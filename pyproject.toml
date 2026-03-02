@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-cpa-credential-manager"
+version = "0.1.0"
+description = "Standalone CPA Codex credential manager"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "CPA Codex Credential Manager Contributors" }
+]
+
+[project.scripts]
+codex-cpa-manager = "codex_cpa_credential_manager.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
