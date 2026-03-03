@@ -25,18 +25,14 @@ COPY frontend/package.json frontend/package-lock.json /app/frontend/
 RUN cd /app/frontend && npm ci --omit=dev
 
 COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
-COPY frontend/server.js /app/frontend/server.js
-COPY frontend/config.yaml /app/frontend/config.yaml
-
-# Keep project root artifacts used by frontend local API wrappers.
-COPY main.py /app/main.py
-COPY pyproject.toml /app/pyproject.toml
-COPY src /app/src
-RUN mkdir -p /app/runtime
+COPY . /app
+RUN if [ ! -f /app/frontend/config.yaml ] && [ -f /app/frontend/config.example.yaml ]; then \
+      cp /app/frontend/config.example.yaml /app/frontend/config.yaml; \
+    fi \
+    && mkdir -p /app/runtime
 
 WORKDIR /app/frontend
 
 EXPOSE 8333
 
 CMD ["node", "server.js"]
-
