@@ -1,0 +1,2 @@
+﻿DEFAULT_CPA_URL = "http://127.0.0.1:8317/"
+DEFAULT_CPA_PASSWORD = "sk-39c5bb"

@@ -22,14 +22,28 @@ app.use(express.json({ limit: '10mb' }));
 // Helper to read config
 function readConfig() {
   if (!fs.existsSync(CONFIG_PATH)) {
-    return { cpa_url: '', management_key: '' };
+    return {
+      cpa_url: '',
+      management_key: '',
+      mail_api_base: '',
+      mail_username: '',
+      mail_password: '',
+      mail_email_domain: '',
+    };
   }
   const file = fs.readFileSync(CONFIG_PATH, 'utf8');
   try {
     return yaml.load(file);
   } catch (e) {
     console.error('Failed to parse config.yaml', e);
-    return { cpa_url: '', management_key: '' };
+    return {
+      cpa_url: '',
+      management_key: '',
+      mail_api_base: '',
+      mail_username: '',
+      mail_password: '',
+      mail_email_domain: '',
+    };
   }
 }
 
@@ -275,12 +289,33 @@ function buildCliCommonArgs(config, body) {
   ];
 }
 
+function buildMailEnv(config) {
+  const env = {};
+  if (config && Object.prototype.hasOwnProperty.call(config, 'mail_api_base')) {
+    env.MAIL_API_BASE = String(config.mail_api_base || '');
+  }
+  if (config && Object.prototype.hasOwnProperty.call(config, 'mail_username')) {
+    env.MAIL_USERNAME = String(config.mail_username || '');
+  }
+  if (config && Object.prototype.hasOwnProperty.call(config, 'mail_password')) {
+    env.MAIL_PASSWORD = String(config.mail_password || '');
+  }
+  if (config && Object.prototype.hasOwnProperty.call(config, 'mail_email_domain')) {
+    env.MAIL_EMAIL_DOMAIN = String(config.mail_email_domain || '');
+  }
+  return env;
+}
+
 function runPythonMain(args, timeoutMs = 10 * 60 * 1000, options = {}) {
   return new Promise((resolve) => {
     const child = spawn('python', [MAIN_PY_PATH, ...args], {
       cwd: PROJECT_ROOT,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        ...(options?.env || {}),
+      },
     });
     let stdout = '';
     let stderr = '';
@@ -388,6 +423,10 @@ app.post('/api/config/update', (req, res) => {
       writeConfig({
         cpa_url: new_config.cpa_url !== undefined ? new_config.cpa_url : config.cpa_url,
         management_key: new_config.management_key !== undefined ? new_config.management_key : config.management_key,
+        mail_api_base: new_config.mail_api_base !== undefined ? new_config.mail_api_base : config.mail_api_base,
+        mail_username: new_config.mail_username !== undefined ? new_config.mail_username : config.mail_username,
+        mail_password: new_config.mail_password !== undefined ? new_config.mail_password : config.mail_password,
+        mail_email_domain: new_config.mail_email_domain !== undefined ? new_config.mail_email_domain : config.mail_email_domain,
       });
       res.json({ ok: true });
     } catch (e) {
@@ -440,7 +479,10 @@ app.post('/api/oauth/login', async (req, res) => {
     if (callbackUrl) {
       args.push('--callback-url', callbackUrl);
     }
-    const result = await runPythonMain(args, execTimeoutMs, { abortSignal: requestAbortController.signal });
+    const result = await runPythonMain(args, execTimeoutMs, {
+      abortSignal: requestAbortController.signal,
+      env: buildMailEnv(config),
+    });
     res.status(result.ok ? 200 : 400).json(result);
   } catch (error) {
     res.status(500).json({ ok: false, error: String(error?.message || error) });
@@ -513,7 +555,9 @@ app.post('/api/oauth/login-batch', async (req, res) => {
     if (callbackFile) {
       args.push('--callback-file', callbackFile);
     }
-    const result = await runPythonMain(args, execTimeoutMs);
+    const result = await runPythonMain(args, execTimeoutMs, {
+      env: buildMailEnv(config),
+    });
     res.status(result.ok ? 200 : 400).json(result);
   } catch (error) {
     res.status(500).json({ ok: false, error: String(error?.message || error) });

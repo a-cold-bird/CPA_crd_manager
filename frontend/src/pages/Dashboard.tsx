@@ -35,6 +35,14 @@ interface SettingsPanelProps {
     setCpaUrl: React.Dispatch<React.SetStateAction<string>>;
     newPassword: string;
     setNewPassword: React.Dispatch<React.SetStateAction<string>>;
+    mailApiBase: string;
+    setMailApiBase: React.Dispatch<React.SetStateAction<string>>;
+    mailUsername: string;
+    setMailUsername: React.Dispatch<React.SetStateAction<string>>;
+    mailPassword: string;
+    setMailPassword: React.Dispatch<React.SetStateAction<string>>;
+    mailEmailDomain: string;
+    setMailEmailDomain: React.Dispatch<React.SetStateAction<string>>;
     savingSettings: boolean;
     setSavingSettings: React.Dispatch<React.SetStateAction<boolean>>;
     message: SettingsMessage;
@@ -76,6 +84,10 @@ export default function Dashboard() {
     // Settings Form State
     const [cpaUrl, setCpaUrl] = useState('');
     const [newPassword, setNewPassword] = useState('');
+    const [mailApiBase, setMailApiBase] = useState('');
+    const [mailUsername, setMailUsername] = useState('');
+    const [mailPassword, setMailPassword] = useState('');
+    const [mailEmailDomain, setMailEmailDomain] = useState('');
     const [savingSettings, setSavingSettings] = useState(false);
     const [settingsMessage, setSettingsMessage] = useState<SettingsMessage>({ type: '', text: '' });
 
@@ -95,6 +107,10 @@ export default function Dashboard() {
                     const resolvedUrl = String(data.config.cpa_url || '').trim();
                     cpaApi.defaults.baseURL = resolvedUrl;
                     setCpaUrl(resolvedUrl);
+                    setMailApiBase(String(data.config.mail_api_base || ''));
+                    setMailUsername(String(data.config.mail_username || ''));
+                    setMailPassword(String(data.config.mail_password || ''));
+                    setMailEmailDomain(String(data.config.mail_email_domain || ''));
                 }
             } catch {
                 localStorage.removeItem('management_key');
@@ -179,6 +195,14 @@ export default function Dashboard() {
                                 setCpaUrl={setCpaUrl}
                                 newPassword={newPassword}
                                 setNewPassword={setNewPassword}
+                                mailApiBase={mailApiBase}
+                                setMailApiBase={setMailApiBase}
+                                mailUsername={mailUsername}
+                                setMailUsername={setMailUsername}
+                                mailPassword={mailPassword}
+                                setMailPassword={setMailPassword}
+                                mailEmailDomain={mailEmailDomain}
+                                setMailEmailDomain={setMailEmailDomain}
                                 savingSettings={savingSettings}
                                 setSavingSettings={setSavingSettings}
                                 message={settingsMessage}
@@ -210,7 +234,25 @@ const SidebarButton = ({ active, onClick, icon, label }: SidebarButtonProps) => 
 
 // ---------------- Sub Sections ----------------
 
-function SettingsPanel({ cpaUrl, setCpaUrl, newPassword, setNewPassword, savingSettings, setSavingSettings, message, setMessage, t }: SettingsPanelProps) {
+function SettingsPanel({
+    cpaUrl,
+    setCpaUrl,
+    newPassword,
+    setNewPassword,
+    mailApiBase,
+    setMailApiBase,
+    mailUsername,
+    setMailUsername,
+    mailPassword,
+    setMailPassword,
+    mailEmailDomain,
+    setMailEmailDomain,
+    savingSettings,
+    setSavingSettings,
+    message,
+    setMessage,
+    t,
+}: SettingsPanelProps) {
     const handleSave = async () => {
         setSavingSettings(true);
         setMessage({ type: '', text: '' });
@@ -221,7 +263,11 @@ function SettingsPanel({ cpaUrl, setCpaUrl, newPassword, setNewPassword, savingS
                 old_password: oldPass,
                 new_config: {
                     cpa_url: cpaUrl || undefined,
-                    management_key: newPassword || undefined
+                    management_key: newPassword || undefined,
+                    mail_api_base: mailApiBase,
+                    mail_username: mailUsername,
+                    mail_password: mailPassword,
+                    mail_email_domain: mailEmailDomain,
                 }
             };
 
@@ -273,6 +319,46 @@ function SettingsPanel({ cpaUrl, setCpaUrl, newPassword, setNewPassword, savingS
                         onChange={(e) => setNewPassword(e.target.value)}
                         className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                         placeholder={t('Leave blank to keep current')}
+                    />
+                </div>
+                <div className="grid gap-2">
+                    <label className="text-sm font-medium leading-none">Mail API Base</label>
+                    <input
+                        type="url"
+                        value={mailApiBase}
+                        onChange={(e) => setMailApiBase(e.target.value)}
+                        className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        placeholder="https://mail-api.example.com"
+                    />
+                </div>
+                <div className="grid gap-2">
+                    <label className="text-sm font-medium leading-none">Mail Username</label>
+                    <input
+                        type="text"
+                        value={mailUsername}
+                        onChange={(e) => setMailUsername(e.target.value)}
+                        className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        placeholder="admin"
+                    />
+                </div>
+                <div className="grid gap-2">
+                    <label className="text-sm font-medium leading-none">Mail Password</label>
+                    <input
+                        type="password"
+                        value={mailPassword}
+                        onChange={(e) => setMailPassword(e.target.value)}
+                        className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        placeholder="mail service password"
+                    />
+                </div>
+                <div className="grid gap-2">
+                    <label className="text-sm font-medium leading-none">Mail Email Domain</label>
+                    <input
+                        type="text"
+                        value={mailEmailDomain}
+                        onChange={(e) => setMailEmailDomain(e.target.value)}
+                        className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        placeholder="example.com"
                     />
                 </div>
 
