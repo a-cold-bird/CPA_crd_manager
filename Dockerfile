@@ -18,8 +18,7 @@ ENV PORT=8333
 
 # Keep python in runtime because frontend local API may call `python main.py` for OAuth tasks.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip python-is-python3 \
-    && python -m pip install --no-cache-dir requests \
+    && apt-get install -y --no-install-recommends python3 python3-requests python-is-python3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY frontend/package.json frontend/package-lock.json /app/frontend/
