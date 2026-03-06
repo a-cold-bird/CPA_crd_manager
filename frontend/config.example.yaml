@@ -4,3 +4,6 @@ mail_api_base: https://mailfree.example.workers.dev
 mail_username: admin
 mail_password: CHANGE_ME
 mail_email_domain: example.com
+auto_probe_enabled: false
+auto_probe_interval_minutes: 60
+codex_quota_disable_remaining_percent: 10

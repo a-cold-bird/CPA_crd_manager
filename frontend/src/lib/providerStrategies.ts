@@ -42,6 +42,289 @@ function parseJsonRecord(value: unknown): Record<string, unknown> | null {
   }
 }
 
+function pickFirstVal(record: Record<string, unknown> | null, ...keys: string[]): unknown {
+  if (!record) return undefined;
+  for (const key of keys) {
+    if (record[key] !== undefined && record[key] !== null) {
+      return record[key];
+    }
+  }
+  return undefined;
+}
+
+function toNumber(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function toPercent(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const text = String(value).trim().replace(/%$/, '');
+  if (!text) return null;
+  const num = Number(text);
+  return Number.isFinite(num) ? num : null;
+}
+
+function toBoolean(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const lower = value.trim().toLowerCase();
+    if (lower === 'true') return true;
+    if (lower === 'false') return false;
+  }
+  return null;
+}
+
+function toUnixSeconds(value: unknown): number | null {
+  const num = toNumber(value);
+  if (num !== null) {
+    if (num > 1_000_000_000_000) return Math.floor(num / 1000);
+    if (num > 0) return Math.floor(num);
+    return null;
+  }
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text) return null;
+  const millis = Date.parse(text);
+  if (Number.isFinite(millis)) {
+    return Math.floor(millis / 1000);
+  }
+  return null;
+}
+
+type CodexQuotaWindow = {
+  name: string;
+  usedPercent: number | null;
+  resetAt: number | null;
+  limitWindowSeconds: number | null;
+  remaining: number | null;
+  limitReached: boolean | null;
+};
+
+export type CodexQuotaCard = {
+  key: string;
+  label: string;
+  usedPercent: number | null;
+  resetAt: number | null;
+  limitWindowSeconds: number | null;
+  limitReached: boolean | null;
+};
+
+export type CodexQuotaInfo = {
+  exhausted: boolean;
+  lowRemaining: boolean;
+  usedPercent: number | null;
+  weeklyUsedPercent: number | null;
+  shortUsedPercent: number | null;
+  resetAt: number | null;
+  source: 'weekly' | '5hour' | 'weekly_limit' | '5hour_limit' | 'remaining' | 'rate_limit_flag' | 'status_message' | null;
+  cards: CodexQuotaCard[];
+};
+
+type ProbeClassifyOptions = {
+  codexQuotaDisableRemainingPercent?: number | null;
+};
+
+const QUOTA_LIMIT_KEYWORDS = ['usage_limit_reached', 'insufficient_quota', 'quota_exceeded', 'limit_reached', 'rate limit'];
+
+function hasLimitKeyword(text: string): boolean {
+  const lower = text.toLowerCase();
+  return QUOTA_LIMIT_KEYWORDS.some((keyword) => lower.includes(keyword));
+}
+
+function parseQuotaWindow(name: string, value: unknown): CodexQuotaWindow | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  return {
+    name,
+    usedPercent: toPercent(pickFirstVal(record, 'used_percent', 'usedPercent', 'used_percentage')),
+    resetAt: toUnixSeconds(pickFirstVal(record, 'reset_at', 'resetAt', 'resets_at', 'resetsAt')),
+    limitWindowSeconds: toNumber(pickFirstVal(record, 'limit_window_seconds', 'limitWindowSeconds', 'window_seconds', 'windowSeconds')),
+    remaining: toNumber(record.remaining),
+    limitReached: toBoolean(pickFirstVal(record, 'limit_reached', 'limitReached')),
+  };
+}
+
+function chooseCodexQuotaWindows(rateLimit: Record<string, unknown>): { weekly: CodexQuotaWindow | null; short: CodexQuotaWindow | null; windows: CodexQuotaWindow[] } {
+  const keys = ['primary_window', 'secondary_window', 'individual_window', 'primaryWindow', 'secondaryWindow', 'individualWindow'];
+  const windows = keys
+    .map((key) => parseQuotaWindow(key, rateLimit[key]))
+    .filter((item): item is CodexQuotaWindow => Boolean(item));
+
+  let weekly = windows.find((window) => window.name.toLowerCase().includes('individual')) || null;
+  let short = windows.find((window) => window.name.toLowerCase().includes('secondary')) || null;
+
+  const withSeconds = windows.filter((window) => typeof window.limitWindowSeconds === 'number');
+  if (!weekly && withSeconds.length) {
+    weekly = [...withSeconds].sort((a, b) => (b.limitWindowSeconds || 0) - (a.limitWindowSeconds || 0))[0] || null;
+  }
+  if (!short && withSeconds.length) {
+    const sorted = [...withSeconds].sort((a, b) => (a.limitWindowSeconds || 0) - (b.limitWindowSeconds || 0));
+    short = sorted.find((window) => !weekly || window.name !== weekly.name) || sorted[0] || null;
+  }
+  if (!weekly && windows.length) weekly = windows[0];
+  if (!short && windows.length > 1) {
+    short = windows.find((window) => !weekly || window.name !== weekly.name) || null;
+  }
+
+  // Single short-window accounts should be treated as the primary short quota instead of weekly quota.
+  if (!short && weekly && typeof weekly.limitWindowSeconds === 'number' && weekly.limitWindowSeconds <= 6 * 3600) {
+    short = weekly;
+    weekly = null;
+  }
+
+  return { weekly, short, windows };
+}
+
+function getQuotaWindowDisplayLabel(window: CodexQuotaWindow, fallbackIndex: number): string {
+  const seconds = window.limitWindowSeconds || 0;
+  if (seconds >= 6 * 24 * 3600) return 'Weekly';
+  if (seconds > 0 && seconds <= 6 * 3600) return '5h';
+  if (window.name.toLowerCase().includes('individual')) return 'Weekly';
+  if (window.name.toLowerCase().includes('secondary')) return '5h';
+  if (window.name.toLowerCase().includes('primary')) return fallbackIndex === 0 ? 'Primary' : `Primary ${fallbackIndex + 1}`;
+  return `Window ${fallbackIndex + 1}`;
+}
+
+function buildQuotaCards(prefix: string, rateLimit: Record<string, unknown> | null): CodexQuotaCard[] {
+  if (!rateLimit) return [];
+  const { windows } = chooseCodexQuotaWindows(rateLimit);
+  return windows.map((window, index) => {
+    const baseLabel = getQuotaWindowDisplayLabel(window, index);
+    return {
+      key: `${prefix}:${window.name}:${index}`,
+      label: prefix ? `${prefix} ${baseLabel}` : baseLabel,
+      usedPercent: window.usedPercent,
+      resetAt: window.resetAt,
+      limitWindowSeconds: window.limitWindowSeconds,
+      limitReached: window.limitReached,
+    };
+  });
+}
+
+function buildAdditionalQuotaCards(value: unknown): CodexQuotaCard[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => buildQuotaCards(`Extra ${index + 1}`, asRecord(item)));
+  }
+  const record = asRecord(value);
+  if (!record) return [];
+  return Object.entries(record).flatMap(([key, item]) => buildQuotaCards(`Extra ${key}`, asRecord(item)));
+}
+
+function extractCodexQuotaInfo(response: ProbeResponse): CodexQuotaInfo | null {
+  const body = parseJsonRecord(response.body);
+  const statusMessage = parseJsonRecord(body?.status_message ?? body?.statusMessage);
+  const statusError = asRecord(statusMessage?.error);
+  const limitHintText = [toText(response.body), toText(response.error), toText(body?.status_message), toText(body?.statusMessage)].join(' ');
+  const quotaMarkedByText = hasLimitKeyword(limitHintText);
+
+  const rateLimit = asRecord(body?.rate_limit ?? body?.rateLimit);
+  const statusResetAt = toUnixSeconds(
+    pickFirstVal(
+      statusError,
+      'resets_at',
+      'resetsAt',
+      'reset_at',
+      'resetAt',
+    ) ?? pickFirstVal(statusMessage, 'resets_at', 'resetsAt', 'reset_at', 'resetAt') ?? pickFirstVal(body, 'resets_at', 'resetsAt', 'reset_at', 'resetAt'),
+  );
+
+  if (!rateLimit) {
+    if (!quotaMarkedByText) return null;
+    return {
+      exhausted: true,
+      lowRemaining: false,
+      usedPercent: 100,
+      weeklyUsedPercent: null,
+      shortUsedPercent: null,
+      resetAt: statusResetAt,
+      source: 'status_message',
+      cards: [],
+    };
+  }
+
+  const { weekly, short, windows } = chooseCodexQuotaWindows(rateLimit);
+  const codeReviewRateLimit = asRecord(body?.code_review_rate_limit ?? body?.codeReviewRateLimit);
+  const cards = [
+    ...buildQuotaCards('', rateLimit),
+    ...buildQuotaCards('Code Review', codeReviewRateLimit),
+    ...buildAdditionalQuotaCards(body?.additional_rate_limits ?? body?.additionalRateLimits),
+  ];
+  const weeklyUsed = weekly?.usedPercent ?? null;
+  const shortUsed = short?.usedPercent ?? null;
+
+  let source: CodexQuotaInfo['source'] = null;
+  let usedPercent: number | null = null;
+  let exhausted = false;
+  let selectedResetAt: number | null = null;
+
+  if (weeklyUsed !== null || shortUsed !== null) {
+    const preferShort = shortUsed !== null && (weeklyUsed === null || shortUsed >= weeklyUsed);
+    if (preferShort) {
+      source = '5hour';
+      usedPercent = shortUsed;
+      selectedResetAt = short?.resetAt ?? null;
+    } else {
+      source = 'weekly';
+      usedPercent = weeklyUsed;
+      selectedResetAt = weekly?.resetAt ?? null;
+    }
+    exhausted = (weeklyUsed !== null && weeklyUsed >= 100) || (shortUsed !== null && shortUsed >= 100);
+  }
+
+  if (usedPercent === null) {
+    const weeklyLimitReached = weekly?.limitReached === true;
+    const shortLimitReached = short?.limitReached === true;
+    const remainingZero = windows.some((window) => window.remaining === 0);
+    const rateLimitReached = toBoolean(pickFirstVal(rateLimit, 'limit_reached', 'limitReached')) === true;
+    const rateAllowed = toBoolean(rateLimit.allowed);
+
+    if (weeklyLimitReached) {
+      source = 'weekly_limit';
+      usedPercent = 100;
+      exhausted = true;
+    } else if (shortLimitReached) {
+      source = '5hour_limit';
+      usedPercent = 100;
+      exhausted = true;
+    } else if (remainingZero) {
+      source = 'remaining';
+      usedPercent = 100;
+      exhausted = true;
+    } else if (rateLimitReached || rateAllowed === false) {
+      source = 'rate_limit_flag';
+      usedPercent = 100;
+      exhausted = true;
+    } else if (quotaMarkedByText) {
+      source = 'status_message';
+      usedPercent = 100;
+      exhausted = true;
+    }
+  }
+
+  const resetAt = selectedResetAt ?? weekly?.resetAt ?? short?.resetAt ?? statusResetAt;
+
+  return {
+    exhausted,
+    lowRemaining: false,
+    usedPercent,
+    weeklyUsedPercent: weeklyUsed,
+    shortUsedPercent: shortUsed,
+    resetAt,
+    source,
+    cards,
+  };
+}
+
+function formatResetAtText(resetAt: number | null): string {
+  if (!resetAt) return 'unknown';
+  const date = new Date(resetAt * 1000);
+  if (!Number.isFinite(date.getTime())) return 'unknown';
+  return date.toISOString().replace('T', ' ').slice(0, 16);
+}
+
 function hasWholeWord(text: string, word: 'free' | 'pro' | 'plus' | 'team' | 'premium'): boolean {
   const pattern = new RegExp(`(^|[^a-z0-9])${word}([^a-z0-9]|$)`);
   return pattern.test(text);
@@ -165,35 +448,59 @@ function extractAntigravityTierFromProbe(response: ProbeResponse): ProbeTier {
   return pickTierByPriority(candidates);
 }
 
-type ProbeClassification = { status: CheckStatus; reason: string };
+type ProbeClassification = { status: CheckStatus; reason: string; quota?: CodexQuotaInfo | null };
 
 type ProviderStrategy = {
   canProbe: (cred: Credential) => boolean;
-  classifyProbe: (response: ProbeResponse) => ProbeClassification;
+  classifyProbe: (response: ProbeResponse, options?: ProbeClassifyOptions) => ProbeClassification;
   tierFromCredential: (cred: Credential) => ProbeTier;
   tierFromProbe?: (response: ProbeResponse) => ProbeTier;
 };
 
 const codexStrategy: ProviderStrategy = {
   canProbe: (cred) => (cred.provider || '').toLowerCase() !== 'iflow',
-  classifyProbe: (response) => {
+  classifyProbe: (response, options) => {
     const statusCode = toStatusCode(response.status_code);
     const text = normalizeProbeText(response);
     const lower = text.toLowerCase();
+    const quota = extractCodexQuotaInfo(response);
+    const remainingThreshold = Math.max(0, Math.min(100, Math.floor(Number(options?.codexQuotaDisableRemainingPercent ?? 0) || 0)));
 
     if (statusCode === 401 && (lower.includes('token_invalidated') || lower.includes('invalidated'))) {
-      return { status: 'invalidated', reason: text || 'codex token invalidated' };
+      return { status: 'invalidated', reason: text || 'codex token invalidated', quota };
     }
     if (statusCode === 401 && lower.includes('deactivated')) {
-      return { status: 'deactivated', reason: text || 'codex account deactivated' };
+      return { status: 'deactivated', reason: text || 'codex account deactivated', quota };
     }
     if (statusCode === 401) {
-      return { status: 'unauthorized', reason: text || 'codex unauthorized' };
+      return { status: 'unauthorized', reason: text || 'codex unauthorized', quota };
+    }
+    if (quota?.exhausted) {
+      const reasonParts = ['codex quota exhausted'];
+      if (typeof quota.usedPercent === 'number') {
+        reasonParts.push(`used=${quota.usedPercent}%`);
+      }
+      reasonParts.push(`source=${quota.source || 'unknown'}`);
+      reasonParts.push(`reset_at=${formatResetAtText(quota.resetAt)}`);
+      return { status: 'quota_exhausted', reason: reasonParts.join(', '), quota };
+    }
+    if (quota && remainingThreshold > 0 && typeof quota.usedPercent === 'number') {
+      const remainingPercent = Math.max(0, 100 - quota.usedPercent);
+      if (remainingPercent <= remainingThreshold) {
+        quota.lowRemaining = true;
+        const reasonParts = ['codex quota remaining below threshold'];
+        reasonParts.push(`remaining=${remainingPercent}%`);
+        reasonParts.push(`threshold=${remainingThreshold}%`);
+        reasonParts.push(`used=${quota.usedPercent}%`);
+        reasonParts.push(`source=${quota.source || 'unknown'}`);
+        reasonParts.push(`reset_at=${formatResetAtText(quota.resetAt)}`);
+        return { status: 'quota_low_remaining', reason: reasonParts.join(', '), quota };
+      }
     }
     if (CODEX_ACTIVE_CODES.has(statusCode)) {
-      return { status: 'active', reason: '' };
+      return { status: 'active', reason: '', quota };
     }
-    return { status: 'unknown', reason: text || `unexpected response (${statusCode || 'n/a'})` };
+    return { status: 'unknown', reason: text || `unexpected response (${statusCode || 'n/a'})`, quota };
   },
   tierFromCredential: extractCodexTierFromCredential,
 };
@@ -249,8 +556,8 @@ export function getProviderStrategy(provider: string): ProviderStrategy {
   return strategyFactory[providerName] || defaultStrategy;
 }
 
-export function classifyProviderProbe(provider: string, response: ProbeResponse): ProbeClassification {
-  return getProviderStrategy(provider).classifyProbe(response);
+export function classifyProviderProbe(provider: string, response: ProbeResponse, options?: ProbeClassifyOptions): ProbeClassification {
+  return getProviderStrategy(provider).classifyProbe(response, options);
 }
 
 export function resolveTierFromCredential(cred: Credential): ProbeTier {
@@ -269,7 +576,7 @@ export function canProbeCredential(cred: Credential): boolean {
 }
 
 export function shouldAutoDisable(status: ProbeUiStatus): boolean {
-  return status === 'invalidated' || status === 'deactivated' || status === 'unauthorized' || status === 'expired_by_time';
+  return status === 'invalidated' || status === 'deactivated' || status === 'unauthorized' || status === 'expired_by_time' || status === 'quota_exhausted' || status === 'quota_low_remaining';
 }
 
 export function toProbeErrorResponse(error: unknown): ProbeResponse {

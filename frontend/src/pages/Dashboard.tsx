@@ -5,7 +5,7 @@ import type { Credential, OAuthAccountPreviewPayload } from '../lib/api';
 import { Settings, LogOut, CheckCircle2, XCircle, Clock, AlertTriangle, ShieldCheck, Play, RefreshCw, Layers, Moon, Sun, Globe, Trash2, ShieldAlert } from 'lucide-react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { canProbeCredential, classifyProviderProbe, resolveTierAfterProbe, resolveTierFromCredential, shouldAutoDisable, toProbeErrorResponse, type ProbeTier, type ProbeUiStatus } from '../lib/providerStrategies';
+import { canProbeCredential, classifyProviderProbe, resolveTierAfterProbe, resolveTierFromCredential, shouldAutoDisable, toProbeErrorResponse, type CodexQuotaCard, type CodexQuotaInfo, type ProbeTier, type ProbeUiStatus } from '../lib/providerStrategies';
 import { useRunLock } from '../hooks/useRunLock';
 import { useLockedInterval } from '../hooks/useLockedInterval';
 import { useGlobalModal } from '../components/global-modal/useGlobalModal';
@@ -16,6 +16,17 @@ interface ProbeUiState {
     reason?: string;
     tier?: ProbeTier;
     detail?: string;
+    quotaResetAt?: number | null;
+    quotaSource?: string | null;
+    quotaUsedPercent?: number | null;
+    quotaCards?: CodexQuotaCard[];
+}
+
+interface CodexQuotaResumeEntry {
+    resetAt: number | null;
+    source: string | null;
+    usedPercent: number | null;
+    nextProbeAtMs: number;
 }
 
 interface SidebarButtonProps {
@@ -29,6 +40,8 @@ interface SettingsMessage {
     type: '' | 'success' | 'error';
     text: string;
 }
+
+type AutoProbeConfigStatus = 'idle' | 'loaded' | 'saving' | 'saved' | 'error';
 
 interface SettingsPanelProps {
     cpaUrl: string;
@@ -53,6 +66,13 @@ interface SettingsPanelProps {
 interface CredentialManagerProps {
     cpaReady: boolean;
     cpaUrl: string;
+    autoProbeEnabled: boolean;
+    setAutoProbeEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+    autoProbeIntervalMinutes: number;
+    setAutoProbeIntervalMinutes: React.Dispatch<React.SetStateAction<number>>;
+    codexQuotaDisableRemainingPercent: number;
+    setCodexQuotaDisableRemainingPercent: React.Dispatch<React.SetStateAction<number>>;
+    autoProbeConfigStatus: AutoProbeConfigStatus;
 }
 
 interface OAuthLoginPanelProps {
@@ -75,6 +95,37 @@ function getInitialTheme(): 'light' | 'dark' {
     return document.documentElement.classList.contains('dark') ? 'dark' : 'light';
 }
 
+function getInitialAutoProbeEnabled(): boolean {
+    try {
+        const raw = String(localStorage.getItem('probe_auto_enabled') || '').trim().toLowerCase();
+        return raw === '1' || raw === 'true' || raw === 'yes';
+    } catch {
+        return false;
+    }
+}
+
+function clampAutoProbeIntervalMinutes(value: unknown, fallback = 60): number {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return fallback;
+    return Math.max(1, Math.min(1440, Math.floor(numeric)));
+}
+
+function clampQuotaDisableRemainingPercent(value: unknown, fallback = 10): number {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return fallback;
+    return Math.max(0, Math.min(100, Math.floor(numeric)));
+}
+
+function parseConfigBoolean(value: unknown, fallback = false): boolean {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+        const lower = value.trim().toLowerCase();
+        if (lower === '1' || lower === 'true' || lower === 'yes') return true;
+        if (lower === '0' || lower === 'false' || lower === 'no') return false;
+    }
+    return fallback;
+}
+
 export default function Dashboard() {
     const navigate = useNavigate();
     const { t, i18n } = useTranslation();
@@ -88,8 +139,14 @@ export default function Dashboard() {
     const [mailUsername, setMailUsername] = useState('');
     const [mailPassword, setMailPassword] = useState('');
     const [mailEmailDomain, setMailEmailDomain] = useState('');
+    const [autoProbeEnabled, setAutoProbeEnabled] = useState<boolean>(getInitialAutoProbeEnabled);
+    const [autoProbeIntervalMinutes, setAutoProbeIntervalMinutes] = useState<number>(() => clampAutoProbeIntervalMinutes(localStorage.getItem('probe_auto_interval_minutes') || 60));
+    const [codexQuotaDisableRemainingPercent, setCodexQuotaDisableRemainingPercent] = useState<number>(() => clampQuotaDisableRemainingPercent(localStorage.getItem('codex_quota_disable_remaining_percent') || 10));
+    const [autoProbeConfigStatus, setAutoProbeConfigStatus] = useState<AutoProbeConfigStatus>('idle');
     const [savingSettings, setSavingSettings] = useState(false);
     const [settingsMessage, setSettingsMessage] = useState<SettingsMessage>({ type: '', text: '' });
+    const autoProbeConfigLoadedRef = useRef(false);
+    const autoProbeConfigSyncPrimedRef = useRef(false);
 
     // Add an initialization effect that loads the URL securely
     useEffect(() => {
@@ -105,12 +162,26 @@ export default function Dashboard() {
                 const { data } = await configApi.post('/config', { password: key });
                 if (data.ok) {
                     const resolvedUrl = String(data.config.cpa_url || '').trim();
+                    const resolvedAutoProbeEnabled = parseConfigBoolean(data.config.auto_probe_enabled, getInitialAutoProbeEnabled());
+                    const resolvedAutoProbeInterval = clampAutoProbeIntervalMinutes(
+                        data.config.auto_probe_interval_minutes,
+                        clampAutoProbeIntervalMinutes(localStorage.getItem('probe_auto_interval_minutes') || 60),
+                    );
+                    const resolvedQuotaDisableRemainingPercent = clampQuotaDisableRemainingPercent(
+                        data.config.codex_quota_disable_remaining_percent,
+                        clampQuotaDisableRemainingPercent(localStorage.getItem('codex_quota_disable_remaining_percent') || 10),
+                    );
                     cpaApi.defaults.baseURL = resolvedUrl;
                     setCpaUrl(resolvedUrl);
                     setMailApiBase(String(data.config.mail_api_base || ''));
                     setMailUsername(String(data.config.mail_username || ''));
                     setMailPassword(String(data.config.mail_password || ''));
                     setMailEmailDomain(String(data.config.mail_email_domain || ''));
+                    setAutoProbeEnabled(resolvedAutoProbeEnabled);
+                    setAutoProbeIntervalMinutes(resolvedAutoProbeInterval);
+                    setCodexQuotaDisableRemainingPercent(resolvedQuotaDisableRemainingPercent);
+                    setAutoProbeConfigStatus('loaded');
+                    autoProbeConfigLoadedRef.current = true;
                 }
             } catch {
                 localStorage.removeItem('management_key');
@@ -134,6 +205,53 @@ export default function Dashboard() {
             // ignore localStorage errors
         }
     }, [theme]);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem('probe_auto_enabled', autoProbeEnabled ? '1' : '0');
+            localStorage.setItem('probe_auto_interval_minutes', String(autoProbeIntervalMinutes));
+            localStorage.setItem('codex_quota_disable_remaining_percent', String(codexQuotaDisableRemainingPercent));
+        } catch {
+            // ignore localStorage errors
+        }
+    }, [autoProbeEnabled, autoProbeIntervalMinutes, codexQuotaDisableRemainingPercent]);
+
+    useEffect(() => {
+        if (!autoProbeConfigLoadedRef.current) return;
+        if (!autoProbeConfigSyncPrimedRef.current) {
+            autoProbeConfigSyncPrimedRef.current = true;
+            return;
+        }
+
+        let cancelled = false;
+        const password = String(localStorage.getItem('management_key') || '').trim();
+        if (!password) return;
+
+        const timer = window.setTimeout(() => {
+            setAutoProbeConfigStatus('saving');
+            void configApi.post('/config/update', {
+                old_password: password,
+                new_config: {
+                    auto_probe_enabled: autoProbeEnabled,
+                    auto_probe_interval_minutes: autoProbeIntervalMinutes,
+                    codex_quota_disable_remaining_percent: codexQuotaDisableRemainingPercent,
+                },
+            }).then(() => {
+                if (!cancelled) {
+                    setAutoProbeConfigStatus('saved');
+                }
+            }).catch(() => {
+                if (!cancelled) {
+                    setAutoProbeConfigStatus('error');
+                }
+            });
+        }, 300);
+
+        return () => {
+            cancelled = true;
+            window.clearTimeout(timer);
+        };
+    }, [autoProbeEnabled, autoProbeIntervalMinutes, codexQuotaDisableRemainingPercent]);
 
     const toggleTheme = () => setTheme(prev => prev === 'light' ? 'dark' : 'light');
     const toggleLanguage = () => i18n.changeLanguage(i18n.language === 'zh' ? 'en' : 'zh');
@@ -186,7 +304,19 @@ export default function Dashboard() {
                 {/* Main Scrollable Content */}
                 <main className="flex-1 p-4 lg:p-6 overflow-y-auto">
                     <div className="mx-auto w-full max-w-[1900px] space-y-6">
-                        {activeTab === 'credentials' && <CredentialManager cpaReady={Boolean(cpaUrl)} cpaUrl={cpaUrl} />}
+                        {activeTab === 'credentials' && (
+                            <CredentialManager
+                                cpaReady={Boolean(cpaUrl)}
+                                cpaUrl={cpaUrl}
+                                autoProbeEnabled={autoProbeEnabled}
+                                setAutoProbeEnabled={setAutoProbeEnabled}
+                                autoProbeIntervalMinutes={autoProbeIntervalMinutes}
+                                setAutoProbeIntervalMinutes={setAutoProbeIntervalMinutes}
+                                codexQuotaDisableRemainingPercent={codexQuotaDisableRemainingPercent}
+                                setCodexQuotaDisableRemainingPercent={setCodexQuotaDisableRemainingPercent}
+                                autoProbeConfigStatus={autoProbeConfigStatus}
+                            />
+                        )}
                         {activeTab === 'archive' && <ArchivePanel cpaReady={Boolean(cpaUrl)} cpaUrl={cpaUrl} />}
                         {activeTab === 'oauthLogin' && <OAuthLoginPanel cpaReady={Boolean(cpaUrl)} />}
                         {activeTab === 'settings' && (
@@ -1488,9 +1618,19 @@ function OAuthLoginPanel({ cpaReady }: OAuthLoginPanelProps) {
         </div>
     );
 }
-function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
+function CredentialManager({
+    cpaReady,
+    cpaUrl,
+    autoProbeEnabled,
+    setAutoProbeEnabled,
+    autoProbeIntervalMinutes,
+    setAutoProbeIntervalMinutes,
+    codexQuotaDisableRemainingPercent,
+    setCodexQuotaDisableRemainingPercent,
+    autoProbeConfigStatus,
+}: CredentialManagerProps) {
     const queryClient = useQueryClient();
-    const { t } = useTranslation();
+    const { t, i18n } = useTranslation();
     const { showAlert, showConfirm } = useGlobalModal();
     const { runWithLock, isLocked } = useRunLock();
     const [probeBatchSize, setProbeBatchSize] = useState<number>(() => {
@@ -1503,7 +1643,10 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
         if (!Number.isFinite(raw)) return 400;
         return Math.max(0, Math.min(10000, Math.floor(raw)));
     });
-
+    const quotaDisableThresholdLabel = i18n.language === 'zh' ? '剩余额度阈值(%)' : 'Quota Remaining Threshold(%)';
+    const quotaDisableThresholdHint = i18n.language === 'zh'
+        ? '0 表示仅在额度耗尽时禁用'
+        : '0 means disable only when quota is exhausted';
     // API Data
     const {
         data: credentials = [],
@@ -1528,6 +1671,7 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
     const probeCancelRequestedRef = useRef(false);
     const probeAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
     const [isAutoDisable, setIsAutoDisable] = useState(true);
+    const [codexQuotaResumeMap, setCodexQuotaResumeMap] = useState<Record<string, CodexQuotaResumeEntry>>({});
 
     // Batch Selection Data
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
@@ -1546,6 +1690,11 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
     // UI Loading states
     const [deletingNames, setDeletingNames] = useState<Set<string>>(new Set());
     const [togglingNames, setTogglingNames] = useState<Set<string>>(new Set());
+
+    const codexQuotaStorageKey = useMemo(() => `codex_quota_resume:${cpaUrl || '__default__'}`, [cpaUrl]);
+    const codexQuotaResumeMapRef = useRef<Record<string, CodexQuotaResumeEntry>>({});
+    const credentialsRef = useRef<Credential[]>([]);
+    const handleProbeSingleRef = useRef<((cred: Credential, options?: { signal?: AbortSignal; fromBatch?: boolean }) => Promise<void>) | null>(null);
 
     const toggleStatusMutation = useMutation({
         mutationFn: ({ name, disabled }: { name: string, disabled: boolean }) => updateCredentialStatus(name, disabled),
@@ -1642,6 +1791,75 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
         return err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError' || msg.includes('canceled') || msg.includes('aborted');
     };
 
+    const isCodexProvider = (provider: string): boolean => (provider || '').toLowerCase() === 'codex';
+
+    const addOrUpdateCodexQuotaResume = (name: string, quota: CodexQuotaInfo | null | undefined) => {
+        const resetAt = typeof quota?.resetAt === 'number' && Number.isFinite(quota.resetAt) ? quota.resetAt : null;
+        const usedPercent = typeof quota?.usedPercent === 'number' && Number.isFinite(quota.usedPercent) ? quota.usedPercent : null;
+        const source = quota?.source ? String(quota.source) : null;
+        const nowMs = Date.now();
+        setCodexQuotaResumeMap((prev) => ({
+            ...prev,
+            [name]: {
+                resetAt,
+                usedPercent,
+                source,
+                nextProbeAtMs: Math.max(nowMs + 30_000, resetAt ? resetAt * 1000 : nowMs + 30_000),
+            },
+        }));
+    };
+
+    const removeCodexQuotaResume = (name: string) => {
+        setCodexQuotaResumeMap((prev) => {
+            if (!prev[name]) return prev;
+            const next = { ...prev };
+            delete next[name];
+            return next;
+        });
+    };
+
+    const formatResetAtText = (resetAt: number | null | undefined): string => {
+        if (typeof resetAt !== 'number' || !Number.isFinite(resetAt) || resetAt <= 0) return t('Unknown');
+        const date = new Date(resetAt * 1000);
+        if (!Number.isFinite(date.getTime())) return t('Unknown');
+        return date.toLocaleString();
+    };
+
+    const normalizePercent = (value: unknown): number | null => {
+        if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+        return Math.max(0, Math.min(100, value));
+    };
+
+    const toRemainingPercent = (usedPercent: number | null): number | null => {
+        if (usedPercent === null) return null;
+        return Math.max(0, Math.min(100, 100 - usedPercent));
+    };
+
+    const getQuotaMeterClass = (remainingPercent: number): string => {
+        if (remainingPercent <= 5) return 'bg-rose-500';
+        if (remainingPercent <= 20) return 'bg-amber-500';
+        return 'bg-emerald-500';
+    };
+
+    const getDisabledBadgeMeta = (status: ProbeUiStatus | undefined, hasQuotaResume: boolean) => {
+        if (hasQuotaResume) {
+            return {
+                label: i18n.language === 'zh' ? '临时禁用(额度)' : 'Temp Disabled (Quota)',
+                detail: i18n.language === 'zh' ? '等待自动恢复' : 'Auto Enable Scheduled',
+            };
+        }
+        if (status === 'invalidated' || status === 'unauthorized' || status === 'deactivated' || status === 'expired_by_time' || status === 'error') {
+            return {
+                label: i18n.language === 'zh' ? '自动禁用(状态)' : 'Auto Disabled (Status)',
+                detail: i18n.language === 'zh' ? '封禁/失效自动禁用' : 'Auto-disabled by status',
+            };
+        }
+        return {
+            label: t('Disabled'),
+            detail: i18n.language === 'zh' ? '手动禁用' : 'Manual Disabled',
+        };
+    };
+
     const handleProbeSingle = async (cred: Credential, options?: { signal?: AbortSignal; fromBatch?: boolean }) => {
         const lockKey = `probe-single:${cred.name}`;
         await runWithLock(lockKey, async () => {
@@ -1658,7 +1876,9 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
 
             try {
                 const response = await probeCredential(cred.auth_index, cred.provider as string, options?.signal);
-                const result = classifyProviderProbe(cred.provider, response);
+                const result = classifyProviderProbe(cred.provider, response, {
+                    codexQuotaDisableRemainingPercent,
+                });
                 const tier = resolveTierAfterProbe(cred, response);
                 const detail = formatProbeDetail(response);
 
@@ -1670,8 +1890,20 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
                         reason: truncateText(result.reason),
                         tier,
                         detail,
+                        quotaResetAt: result.quota?.resetAt ?? null,
+                        quotaSource: result.quota?.source ?? null,
+                        quotaUsedPercent: result.quota?.usedPercent ?? null,
+                        quotaCards: result.quota?.cards ?? [],
                     },
                 }));
+
+                if (isCodexProvider(String(cred.provider || ''))) {
+                    if (result.status === 'quota_exhausted' || result.status === 'quota_low_remaining') {
+                        addOrUpdateCodexQuotaResume(cred.name, result.quota);
+                    } else {
+                        removeCodexQuotaResume(cred.name);
+                    }
+                }
 
                 if (result.status === 'active' && cred.disabled) {
                     await runStatusUpdate(cred.name, false);
@@ -1696,7 +1928,9 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
                 }
 
                 const fallbackResponse = toProbeErrorResponse(error);
-                const result = classifyProviderProbe(cred.provider, fallbackResponse);
+                const result = classifyProviderProbe(cred.provider, fallbackResponse, {
+                    codexQuotaDisableRemainingPercent,
+                });
                 const finalStatus: ProbeUiStatus = result.status === 'unknown' ? 'error' : result.status;
                 const detail = formatProbeDetail(fallbackResponse);
 
@@ -1718,15 +1952,129 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
         });
     };
 
-    const handleProbeAll = async () => {
-        if (!activeCredentials.length || isProbingAll) return;
+    useEffect(() => {
+        try {
+            const raw = localStorage.getItem(codexQuotaStorageKey);
+            if (!raw) {
+                setCodexQuotaResumeMap({});
+                return;
+            }
+            const parsed = JSON.parse(raw) as Record<string, Partial<CodexQuotaResumeEntry>>;
+            if (!parsed || typeof parsed !== 'object') {
+                setCodexQuotaResumeMap({});
+                return;
+            }
+            const next: Record<string, CodexQuotaResumeEntry> = {};
+            Object.entries(parsed).forEach(([name, item]) => {
+                const resetAt = typeof item?.resetAt === 'number' && Number.isFinite(item.resetAt) ? item.resetAt : null;
+                const usedPercent = typeof item?.usedPercent === 'number' && Number.isFinite(item.usedPercent) ? item.usedPercent : null;
+                const source = item?.source ? String(item.source) : null;
+                const nextProbeAtMs = typeof item?.nextProbeAtMs === 'number' && Number.isFinite(item.nextProbeAtMs)
+                    ? item.nextProbeAtMs
+                    : Date.now();
+                next[name] = { resetAt, usedPercent, source, nextProbeAtMs };
+            });
+            setCodexQuotaResumeMap(next);
+        } catch {
+            setCodexQuotaResumeMap({});
+        }
+    }, [codexQuotaStorageKey]);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem(codexQuotaStorageKey, JSON.stringify(codexQuotaResumeMap));
+        } catch {
+            // ignore localStorage errors
+        }
+    }, [codexQuotaStorageKey, codexQuotaResumeMap]);
+
+    useEffect(() => {
+        if (!credentials.length) return;
+        const byName = new Map(credentials.map((item) => [item.name, item]));
+        setCodexQuotaResumeMap((prev) => {
+            let changed = false;
+            const next: Record<string, CodexQuotaResumeEntry> = {};
+            Object.entries(prev).forEach(([name, entry]) => {
+                const cred = byName.get(name);
+                if (!cred || !isCodexProvider(String(cred.provider || ''))) {
+                    changed = true;
+                    return;
+                }
+                next[name] = entry;
+            });
+            return changed ? next : prev;
+        });
+    }, [credentials]);
+
+    useEffect(() => {
+        codexQuotaResumeMapRef.current = codexQuotaResumeMap;
+    }, [codexQuotaResumeMap]);
+
+    useEffect(() => {
+        credentialsRef.current = credentials;
+    }, [credentials]);
+
+    useEffect(() => {
+        handleProbeSingleRef.current = handleProbeSingle;
+    }, [handleProbeSingle]);
+
+    useEffect(() => {
+        if (!cpaReady) return;
+        const timer = window.setInterval(() => {
+            const nowMs = Date.now();
+            const currentMap = codexQuotaResumeMapRef.current;
+            const currentCredentials = credentialsRef.current;
+            const dueNames = Object.entries(currentMap)
+                .filter(([, entry]) => {
+                    if (!entry) return false;
+                    if (nowMs < entry.nextProbeAtMs) return false;
+                    if (typeof entry.resetAt !== 'number' || !Number.isFinite(entry.resetAt) || entry.resetAt <= 0) return true;
+                    return nowMs >= entry.resetAt * 1000;
+                })
+                .map(([name]) => name);
+
+            if (!dueNames.length) return;
+
+            dueNames.forEach((name) => {
+                const cred = currentCredentials.find((item) => item.name === name && isCodexProvider(String(item.provider || '')));
+                if (!cred || !cred.disabled) {
+                    setCodexQuotaResumeMap((prev) => {
+                        if (!prev[name]) return prev;
+                        const next = { ...prev };
+                        delete next[name];
+                        return next;
+                    });
+                    return;
+                }
+
+                setCodexQuotaResumeMap((prev) => {
+                    const current = prev[name];
+                    if (!current) return prev;
+                    return {
+                        ...prev,
+                        [name]: {
+                            ...current,
+                            nextProbeAtMs: nowMs + 60_000,
+                        },
+                    };
+                });
+
+                void handleProbeSingleRef.current?.(cred, { fromBatch: false });
+            });
+        }, 30_000);
+
+        return () => window.clearInterval(timer);
+    }, [cpaReady]);
+
+    const runProbeForTargets = async (targets: Credential[]) => {
+        if (!targets.length || isProbingAll) return;
         probeCancelRequestedRef.current = false;
         setProbeCancelRequested(false);
         probeAbortControllersRef.current.clear();
         await runWithLock('probe-all', async () => {
             setIsProbingAll(true);
             try {
-                const probeTargets = filteredCredentials.filter((cred: Credential) => canProbeCredential(cred));
+                const probeTargets = targets.filter((cred: Credential) => canProbeCredential(cred));
                 for (let i = 0; i < probeTargets.length; i += probeBatchSize) {
                     if (probeCancelRequestedRef.current) {
                         break;
@@ -1764,6 +2112,10 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
         });
     };
 
+    const handleProbeAll = async () => {
+        await runProbeForTargets(filteredCredentials);
+    };
+
     const handleCancelProbeAll = () => {
         if (!isProbingAll) return;
         setProbeCancelRequested(true);
@@ -1795,6 +2147,10 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
     const activeCredentials = useMemo(
         () => credentials.filter((cred: Credential) => !archivedNameSet.has(cred.name)),
         [credentials, archivedNameSet],
+    );
+    const autoProbeTargets = useMemo(
+        () => activeCredentials.filter((cred: Credential) => !cred.disabled),
+        [activeCredentials],
     );
 
     const loadCredentialArchive = useCallback(async () => {
@@ -1924,6 +2280,35 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
         setProbeBatchIntervalMs(Math.max(0, Math.min(10000, Math.floor(nextValue))));
     };
 
+    const setSafeAutoProbeIntervalMinutes = (nextValue: number) => {
+        if (!Number.isFinite(nextValue)) return;
+        setAutoProbeIntervalMinutes(Math.max(1, Math.min(1440, Math.floor(nextValue))));
+    };
+
+    const setSafeQuotaDisableRemainingPercent = (nextValue: number) => {
+        if (!Number.isFinite(nextValue)) return;
+        setCodexQuotaDisableRemainingPercent(Math.max(0, Math.min(100, Math.floor(nextValue))));
+    };
+
+    const autoProbeConfigHint = useMemo(() => {
+        const isZh = i18n.language === 'zh';
+        if (autoProbeConfigStatus === 'saving') {
+            return isZh ? '正在保存自动探针配置到 config.yaml...' : 'Saving auto probe config to config.yaml...';
+        }
+        if (autoProbeConfigStatus === 'saved') {
+            return isZh ? '自动探针配置已保存到 config.yaml' : 'Auto probe config saved to config.yaml';
+        }
+        if (autoProbeConfigStatus === 'error') {
+            return isZh ? '自动探针配置保存失败，请检查 config.yaml 写入权限' : 'Failed to save auto probe config. Check config.yaml write permission';
+        }
+        if (autoProbeConfigStatus === 'loaded') {
+            return isZh
+                ? `已从 config.yaml 加载自动探针间隔：${autoProbeIntervalMinutes} 分钟，剩余额度阈值：${codexQuotaDisableRemainingPercent}%`
+                : `Loaded auto probe interval: ${autoProbeIntervalMinutes} min, remaining quota threshold: ${codexQuotaDisableRemainingPercent}%`;
+        }
+        return '';
+    }, [autoProbeConfigStatus, autoProbeIntervalMinutes, codexQuotaDisableRemainingPercent, i18n.language]);
+
     const refreshListWithLock = useCallback(async (force: boolean = false) => {
         await runWithLock('refresh-list', async () => {
             if (force) {
@@ -1941,6 +2326,16 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
         },
         15000,
         cpaReady,
+        false,
+    );
+
+    useLockedInterval(
+        async () => {
+            if (!cpaReady || !autoProbeEnabled || isProbingAll || isFetching) return;
+            await runProbeForTargets(autoProbeTargets);
+        },
+        Math.max(1, autoProbeIntervalMinutes) * 60 * 1000,
+        cpaReady && autoProbeEnabled,
         false,
     );
 
@@ -2220,6 +2615,27 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2 md:justify-end">
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground whitespace-nowrap rounded-md border border-border bg-background/50 px-2 py-1">
+                            <input
+                                id="auto-probe-enabled"
+                                type="checkbox"
+                                checked={autoProbeEnabled}
+                                onChange={(e) => setAutoProbeEnabled(e.target.checked)}
+                                className="rounded border-input text-primary focus:ring-primary h-4 w-4 bg-background/50"
+                            />
+                            <label htmlFor="auto-probe-enabled" className="cursor-pointer">{t('Auto Probe')}</label>
+                        </div>
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground whitespace-nowrap">
+                            <span>{t('Auto Probe Interval(min)')}</span>
+                            <input
+                                type="number"
+                                min={1}
+                                max={1440}
+                                value={autoProbeIntervalMinutes}
+                                onChange={(e) => setSafeAutoProbeIntervalMinutes(Number(e.target.value || 1))}
+                                className="h-8 w-20 rounded-md border border-input bg-background px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            />
+                        </div>
                         <div className="flex items-center gap-2 text-xs text-muted-foreground whitespace-nowrap">
                             <span>{t('Probe batch size')}</span>
                             <input
@@ -2242,6 +2658,23 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
                                 className="h-8 w-20 rounded-md border border-input bg-background px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                             />
                         </div>
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground whitespace-nowrap">
+                            <span>{quotaDisableThresholdLabel}</span>
+                            <input
+                                type="number"
+                                min={0}
+                                max={100}
+                                value={codexQuotaDisableRemainingPercent}
+                                onChange={(e) => setSafeQuotaDisableRemainingPercent(Number(e.target.value || 0))}
+                                className="h-8 w-20 rounded-md border border-input bg-background px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                title={quotaDisableThresholdHint}
+                            />
+                        </div>
+                        {autoProbeConfigHint && (
+                            <div className="w-full text-right text-[11px] text-muted-foreground md:pr-1">
+                                {autoProbeConfigHint}
+                            </div>
+                        )}
                     </div>
                 </div>
             </div>
@@ -2270,7 +2703,7 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
 
             <div className="rounded-xl border border-border bg-card shadow-sm overflow-hidden">
                 <div className="overflow-x-auto">
-                    <table className="min-w-[1480px] w-full text-sm text-left whitespace-nowrap">
+                    <table className="min-w-[1680px] w-full text-sm text-left whitespace-nowrap">
                         <thead className="bg-muted/50 text-muted-foreground border-b border-border text-xs uppercase font-medium">
                             <tr>
                                 <th className="px-4 py-4 w-12">
@@ -2284,18 +2717,19 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
                                 <th className="px-6 py-4">{t('ID / Index')}</th>
                                 <th className="px-6 py-4">{t('Provider')}</th>
                                 <th className="px-6 py-4">{t('Status')}</th>
+                                <th className="px-6 py-4">{t('Quota')}</th>
                                 <th className="px-6 py-4">{t('Last Checked')}</th>
                                 <th className="px-6 py-4 text-right">{t('Actions')}</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-border">
                             {!cpaReady ? (
-                                <tr><td colSpan={6} className="px-6 py-8 text-center text-muted-foreground">{t('Initializing connection...')}</td></tr>
+                                <tr><td colSpan={7} className="px-6 py-8 text-center text-muted-foreground">{t('Initializing connection...')}</td></tr>
                             ) : isLoading ? (
-                                <tr><td colSpan={6} className="px-6 py-8 text-center text-muted-foreground">{t('Loading credentials...')}</td></tr>
+                                <tr><td colSpan={7} className="px-6 py-8 text-center text-muted-foreground">{t('Loading credentials...')}</td></tr>
                             ) : isError ? (
                                 <tr>
-                                    <td colSpan={6} className="px-6 py-8 text-center text-muted-foreground">
+                                    <td colSpan={7} className="px-6 py-8 text-center text-muted-foreground">
                                         <div className="space-y-2">
                                             <div>{t('Failed to load credentials.')}</div>
                                             <div className="text-xs text-destructive">{String((error as { message?: string })?.message || '')}</div>
@@ -2309,13 +2743,53 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
                                     </td>
                                 </tr>
                             ) : filteredCredentials.length === 0 ? (
-                                <tr><td colSpan={6} className="px-6 py-8 text-center text-muted-foreground">{t('No credentials found.')}</td></tr>
+                                <tr><td colSpan={7} className="px-6 py-8 text-center text-muted-foreground">{t('No credentials found.')}</td></tr>
                             ) : (
                                 pagedCredentials.map((cred: Credential) => {
                                     const st = probeStatuses[cred.name];
+                                    const quotaResume = codexQuotaResumeMap[cred.name];
                                     const probeLockKey = `probe-single:${cred.name}`;
                                     const isProbeRunning = st?.status === 'running' || isLocked(probeLockKey);
                                     const canProbe = canProbeCredential(cred);
+                                    const quotaCards = Array.isArray(st?.quotaCards) ? st.quotaCards : [];
+                                    const fallbackQuotaPercent = normalizePercent((st?.quotaUsedPercent ?? quotaResume?.usedPercent) as number | null | undefined);
+                                    const fallbackQuotaRemainingPercent = toRemainingPercent(fallbackQuotaPercent);
+                                    const quotaResetAt = st?.quotaResetAt ?? quotaResume?.resetAt ?? null;
+                                    const remainingLabel = i18n.language === 'zh' ? '剩余' : 'Remaining';
+
+                                    const displayQuotaCards = quotaCards.length
+                                        ? quotaCards.filter((card) => toRemainingPercent(normalizePercent(card.usedPercent)) !== null)
+                                        : (fallbackQuotaRemainingPercent !== null
+                                            ? [{ key: 'fallback', label: t('Quota'), usedPercent: fallbackQuotaPercent, resetAt: quotaResetAt }]
+                                            : []);
+
+                                    const quotaCardBlock = displayQuotaCards.length ? (
+                                        <div className="flex min-w-[360px] max-w-[420px] flex-wrap gap-2">
+                                            {displayQuotaCards.map((card) => {
+                                                const remainingPercent = toRemainingPercent(normalizePercent(card.usedPercent));
+                                                if (remainingPercent === null) return null;
+                                                return (
+                                                    <div key={card.key} className="min-w-[170px] rounded-md border border-border/60 bg-background/80 px-3 py-2.5 shadow-sm">
+                                                        <div className="flex items-center justify-between gap-2 text-[10px] font-medium text-foreground/90">
+                                                            <span className="truncate">{card.label}</span>
+                                                            <span>{Math.round(remainingPercent)}%</span>
+                                                        </div>
+                                                        <div className="mt-1 h-1.5 overflow-hidden rounded bg-muted">
+                                                            <div className={`h-full ${getQuotaMeterClass(remainingPercent)}`} style={{ width: `${remainingPercent}%` }} />
+                                                        </div>
+                                                        <div className="mt-1 text-[10px] text-muted-foreground truncate">
+                                                            {remainingLabel}
+                                                        </div>
+                                                        {(card.resetAt || quotaResetAt) ? (
+                                                            <div className="mt-1 text-[10px] text-muted-foreground truncate">
+                                                                {t('Reset At')}: {formatResetAtText(card.resetAt ?? quotaResetAt)}
+                                                            </div>
+                                                        ) : null}
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    ) : null;
 
                                     const getProviderBadge = (provider: string) => {
                                         switch (provider.toLowerCase()) {
@@ -2362,9 +2836,27 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
                                             <td className="px-6 py-4">
                                                 {cred.disabled ? (
                                                     <div className="flex flex-col items-start gap-1">
-                                                        <div className="inline-flex items-center rounded-md border border-destructive/20 bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive/90" title={st?.reason}>
-                                                            <XCircle className="w-3.5 h-3.5 mr-1" /> {t('Disabled')} <span className="text-destructive/50 ml-1.5 pl-1.5 border-l border-destructive/20 text-[10px]">{t('Auto-check: 1h')}</span>
-                                                        </div>
+                                                        {(() => {
+                                                            const disabledBadge = getDisabledBadgeMeta(st?.status, Boolean(quotaResume));
+                                                            const quotaRemainingPercent = toRemainingPercent(normalizePercent(quotaResume?.usedPercent));
+                                                            return (
+                                                                <>
+                                                                    <div className="inline-flex items-center rounded-md border border-destructive/20 bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive/90" title={st?.reason}>
+                                                                        <XCircle className="w-3.5 h-3.5 mr-1" />
+                                                                        {disabledBadge.label}
+                                                                        <span className="text-destructive/50 ml-1.5 pl-1.5 border-l border-destructive/20 text-[10px]">
+                                                                            {disabledBadge.detail}
+                                                                        </span>
+                                                                    </div>
+                                                                    {quotaResume && (
+                                                                        <div className="text-[11px] font-medium text-destructive/90 max-w-[280px] break-words whitespace-normal leading-tight">
+                                                                            {t('Auto Enable At')}: {formatResetAtText(quotaResume.resetAt)}
+                                                                            {quotaRemainingPercent !== null ? ` | ${i18n.language === 'zh' ? '剩余' : 'Remaining'}: ${quotaRemainingPercent}%` : ''}
+                                                                        </div>
+                                                                    )}
+                                                                </>
+                                                            );
+                                                        })()}
                                                         {st?.reason && (
                                                             <div className="text-[11px] font-medium text-destructive/90 max-w-[280px] break-words whitespace-normal leading-tight" title={st.reason}>
                                                                 {st.reason}
@@ -2384,8 +2876,8 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
                                                         <div className="flex items-center gap-2">
                                                             {st?.status === 'active' ? (
                                                                 <span className="flex items-center text-emerald-500"><CheckCircle2 className="w-4 h-4 mr-1.5" /> {t('Active')}</span>
-                                                            ) : st?.status === 'invalidated' || st?.status === 'unauthorized' || st?.status === 'deactivated' || st?.status === 'expired_by_time' || st?.status === 'error' ? (
-                                                                <span className="flex items-center text-destructive" title={st.reason}><AlertTriangle className="w-4 h-4 mr-1.5" /> {t(st.status)}</span>
+                                                            ) : st?.status === 'invalidated' || st?.status === 'unauthorized' || st?.status === 'deactivated' || st?.status === 'expired_by_time' || st?.status === 'quota_exhausted' || st?.status === 'quota_low_remaining' || st?.status === 'error' ? (
+                                                                <span className="flex items-center text-destructive" title={st.reason}><AlertTriangle className="w-4 h-4 mr-1.5" /> {st.status === 'quota_low_remaining' ? (i18n.language === 'zh' ? '剩余额度过低' : 'Low Remaining Quota') : t(st.status)}</span>
                                                             ) : st?.status === 'unknown' ? (
                                                                 <span className="flex items-center text-amber-500"><AlertTriangle className="w-4 h-4 mr-1.5" /> {t('Unknown')}</span>
                                                             ) : (
@@ -2407,6 +2899,9 @@ function CredentialManager({ cpaReady, cpaUrl }: CredentialManagerProps) {
                                                         )}
                                                     </div>
                                                 )}
+                                            </td>
+                                            <td className="px-6 py-4 align-top">
+                                                {quotaCardBlock || <span className="text-xs text-muted-foreground">-</span>}
                                             </td>
                                             <td className="px-6 py-4 text-muted-foreground">
                                                 {st?.time || 'Never'}
@@ -2831,5 +3326,16 @@ function ArchivePanel({ cpaReady, cpaUrl }: ArchivePanelProps) {
         </div>
     );
 }
+
+
+
+
+
+
+
+
+
+
+
 
 
