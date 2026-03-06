@@ -2,6 +2,19 @@
 .gitignore
 .ignore
 
+frontend/config.yaml
+frontend/config.local.yaml
+frontend/config.local.yml
+feature_list.json
+progress.txt
+backup
+tests
+runtime
+test_codex_ops.py
+.venv
+venv
+env
+
 archive
 cockpit-tools
 CLIProxyAPI
@@ -22,4 +35,3 @@ runtime/*.jsonl
 runtime/*.csv
 runtime/*.txt
 runtime/*.log
-

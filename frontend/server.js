@@ -21,29 +21,30 @@ app.use(express.json({ limit: '10mb' }));
 
 // Helper to read config
 function readConfig() {
+  const defaults = {
+    cpa_url: '',
+    management_key: '',
+    mail_api_base: '',
+    mail_username: '',
+    mail_password: '',
+    mail_email_domain: '',
+    auto_probe_enabled: false,
+    auto_probe_interval_minutes: 60,
+    codex_quota_disable_remaining_percent: 10,
+  };
   if (!fs.existsSync(CONFIG_PATH)) {
-    return {
-      cpa_url: '',
-      management_key: '',
-      mail_api_base: '',
-      mail_username: '',
-      mail_password: '',
-      mail_email_domain: '',
-    };
+    return defaults;
   }
   const file = fs.readFileSync(CONFIG_PATH, 'utf8');
   try {
-    return yaml.load(file);
+    const parsed = yaml.load(file);
+    if (!parsed || typeof parsed !== 'object') {
+      return defaults;
+    }
+    return { ...defaults, ...parsed };
   } catch (e) {
     console.error('Failed to parse config.yaml', e);
-    return {
-      cpa_url: '',
-      management_key: '',
-      mail_api_base: '',
-      mail_username: '',
-      mail_password: '',
-      mail_email_domain: '',
-    };
+    return defaults;
   }
 }
 
@@ -416,17 +417,33 @@ app.post('/api/config', (req, res) => {
 app.post('/api/config/update', (req, res) => {
   const { old_password, new_config } = req.body;
   const config = readConfig();
+  const nextConfig = new_config && typeof new_config === 'object' ? new_config : {};
 
   // To update config, they must provide the correct current password
   if (isAuthorized(old_password, config)) {
     try {
+      const nextAutoProbeEnabled = nextConfig.auto_probe_enabled !== undefined
+        ? parseBoolSafe(nextConfig.auto_probe_enabled, parseBoolSafe(config.auto_probe_enabled, false))
+        : parseBoolSafe(config.auto_probe_enabled, false);
+      const nextAutoProbeIntervalMinutesRaw = nextConfig.auto_probe_interval_minutes !== undefined
+        ? parseIntSafe(nextConfig.auto_probe_interval_minutes, parseIntSafe(config.auto_probe_interval_minutes, 60))
+        : parseIntSafe(config.auto_probe_interval_minutes, 60);
+      const nextAutoProbeIntervalMinutes = Math.max(1, Math.min(1440, nextAutoProbeIntervalMinutesRaw));
+      const nextQuotaDisableRemainingPercentRaw = nextConfig.codex_quota_disable_remaining_percent !== undefined
+        ? parseIntSafe(nextConfig.codex_quota_disable_remaining_percent, parseIntSafe(config.codex_quota_disable_remaining_percent, 10))
+        : parseIntSafe(config.codex_quota_disable_remaining_percent, 10);
+      const nextQuotaDisableRemainingPercent = Math.max(0, Math.min(100, nextQuotaDisableRemainingPercentRaw));
+
       writeConfig({
-        cpa_url: new_config.cpa_url !== undefined ? new_config.cpa_url : config.cpa_url,
-        management_key: new_config.management_key !== undefined ? new_config.management_key : config.management_key,
-        mail_api_base: new_config.mail_api_base !== undefined ? new_config.mail_api_base : config.mail_api_base,
-        mail_username: new_config.mail_username !== undefined ? new_config.mail_username : config.mail_username,
-        mail_password: new_config.mail_password !== undefined ? new_config.mail_password : config.mail_password,
-        mail_email_domain: new_config.mail_email_domain !== undefined ? new_config.mail_email_domain : config.mail_email_domain,
+        cpa_url: nextConfig.cpa_url !== undefined ? nextConfig.cpa_url : config.cpa_url,
+        management_key: nextConfig.management_key !== undefined ? nextConfig.management_key : config.management_key,
+        mail_api_base: nextConfig.mail_api_base !== undefined ? nextConfig.mail_api_base : config.mail_api_base,
+        mail_username: nextConfig.mail_username !== undefined ? nextConfig.mail_username : config.mail_username,
+        mail_password: nextConfig.mail_password !== undefined ? nextConfig.mail_password : config.mail_password,
+        mail_email_domain: nextConfig.mail_email_domain !== undefined ? nextConfig.mail_email_domain : config.mail_email_domain,
+        auto_probe_enabled: nextAutoProbeEnabled,
+        auto_probe_interval_minutes: nextAutoProbeIntervalMinutes,
+        codex_quota_disable_remaining_percent: nextQuotaDisableRemainingPercent,
       });
       res.json({ ok: true });
     } catch (e) {

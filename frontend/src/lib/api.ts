@@ -34,7 +34,7 @@ export interface Credential {
   [key: string]: unknown;
 }
 
-export type CheckStatus = 'active' | 'invalidated' | 'deactivated' | 'unauthorized' | 'expired_by_time' | 'unknown' | 'error';
+export type CheckStatus = 'active' | 'invalidated' | 'deactivated' | 'unauthorized' | 'expired_by_time' | 'quota_exhausted' | 'quota_low_remaining' | 'unknown' | 'error';
 
 export interface OperationLog {
   at: string;
@@ -249,17 +249,14 @@ export const fetchAuthFilesForceRefresh = async (): Promise<Credential[]> => {
 };
 
 export const probeCredential = async (auth_index: string, provider: string, signal?: AbortSignal): Promise<ProbeResponse> => {
-  let method = 'POST';
-  let url = 'https://chatgpt.com/backend-api/codex/responses';
+  let method = 'GET';
+  let url = 'https://chatgpt.com/backend-api/wham/usage';
   let header: Record<string, string> = {
     Authorization: 'Bearer $TOKEN$',
     'Content-Type': 'application/json',
-    'Openai-Beta': 'responses=experimental',
-    Version: '0.98.0',
-    Originator: 'codex_cli_rs',
     'User-Agent': 'codex_cli_rs/0.98.0',
   };
-  let data: string | undefined = '{"model":"gpt-4.1-mini","input":"ping","stream":false}';
+  let data: string | undefined;
 
   if (provider.toLowerCase() === 'antigravity') {
     method = 'POST';
