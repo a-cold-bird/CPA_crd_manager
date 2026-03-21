@@ -120,7 +120,7 @@ export default function Dashboard() {
                         data.config.codex_quota_disable_remaining_percent,
                         clampQuotaDisableRemainingPercent(localStorage.getItem('codex_quota_disable_remaining_percent') || 10),
                     );
-                    cpaApi.defaults.baseURL = resolvedUrl;
+                    cpaApi.defaults.baseURL = '/api/cpa';
                     setCpaUrl(resolvedUrl);
                     setMailApiBase(String(data.config.mail_api_base || ''));
                     setMailUsername(String(data.config.mail_username || ''));

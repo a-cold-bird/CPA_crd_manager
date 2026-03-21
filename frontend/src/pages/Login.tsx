@@ -27,7 +27,7 @@ export default function Login() {
 
             if (data.ok && data.config) {
                 localStorage.setItem('management_key', normalizedPassword);
-                cpaApi.defaults.baseURL = data.config.cpa_url;
+                cpaApi.defaults.baseURL = '/api/cpa';
                 navigate('/');
             } else {
                 setError(t('Authentication failed'));

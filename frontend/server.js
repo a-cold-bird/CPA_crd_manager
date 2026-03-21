@@ -68,6 +68,31 @@ function resolveReadableConfigPath() {
   return '';
 }
 
+function resolveReadableFilePath(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return '';
+  }
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.isFile()) {
+      return filePath;
+    }
+    console.error(`Path exists but is not a file: ${filePath}`);
+  } catch (error) {
+    console.error(`Failed to stat path ${filePath}`, error);
+  }
+  return '';
+}
+
+function ensureWritableFilePath(filePath) {
+  if (fs.existsSync(filePath)) {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      throw new Error(`Path must be a file, but received: ${filePath}`);
+    }
+  }
+}
+
 // Helper to read config
 function readConfig() {
   const defaults = {
@@ -318,11 +343,12 @@ function normalizeCodexReplenishBatchSize(value, fallback = 1) {
 }
 
 function readArchiveStore() {
-  if (!fs.existsSync(ARCHIVE_STORE_PATH)) {
+  const storePath = resolveReadableFilePath(ARCHIVE_STORE_PATH);
+  if (!storePath) {
     return { by_cpa_url: {} };
   }
   try {
-    const raw = fs.readFileSync(ARCHIVE_STORE_PATH, 'utf8');
+    const raw = fs.readFileSync(storePath, 'utf8');
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') {
       return { by_cpa_url: {} };
@@ -344,6 +370,7 @@ function readArchiveStore() {
 }
 
 function writeArchiveStore(store) {
+  ensureWritableFilePath(ARCHIVE_STORE_PATH);
   const normalizedStore = { by_cpa_url: {} };
   const source = store?.by_cpa_url && typeof store.by_cpa_url === 'object' ? store.by_cpa_url : {};
   Object.entries(source).forEach(([rawKey, value]) => {
@@ -500,11 +527,12 @@ function normalizeReplenishmentStatus(value) {
 }
 
 function readReplenishmentStatus() {
-  if (!fs.existsSync(REPLENISHMENT_STATUS_PATH)) {
+  const statusPath = resolveReadableFilePath(REPLENISHMENT_STATUS_PATH);
+  if (!statusPath) {
     return createEmptyReplenishmentStatus();
   }
   try {
-    const raw = fs.readFileSync(REPLENISHMENT_STATUS_PATH, 'utf8');
+    const raw = fs.readFileSync(statusPath, 'utf8');
     const parsed = JSON.parse(raw);
     return normalizeReplenishmentStatus(parsed);
   } catch {
@@ -513,6 +541,7 @@ function readReplenishmentStatus() {
 }
 
 function writeReplenishmentStatus(status) {
+  ensureWritableFilePath(REPLENISHMENT_STATUS_PATH);
   const normalized = normalizeReplenishmentStatus(status);
   fs.writeFileSync(REPLENISHMENT_STATUS_PATH, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
 }
@@ -646,11 +675,12 @@ function normalizeRuntimeStateStore(value) {
 }
 
 function readRuntimeState() {
-  if (!fs.existsSync(RUNTIME_STATE_PATH)) {
+  const statePath = resolveReadableFilePath(RUNTIME_STATE_PATH);
+  if (!statePath) {
     return createEmptyRuntimeState();
   }
   try {
-    const raw = fs.readFileSync(RUNTIME_STATE_PATH, 'utf8');
+    const raw = fs.readFileSync(statePath, 'utf8');
     const parsed = JSON.parse(raw);
     return normalizeRuntimeStateStore(parsed);
   } catch (error) {
@@ -660,6 +690,7 @@ function readRuntimeState() {
 }
 
 function writeRuntimeState(store) {
+  ensureWritableFilePath(RUNTIME_STATE_PATH);
   const normalized = normalizeRuntimeStateStore(store);
   fs.mkdirSync(path.dirname(RUNTIME_STATE_PATH), { recursive: true });
   fs.writeFileSync(RUNTIME_STATE_PATH, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
@@ -2015,6 +2046,99 @@ app.post('/api/remote/push-test', async (req, res) => {
           error: String(error?.message || error),
         },
       },
+    });
+  }
+});
+
+app.get('/api/cpa/auth-files', async (req, res) => {
+  const config = readConfig();
+  if (!isAuthorized(resolveRequestSecret(req), config)) {
+    res.status(401).json({ ok: false, error: 'Unauthorized' });
+    return;
+  }
+
+  try {
+    const files = await fetchAuthFilesFromCpa(config);
+    res.json({ files });
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      error: String(error?.message || error),
+      payload: error?.response?.data ?? null,
+    });
+  }
+});
+
+app.patch('/api/cpa/auth-files/status', async (req, res) => {
+  const config = readConfig();
+  if (!isAuthorized(resolveRequestSecret(req), config)) {
+    res.status(401).json({ ok: false, error: 'Unauthorized' });
+    return;
+  }
+
+  try {
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const name = normalizeCredentialName(body.name);
+    if (!name) {
+      res.status(400).json({ ok: false, error: 'name is required' });
+      return;
+    }
+    const disabled = Boolean(body.disabled);
+    const result = await updateCredentialDisabledStatus(config, name, disabled);
+    res.json(result.data ?? { ok: true });
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      error: String(error?.message || error),
+      payload: error?.response?.data ?? null,
+    });
+  }
+});
+
+app.delete('/api/cpa/auth-files', async (req, res) => {
+  const config = readConfig();
+  if (!isAuthorized(resolveRequestSecret(req), config)) {
+    res.status(401).json({ ok: false, error: 'Unauthorized' });
+    return;
+  }
+
+  try {
+    const name = normalizeCredentialName(req.query?.name);
+    if (!name) {
+      res.status(400).json({ ok: false, error: 'name is required' });
+      return;
+    }
+    const result = await deleteAuthFileFromCpa(config, name);
+    res.json(result.data ?? { ok: true });
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      error: String(error?.message || error),
+      payload: error?.response?.data ?? null,
+    });
+  }
+});
+
+app.post('/api/cpa/api-call', async (req, res) => {
+  const config = readConfig();
+  if (!isAuthorized(resolveRequestSecret(req), config)) {
+    res.status(401).json({ ok: false, error: 'Unauthorized' });
+    return;
+  }
+
+  try {
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const result = await cpaRequest(config, {
+      method: 'POST',
+      pathname: '/v0/management/api-call',
+      body,
+    });
+    res.status(result.status || 200).json(result.data ?? {});
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      error: String(error?.message || error),
+      payload: error?.response?.data ?? null,
     });
   }
 });

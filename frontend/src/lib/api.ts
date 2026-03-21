@@ -14,7 +14,9 @@ configApi.interceptors.request.use((config) => {
 });
 
 // 2. Create the main CPA API client
-export const cpaApi = axios.create(); // baseURL will be set dynamically once config is loaded
+export const cpaApi = axios.create({
+  baseURL: '/api/cpa',
+});
 
 cpaApi.interceptors.request.use((config) => {
   const key = localStorage.getItem('management_key');
