@@ -49,6 +49,25 @@ const runtimeScheduler = {
 let backendServerLockHeld = false;
 
 
+function resolveReadableConfigPath() {
+  const candidates = [CONFIG_PATH, CONFIG_FALLBACK_PATH];
+  for (const candidate of candidates) {
+    if (!candidate || !fs.existsSync(candidate)) {
+      continue;
+    }
+    try {
+      const stat = fs.statSync(candidate);
+      if (stat.isFile()) {
+        return candidate;
+      }
+      console.error(`Config path exists but is not a file: ${candidate}`);
+    } catch (error) {
+      console.error(`Failed to stat config path ${candidate}`, error);
+    }
+  }
+  return '';
+}
+
 // Helper to read config
 function readConfig() {
   const defaults = {
@@ -71,14 +90,12 @@ function readConfig() {
     auto_probe_interval_minutes: 60,
     codex_quota_disable_remaining_percent: 10,
   };
-  const configPathToRead = fs.existsSync(CONFIG_PATH)
-    ? CONFIG_PATH
-    : (fs.existsSync(CONFIG_FALLBACK_PATH) ? CONFIG_FALLBACK_PATH : '');
+  const configPathToRead = resolveReadableConfigPath();
   if (!configPathToRead) {
     return defaults;
   }
-  const file = fs.readFileSync(configPathToRead, 'utf8');
   try {
+    const file = fs.readFileSync(configPathToRead, 'utf8');
     const parsed = yaml.load(file);
     if (!parsed || typeof parsed !== 'object') {
       return defaults;
@@ -108,6 +125,12 @@ function readConfig() {
 
 // Helper to write config
 function writeConfig(data) {
+  if (fs.existsSync(CONFIG_PATH)) {
+    const stat = fs.statSync(CONFIG_PATH);
+    if (!stat.isFile()) {
+      throw new Error(`CONFIG_PATH must be a file, but received: ${CONFIG_PATH}`);
+    }
+  }
   const current = readConfig();
   const merged = { ...current, ...data };
   const normalizedTargetCount = resolveCodexReplenishTargetCount(merged, 5);
