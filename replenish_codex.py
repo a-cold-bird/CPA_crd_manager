@@ -372,6 +372,7 @@ def create_empty_replenishment_status() -> Dict[str, Any]:
         "threshold": None,
         "batch_size": None,
         "use_proxy": None,
+        "healthy_count": None,
         "needed": None,
         "new_token_files": None,
         "last_scan_register_total": None,
@@ -940,7 +941,14 @@ def process_token_for_cpa(
         "cleaned_paths": cleaned_paths,
     }
 
-def start_replenishment_status(mode: str, config: Dict[str, Any], *, limit: Optional[int] = None, needed: Optional[int] = None) -> None:
+def start_replenishment_status(
+    mode: str,
+    config: Dict[str, Any],
+    *,
+    limit: Optional[int] = None,
+    needed: Optional[int] = None,
+    healthy_count: Optional[int] = None,
+) -> None:
     now_ms = _now_ms()
     target_count = config.get('codex_replenish_target_count', config.get('codex_target_count'))
     threshold = config.get('codex_replenish_threshold')
@@ -956,6 +964,7 @@ def start_replenishment_status(mode: str, config: Dict[str, Any], *, limit: Opti
         threshold=int(threshold) if threshold is not None else None,
         batch_size=int(batch_size) if batch_size is not None else None,
         use_proxy=bool(config.get('codex_replenish_use_proxy', False)),
+        healthy_count=max(0, int(healthy_count)) if healthy_count is not None else None,
         needed=needed,
         new_token_files=None,
         last_scan_register_total=None,
@@ -987,6 +996,7 @@ def finish_replenishment_status(
     cpa_total: Optional[int] = None,
     missing_count: Optional[int] = None,
     new_token_files: Optional[int] = None,
+    healthy_count: Optional[int] = None,
 ) -> None:
     update_replenishment_status(
         in_progress=False,
@@ -1000,10 +1010,12 @@ def finish_replenishment_status(
         last_scan_cpa_total=cpa_total,
         last_scan_missing_count=missing_count,
         new_token_files=new_token_files,
+        healthy_count=max(0, int(healthy_count)) if healthy_count is not None else None,
     )
 
 def update_running_replenishment_status(
     *,
+    healthy_count: Optional[int] = None,
     needed: Optional[int] = None,
     uploaded: Optional[int] = None,
     failed: Optional[int] = None,
@@ -1018,6 +1030,8 @@ def update_running_replenishment_status(
     partial: Dict[str, Any] = {
         "in_progress": True,
     }
+    if healthy_count is not None:
+        partial["healthy_count"] = max(0, int(healthy_count))
     if needed is not None:
         partial["needed"] = max(0, int(needed))
     if uploaded is not None:
@@ -1043,6 +1057,7 @@ def update_running_replenishment_status(
 def write_replenishment_idle_status(
     config: Dict[str, Any],
     *,
+    healthy_count: Optional[int] = None,
     needed: int,
     summary: str,
     error: str = "",
@@ -1059,6 +1074,7 @@ def write_replenishment_idle_status(
         threshold=int(threshold) if threshold is not None else None,
         batch_size=int(batch_size) if batch_size is not None else None,
         use_proxy=bool(config.get('codex_replenish_use_proxy', False)),
+        healthy_count=max(0, int(healthy_count)) if healthy_count is not None else None,
         needed=max(0, int(needed)),
         new_token_files=0,
         last_summary=str(summary or ""),
@@ -1354,12 +1370,13 @@ def build_register_progress_hook(batch_attempt: int):
             return
 
         if event_type == "account_attempt_failed":
+            idx = int(payload.get("idx") or 0)
+            total = int(payload.get("total") or 0)
+            attempt = int(payload.get("attempt") or 0)
+            email = str(payload.get("email") or "")
+            proxy = str(payload.get("proxy") or "")
+            error = str(payload.get("error") or "unknown error")
             if bool(payload.get("final")):
-                idx = int(payload.get("idx") or 0)
-                total = int(payload.get("total") or 0)
-                email = str(payload.get("email") or "")
-                proxy = str(payload.get("proxy") or "")
-                error = str(payload.get("error") or "unknown error")
                 def _mutate(current: Dict[str, Any]) -> None:
                     batch = normalize_batch_status(current.get("current_batch")) or create_empty_batch_status()
                     upsert_batch_account(
@@ -1378,6 +1395,26 @@ def build_register_progress_hook(batch_attempt: int):
                     )
                     current["current_batch"] = batch
                 mutate_replenishment_status(_mutate)
+                return
+            def _mutate_retry(current: Dict[str, Any]) -> None:
+                batch = normalize_batch_status(current.get("current_batch")) or create_empty_batch_status()
+                upsert_batch_account(
+                    batch,
+                    idx=idx,
+                    total=total,
+                    email=email,
+                    proxy=proxy,
+                    status="retrying",
+                    error=f"Attempt {attempt} failed: {error}",
+                )
+                batch["current_email"] = email or batch.get("current_email") or ""
+                batch["current_proxy"] = proxy or batch.get("current_proxy") or ""
+                append_batch_event(
+                    batch,
+                    f"Account {idx}/{total} attempt {attempt} failed for {email or 'pending-email'} via {proxy or 'direct'}: {error}",
+                )
+                current["current_batch"] = batch
+            mutate_replenishment_status(_mutate_retry)
             return
 
         if event_type == "account_failed":
@@ -1497,12 +1534,12 @@ def replenish(needed: int, config: Dict[str, Any], state_path: str):
     registration_attempts = 0
     remaining_budget = max(needed * 3, needed + 10, configured_batch_size)
 
-    logger.info(f"Target reached: No, needed: {needed}. Starting replenishment...")
-    start_replenishment_status('replenish', config, needed=needed)
-
     estimated_active = count_normal_accounts(cpa_url, management_key, load_runtime_state(state_path))
+    logger.info(f"Target reached: No, needed: {needed}. Starting replenishment...")
+    start_replenishment_status('replenish', config, needed=needed, healthy_count=estimated_active)
     target_limit = target_count if target_count > 0 else estimated_active + needed
     update_running_replenishment_status(
+        healthy_count=estimated_active,
         needed=max(0, target_limit - estimated_active),
         uploaded=0,
         failed=0,
@@ -1529,6 +1566,7 @@ def replenish(needed: int, config: Dict[str, Any], state_path: str):
         registration_attempts += 1
         remaining_budget -= batch_size
         update_running_replenishment_status(
+            healthy_count=estimated_active,
             needed=max(0, target_limit - estimated_active),
             uploaded=success_uploads,
             failed=len(failed_names),
@@ -1546,6 +1584,7 @@ def replenish(needed: int, config: Dict[str, Any], state_path: str):
                 remaining_budget,
             )
             update_running_replenishment_status(
+                healthy_count=estimated_active,
                 needed=max(0, target_limit - estimated_active),
                 uploaded=success_uploads,
                 failed=len(failed_names),
@@ -1602,6 +1641,7 @@ def replenish(needed: int, config: Dict[str, Any], state_path: str):
                 mutate_replenishment_status(_mutate_upload_failed)
 
             update_running_replenishment_status(
+                healthy_count=estimated_active,
                 needed=max(0, target_limit - estimated_active),
                 uploaded=success_uploads,
                 failed=len(failed_names),
@@ -1640,6 +1680,7 @@ def replenish(needed: int, config: Dict[str, Any], state_path: str):
         failed_names=failed_names,
         summary=summary,
         new_token_files=total_new_files,
+        healthy_count=estimated_active,
     )
 
 def backfill_missing_uploads(config: Dict[str, Any], limit: Optional[int] = None) -> int:

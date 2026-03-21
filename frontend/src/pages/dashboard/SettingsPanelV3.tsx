@@ -173,6 +173,8 @@ function getAccountStatusLabel(status: string, text: (en: string, zh: string) =>
   switch (String(status || '').trim().toLowerCase()) {
     case 'registering':
       return text('Registering', '注册中');
+    case 'retrying':
+      return text('Retrying', '重试中');
     case 'registered':
       return text('Registered', '已注册');
     case 'codex_failed':

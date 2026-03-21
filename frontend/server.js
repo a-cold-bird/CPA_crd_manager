@@ -463,6 +463,7 @@ function createEmptyReplenishmentStatus() {
     threshold: null,
     batch_size: null,
     use_proxy: false,
+    healthy_count: null,
     needed: null,
     new_token_files: null,
     last_scan_register_total: null,
@@ -496,6 +497,7 @@ function normalizeReplenishmentStatus(value) {
     threshold: normalizeNumberOrNull(source.threshold),
     batch_size: normalizeNumberOrNull(source.batch_size),
     use_proxy: normalizeBoolean(source.use_proxy, false),
+    healthy_count: normalizeNumberOrNull(source.healthy_count),
     needed: normalizeNumberOrNull(source.needed),
     new_token_files: normalizeNumberOrNull(source.new_token_files),
     last_scan_register_total: normalizeNumberOrNull(source.last_scan_register_total),
@@ -1473,6 +1475,16 @@ function buildRuntimeStatusPayload(config) {
   const hasRuntimeConfig = Boolean(normalizeCpaBaseUrl(config?.cpa_url) && String(config?.management_key || '').trim());
   const healthyCodexCount = countNormalCodexAccountsFromRuntime(runtimeState, cpaUrlKey);
   const replenishmentTracked = Boolean(trackedReplenishment) || normalizeBoolean(replenishmentStatus.in_progress, false);
+  const statusHealthyCount = normalizeNumberOrNull(replenishmentStatus.healthy_count);
+  const derivedHealthyCount = statusHealthyCount ?? healthyCodexCount;
+  const statusTargetCount = normalizeNumberOrNull(replenishmentStatus.target_count);
+  const configTargetCount = normalizeNonNegativeInteger(
+    config?.codex_replenish_target_count,
+    normalizeNonNegativeInteger(config?.codex_target_count, 0),
+  );
+  const effectiveTargetCount = statusTargetCount ?? configTargetCount;
+  const statusNeeded = normalizeNumberOrNull(replenishmentStatus.needed);
+  const derivedNeeded = statusNeeded ?? Math.max(0, effectiveTargetCount - derivedHealthyCount);
 
   return {
     cpa_url: cpaUrlKey,
@@ -1494,13 +1506,13 @@ function buildRuntimeStatusPayload(config) {
         stop_requested: runtimeScheduler.replenishmentStopRequested,
         process_pid: trackedReplenishment?.pid ?? normalizeNumberOrNull(runtimeScheduler.replenishmentPid),
         mode: normalizeStringOrEmpty(replenishmentStatus.mode),
-      healthy_count: healthyCodexCount,
+      healthy_count: derivedHealthyCount,
       proxy_pool_size: normalizeNumberOrNull(replenishmentStatus.proxy_pool_size),
-      target_count: normalizeNumberOrNull(replenishmentStatus.target_count),
+      target_count: effectiveTargetCount,
       threshold: normalizeNumberOrNull(replenishmentStatus.threshold),
       batch_size: normalizeNumberOrNull(replenishmentStatus.batch_size) ?? normalizeCodexReplenishBatchSize(config?.codex_replenish_batch_size, 1),
       use_proxy: normalizeBoolean(replenishmentStatus.use_proxy, false),
-      needed: normalizeNumberOrNull(replenishmentStatus.needed),
+      needed: derivedNeeded,
       new_token_files: normalizeNumberOrNull(replenishmentStatus.new_token_files),
       last_limit: normalizeNumberOrNull(replenishmentStatus.last_limit),
       last_scan_register_total: normalizeNumberOrNull(replenishmentStatus.last_scan_register_total),

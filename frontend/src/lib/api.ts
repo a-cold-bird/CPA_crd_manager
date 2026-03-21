@@ -264,7 +264,7 @@ export const clearAuthFilesCache = () => {
 };
 
 async function requestAuthFilesFromServer(): Promise<Credential[]> {
-  const res = await cpaApi.get('/v0/management/auth-files');
+  const res = await cpaApi.get('/auth-files');
   return res.data.files as Credential[];
 }
 
@@ -337,7 +337,7 @@ export const probeCredential = async (auth_index: string, provider: string, sign
   }
 
   const res = await cpaApi.post(
-    '/v0/management/api-call',
+    '/api-call',
     {
       auth_index,
       method,
@@ -353,7 +353,7 @@ export const probeCredential = async (auth_index: string, provider: string, sign
 };
 
 export const updateCredentialStatus = async (name: string, disabled: boolean) => {
-  const res = await cpaApi.patch('/v0/management/auth-files/status', {
+  const res = await cpaApi.patch('/auth-files/status', {
     name,
     disabled,
   });
@@ -362,7 +362,7 @@ export const updateCredentialStatus = async (name: string, disabled: boolean) =>
 };
 
 export const deleteCredential = async (name: string) => {
-  const res = await cpaApi.delete('/v0/management/auth-files', { params: { name } });
+  const res = await cpaApi.delete('/auth-files', { params: { name } });
   clearAuthFilesCache();
   return res.data;
 };
