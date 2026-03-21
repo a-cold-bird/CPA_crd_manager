@@ -12,6 +12,11 @@ license = { text = "MIT" }
 authors = [
   { name = "CPA Codex Credential Manager Contributors" }
 ]
+dependencies = [
+  "PyYAML>=6.0",
+  "requests>=2.31",
+  "curl-cffi>=0.7.0",
+]
 
 [project.scripts]
 codex-cpa-manager = "codex_cpa_credential_manager.cli:main"

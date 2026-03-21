@@ -34,7 +34,6 @@ const resources = {
             "Probe List": "Probe List",
             "Refresh List": "Refresh List",
             "Loading...": "Loading...",
-            "Refresh OAuth": "Refresh OAuth (Manual)",
             "items selected": "items selected",
             "Delete Selected": "Delete Selected",
             "ID / Index": "ID / Index",
@@ -73,13 +72,18 @@ const resources = {
             "Delete Multiple": "Delete Multiple",
             "Cancel": "Cancel",
             "Confirm": "Confirm",
-            "Failed to get OAuth URL from manager": "Failed to get OAuth URL from manager",
             "noProbeNeeded": "Probe not supported",
             "Auto-check: 1h": "Auto-check: hourly",
             "Temp Disabled (Quota)": "Temp Disabled (Quota)",
             "Auto Enable Scheduled": "Auto-enable scheduled",
             "Auto Enable At": "Auto-enable at",
-            "Usage": "Usage"
+            "Usage": "Usage",
+            "Codex Account Replenishment": "Codex Account Replenishment",
+            "Target Account Count": "Target Account Count",
+            "Replenish Threshold": "Replenish Threshold",
+            "Email Domains": "Email Domains",
+            "Use Proxy for Registration": "Use Proxy for Registration",
+            "Enabled": "Enabled"
         }
     },
     zh: {
@@ -114,7 +118,6 @@ const resources = {
             "Probe List": "探针扫描",
             "Refresh List": "刷新列表",
             "Loading...": "加载中...",
-            "Refresh OAuth": "新增 OAuth (手动)",
             "items selected": "项已选择",
             "Delete Selected": "批量删除",
             "ID / Index": "凭证标识",
@@ -153,13 +156,18 @@ const resources = {
             "Delete Multiple": "批量删除",
             "Cancel": "取消",
             "Confirm": "确认",
-            "Failed to get OAuth URL from manager": "获取登录连接失败",
             "noProbeNeeded": "此类型无需探测",
             "Auto-check: 1h": "自动巡检: 1 小时/次",
             "Temp Disabled (Quota)": "临时禁用(额度)",
             "Auto Enable Scheduled": "等待自动恢复",
             "Auto Enable At": "预计恢复时间",
-            "Usage": "使用率"
+            "Usage": "使用率",
+            "Codex Account Replenishment": "Codex 账号自动补货",
+            "Target Account Count": "目标账号存量",
+            "Replenish Threshold": "补货触发阈值",
+            "Email Domains": "备选邮箱域名",
+            "Use Proxy for Registration": "注册时使用代理",
+            "Enabled": "启动自动补货"
         }
     }
 };

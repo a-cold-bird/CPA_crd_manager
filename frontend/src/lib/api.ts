@@ -5,6 +5,14 @@ export const configApi = axios.create({
   baseURL: '/api', // this goes to our local node server
 });
 
+configApi.interceptors.request.use((config) => {
+  const key = localStorage.getItem('management_key');
+  if (key) {
+    config.headers['Authorization'] = `Bearer ${key}`;
+  }
+  return config;
+});
+
 // 2. Create the main CPA API client
 export const cpaApi = axios.create(); // baseURL will be set dynamically once config is loaded
 
@@ -34,7 +42,7 @@ export interface Credential {
   [key: string]: unknown;
 }
 
-export type CheckStatus = 'active' | 'invalidated' | 'deactivated' | 'unauthorized' | 'expired_by_time' | 'quota_exhausted' | 'quota_low_remaining' | 'unknown' | 'error';
+export type CheckStatus = 'active' | 'invalidated' | 'deactivated' | 'unauthorized' | 'expired_by_time' | 'quota_exhausted' | 'quota_low_remaining' | 'rate_limited' | 'unknown' | 'error';
 
 export interface OperationLog {
   at: string;
@@ -62,56 +70,14 @@ export interface LocalCliResult<T = Record<string, unknown>> {
   error?: string;
 }
 
-export interface OAuthLoginRequest {
-  provider: string;
-  account_file: string;
-  index?: number;
-  wait_seconds?: number;
-  max_wait?: number;
-  headless?: boolean;
-  callback_url?: string;
-  timeout?: number;
-}
-
-export interface OAuthAppendAccountsRequest {
-  provider: string;
-  account_file: string;
-  content: string;
-}
-
-export interface OAuthDeleteAccountsRequest {
-  provider: string;
-  account_file: string;
-  indexes: number[];
-  exec_timeout_ms?: number;
-}
-
-export interface OAuthAppendAccountsPayload {
-  file: string;
-  appended: number;
-  added?: number;
-  overwritten?: number;
-  skipped_invalid?: number;
-  input_total?: number;
-  final_total?: number;
-}
-
-export interface OAuthDeleteAccountsPayload {
-  detail?: {
-    file?: string;
-    provider?: string;
-    requested?: number;
-    deleted?: number;
-    missing?: number;
-    missing_indexes?: number[];
-    total_before?: number;
-    total_after?: number;
-  };
-}
-
 export interface CredentialArchivePayload {
   cpa_url: string;
   names: string[];
+  entries: Array<{
+    name: string;
+    archived_at: number | null;
+    archived_at_iso: string;
+  }>;
   total: number;
   added?: number;
   removed?: number;
@@ -122,55 +88,155 @@ export interface CredentialArchiveRequest {
   names?: string[];
 }
 
-export interface OAuthLoginBatchRequest {
-  provider: string;
-  account_file: string;
-  start?: number;
-  limit?: number;
-  indexes?: number[];
-  workers?: number;
-  retries?: number;
-  wait_seconds?: number;
-  max_wait?: number;
-  headless?: boolean;
-  callback_file?: string;
-  skip_submitted?: boolean;
-  cooldown?: number;
-  result_file?: string;
-  success_file?: string;
-  detail_log_file?: string;
-  dry_run?: boolean;
-  timeout?: number;
+export interface RuntimeCredentialState {
+  provider?: string;
+  last_status: CheckStatus;
+  last_reason: string;
+  last_probe_at: number | null;
+  last_probe_at_iso: string;
+  last_probe_detail: string;
+  last_reset_at: number | null;
+  last_quota_source: string;
+  last_quota_used_percent: number | null;
+  last_quota_cards: Array<{
+    key: string;
+    label: string;
+    usedPercent: number | null;
+    resetAt: number | null;
+    limitWindowSeconds: number | null;
+    limitReached: boolean | null;
+  }>;
+  next_probe_at_ms: number | null;
+  archived_by_runtime: boolean;
+  disabled_by_runtime: boolean;
 }
 
-export type OAuthPreviewMode = 'single' | 'batch';
-
-export interface OAuthAccountPreviewRequest {
-  provider: string;
-  account_file: string;
-  mode?: OAuthPreviewMode;
-  index?: number;
-  start?: number;
-  limit?: number;
-  exec_timeout_ms?: number;
+export interface ReplenishmentBatchStatus {
+  accounts: Array<{
+    idx: number | null;
+    total: number | null;
+    email: string;
+    proxy: string;
+    status: string;
+    register_ok: boolean;
+    codex_ok: boolean;
+    upload_ok: boolean;
+    error: string;
+    updated_at: number | null;
+  }>;
+  attempt: number | null;
+  requested: number | null;
+  workers: number | null;
+  selected_domain: string;
+  email_selection_mode: string;
+  status: string;
+  register_succeeded: number;
+  register_failed: number;
+  codex_succeeded: number;
+  codex_failed: number;
+  upload_succeeded: number;
+  upload_failed: number;
+  current_proxy: string;
+  current_email: string;
+  last_error: string;
+  started_at: number | null;
+  finished_at: number | null;
+  events: string[];
 }
 
-export interface OAuthAccountPreviewAccount {
-  index: number;
-  email: string;
-  provider: string;
-  channel: string;
-  has_access_token: boolean;
-  has_recovery_email: boolean;
-  has_totp_url: boolean;
+export interface RuntimeStatusPayload {
+  cpa_url: string;
+  runtime: {
+    wake_interval_ms: number;
+    auto_probe_enabled: boolean;
+    has_runtime_config: boolean;
+    backend_automation_active: boolean;
+    cycle_in_progress: boolean;
+    last_cycle_started_at: number | null;
+    last_cycle_started_at_iso: string;
+    last_cycle_finished_at: number | null;
+    last_cycle_finished_at_iso: string;
+    last_error: string;
+  };
+  replenishment: {
+    enabled: boolean;
+    in_progress: boolean;
+    stop_requested: boolean;
+    process_pid: number | null;
+    mode: string;
+    healthy_count: number | null;
+    proxy_pool_size: number | null;
+    target_count: number | null;
+    threshold: number | null;
+    batch_size: number | null;
+    use_proxy: boolean;
+    needed: number | null;
+    new_token_files: number | null;
+    last_limit: number | null;
+    last_scan_register_total: number | null;
+    last_scan_cpa_total: number | null;
+    last_scan_missing_count: number | null;
+    last_uploaded: number | null;
+    last_failed: number | null;
+    failed_names: string[];
+    log_file: string;
+    recent_events: string[];
+    log_tail: string[];
+    last_started_at: number | null;
+    last_started_at_iso: string;
+    last_finished_at: number | null;
+    last_finished_at_iso: string;
+    last_error: string;
+    last_summary: string;
+    email_selection_mode: string;
+    last_selected_domain: string;
+    current_batch: ReplenishmentBatchStatus | null;
+    batch_history: ReplenishmentBatchStatus[];
+  };
+  credentials: Record<string, RuntimeCredentialState>;
 }
 
-export interface OAuthAccountPreviewPayload {
-  mode: OAuthPreviewMode;
-  total_accounts: number;
-  selected: number;
-  indexes: number[];
-  accounts: OAuthAccountPreviewAccount[];
+export interface RemotePushTestPayload {
+  target_cpa_url: string;
+  read_ok: boolean;
+  auth_files_total: number;
+  push_test: {
+    attempted: boolean;
+    upload_ok: boolean;
+    cleanup_ok: boolean;
+    upload_status: number | null;
+    cleanup_status: number | null;
+    upload_mode: string;
+    error: string;
+  };
+}
+
+export interface MailDomainTestPayload {
+  domain: string;
+  mailbox: string;
+  ok: boolean;
+  login_status: number | null;
+  list_status: number | null;
+  message: string;
+  error: string;
+}
+
+export interface StartReplenishmentPayload {
+  started: boolean;
+  already_running: boolean;
+  pid: number | null;
+  needed: number | null;
+  healthy_count: number | null;
+  target_count: number | null;
+  threshold: number | null;
+  message: string;
+}
+
+export interface StopReplenishmentPayload {
+  requested: boolean;
+  stopped: boolean;
+  pid: number | null;
+  message: string;
 }
 
 const AUTH_FILES_CACHE_TTL_MS = 3000;
@@ -299,26 +365,6 @@ export const deleteCredential = async (name: string) => {
   return res.data;
 };
 
-export const getCodexAuthUrl = async (is_webui: boolean = true) => {
-  const res = await cpaApi.get(`/v0/management/codex-auth-url?is_webui=${is_webui}`);
-  return res.data;
-};
-
-export const submitOAuthCallback = async (provider: string, redirectUrl: string, state?: string) => {
-  const res = await cpaApi.post('/v0/management/oauth-callback', {
-    provider,
-    redirect_url: redirectUrl,
-    state,
-  });
-  clearAuthFilesCache();
-  return res.data;
-};
-
-export const getOAuthStatus = async (state: string) => {
-  const res = await cpaApi.get(`/v0/management/get-auth-status?state=${state}`);
-  return res.data;
-};
-
 function getManagementKeyOrThrow(): string {
   const password = String(localStorage.getItem('management_key') || '').trim();
   if (!password) {
@@ -326,56 +372,6 @@ function getManagementKeyOrThrow(): string {
   }
   return password;
 }
-
-export const runOAuthLogin = async (
-  payload: OAuthLoginRequest,
-  options?: { signal?: AbortSignal },
-): Promise<LocalCliResult> => {
-  const password = getManagementKeyOrThrow();
-  const res = await configApi.post('/oauth/login', {
-    password,
-    ...payload,
-  }, {
-    signal: options?.signal,
-  });
-  return res.data as LocalCliResult;
-};
-
-export const runOAuthLoginBatch = async (payload: OAuthLoginBatchRequest): Promise<LocalCliResult> => {
-  const password = getManagementKeyOrThrow();
-  const res = await configApi.post('/oauth/login-batch', {
-    password,
-    ...payload,
-  });
-  return res.data as LocalCliResult;
-};
-
-export const runOAuthAccountPreview = async (payload: OAuthAccountPreviewRequest): Promise<LocalCliResult<OAuthAccountPreviewPayload>> => {
-  const password = getManagementKeyOrThrow();
-  const res = await configApi.post('/oauth/accounts/preview', {
-    password,
-    ...payload,
-  });
-  return res.data as LocalCliResult<OAuthAccountPreviewPayload>;
-};
-
-export const runOAuthAppendAccounts = async (payload: OAuthAppendAccountsRequest): Promise<LocalCliResult<OAuthAppendAccountsPayload>> => {
-  const password = getManagementKeyOrThrow();
-  const res = await configApi.post('/oauth/accounts/append', {
-    password,
-    ...payload,
-  });
-  return res.data as LocalCliResult<OAuthAppendAccountsPayload>;
-};
-
-export const runOAuthDeleteAccounts = async (payload: OAuthDeleteAccountsRequest): Promise<LocalCliResult<OAuthDeleteAccountsPayload>> => {
-  const password = getManagementKeyOrThrow();
-  const res = await configApi.post('/oauth/accounts/delete', {
-    password,
-    ...payload,
-  });
-  return res.data as LocalCliResult<OAuthDeleteAccountsPayload>;
-};
 
 export const runCredentialArchiveList = async (payload?: CredentialArchiveRequest): Promise<LocalCliResult<CredentialArchivePayload>> => {
   const password = getManagementKeyOrThrow();
@@ -402,4 +398,60 @@ export const runCredentialArchiveRemove = async (payload: CredentialArchiveReque
     ...payload,
   });
   return res.data as LocalCliResult<CredentialArchivePayload>;
+};
+
+export const fetchRuntimeStatus = async (): Promise<LocalCliResult<RuntimeStatusPayload>> => {
+  const res = await configApi.get('/runtime/status');
+  return res.data as LocalCliResult<RuntimeStatusPayload>;
+};
+
+export const upsertRuntimeCredentialState = async (payload: {
+  cpa_url?: string;
+  name: string;
+  state: Partial<RuntimeCredentialState>;
+}): Promise<LocalCliResult<{ cpa_url: string; name: string; state: RuntimeCredentialState }>> => {
+  const res = await configApi.post('/runtime/credential-state/upsert', payload);
+  return res.data as LocalCliResult<{ cpa_url: string; name: string; state: RuntimeCredentialState }>;
+};
+
+export const runRemotePushTest = async (payload?: {
+  target_cpa_url?: string;
+  target_management_key?: string;
+}): Promise<LocalCliResult<RemotePushTestPayload>> => {
+  const password = getManagementKeyOrThrow();
+  const res = await configApi.post('/remote/push-test', {
+    password,
+    ...payload,
+  });
+  return res.data as LocalCliResult<RemotePushTestPayload>;
+};
+
+export const runMailDomainTest = async (payload: {
+  domain: string;
+  mail_api_base?: string;
+  mail_username?: string;
+  mail_password?: string;
+}): Promise<LocalCliResult<MailDomainTestPayload>> => {
+  const password = getManagementKeyOrThrow();
+  const res = await configApi.post('/mail/domain-test', {
+    password,
+    ...payload,
+  });
+  return res.data as LocalCliResult<MailDomainTestPayload>;
+};
+
+export const stopReplenishment = async (): Promise<LocalCliResult<StopReplenishmentPayload>> => {
+  const password = getManagementKeyOrThrow();
+  const res = await configApi.post('/runtime/replenishment/stop', {
+    password,
+  });
+  return res.data as LocalCliResult<StopReplenishmentPayload>;
+};
+
+export const startReplenishment = async (): Promise<LocalCliResult<StartReplenishmentPayload>> => {
+  const password = getManagementKeyOrThrow();
+  const res = await configApi.post('/runtime/replenishment/start', {
+    password,
+  });
+  return res.data as LocalCliResult<StartReplenishmentPayload>;
 };

@@ -5,11 +5,14 @@
 - API auto-restart (`node --watch`): `npm run dev:api` (port `8333`)
 - Web HMR (`vite`): `npm run dev:web` (port `5173`)
 - One-click Windows start (run from project root): `..\\start-hot.bat`
+- One-click Linux start (run from project root): `../start_dev.sh`
 
 ## Production Start
 
 - Normal: `start.bat` (build + run)
 - Fallback mode: `start.bat --no-build` (skip build, use existing `dist`)
+- Linux: `./start.sh`
+- Linux fallback: `./start.sh --no-build`
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 

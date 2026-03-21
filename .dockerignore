@@ -5,6 +5,19 @@
 frontend/config.yaml
 frontend/config.local.yaml
 frontend/config.local.yml
+internal_register/config.json
+frontend/runtime
+frontend/ak.txt
+frontend/rk.txt
+ak.txt
+rk.txt
+stable_proxy.txt
+stable_proxies.txt
+internal_register/stable_proxy.txt
+internal_register/stable_proxies.txt
+registered_accounts.txt
+internal_register/registered_accounts.txt
+codex_tokens/
 feature_list.json
 progress.txt
 backup
@@ -16,8 +29,10 @@ venv
 env
 
 archive
+deploy_personal_data_*
 cockpit-tools
 CLIProxyAPI
+plans
 docs
 __pycache__
 

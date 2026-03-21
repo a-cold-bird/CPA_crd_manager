@@ -23,9 +23,8 @@ echo [INFO] Starting CPA dev servers with hot reload...
 echo [INFO] API  : http://127.0.0.1:8333
 echo [INFO] Web  : http://127.0.0.1:5173
 
-after_start:
-start "CPA Dev API" cmd /k "cd /d "%FRONTEND_DIR%" && npm run dev:api"
-start "CPA Dev Web" cmd /k "cd /d "%FRONTEND_DIR%" && npm run dev:web"
+start "CPA Dev API" cmd /k "cd /d ""%FRONTEND_DIR%"" && npm run dev:api"
+start "CPA Dev Web" cmd /k "cd /d ""%FRONTEND_DIR%"" && npm run dev:web"
 
 exit /b 0
 

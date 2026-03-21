@@ -4,6 +4,14 @@ mail_api_base: https://mailfree.example.workers.dev
 mail_username: admin
 mail_password: CHANGE_ME
 mail_email_domain: example.com
+mail_email_domains: "example.com,example.net"
+mail_randomize_from_list: true
 auto_probe_enabled: false
 auto_probe_interval_minutes: 60
 codex_quota_disable_remaining_percent: 10
+codex_replenish_enabled: false
+codex_replenish_target_count: 5
+codex_replenish_threshold: 2
+codex_replenish_batch_size: 1
+codex_replenish_use_proxy: false
+codex_replenish_proxy_pool: ""

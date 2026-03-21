@@ -18,9 +18,9 @@ cpa_url: http://127.0.0.1:8317
 management_key: sk-39c5bb
 ```
 
-注意：`management_key` 必须与远程 CPA 服务端配置的管理密码保持一致，否则 WebUI 登录会失败。
+注意：`management_key` 需要替换成你自己的管理密码，并且必须与远程 CPA 服务端配置保持一致，否则 WebUI 登录会失败。
 
-### 3) 本地启动（推荐）
+### 3) 本地启动（Windows 推荐）
 
 ```powershell
 .\start.bat
@@ -28,10 +28,21 @@ management_key: sk-39c5bb
 
 默认访问：`http://localhost:8333`
 
-### 4) Docker 启动（可选）
+Linux 本机启动：
+
+```bash
+./start.sh
+```
+
+### 4) Docker 启动（Linux / Windows 都支持）
 
 ```powershell
 docker compose up -d --build
 ```
 
 默认访问：`http://localhost:8333`
+
+说明：
+- Docker 镜像现在会自带 `python3` 和项目的 Python dependencies，所以 `replenish_codex.py` 在 Linux 容器里也能直接运行。
+- 如果你不是用 Docker，而是在 Linux 主机本机启动，请确保系统里有 `python3`、`pip`、`node`、`npm`，并且 Python 依赖已安装。
+- Linux 热更新开发可使用 `./start_dev.sh`。

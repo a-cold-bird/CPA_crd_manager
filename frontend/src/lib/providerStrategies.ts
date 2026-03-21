@@ -3,7 +3,7 @@
 export type ProbeTier = 'FREE' | 'PRO' | 'PLUS' | 'TEAM' | null;
 export type ProbeUiStatus = CheckStatus | 'running' | 'error';
 
-const CODEX_ACTIVE_CODES = new Set([200, 201, 400, 402, 403, 404, 409, 422, 429]);
+const CODEX_ACTIVE_CODES = new Set([200, 201, 400, 402, 403, 404, 409, 422]);
 const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
 const TIER_PRIORITY: Array<Exclude<ProbeTier, null>> = ['TEAM', 'PLUS', 'PRO', 'FREE'];
 
@@ -325,6 +325,15 @@ function formatResetAtText(resetAt: number | null): string {
   return date.toISOString().replace('T', ' ').slice(0, 16);
 }
 
+function isCodexInvalidated401(lower: string): boolean {
+  return lower.includes('token_invalidated')
+    || lower.includes('token invalidated')
+    || lower.includes('authentication token has been invalidated')
+    || lower.includes('invalidated oauth token')
+    || lower.includes('token_revoked')
+    || lower.includes('invalidated');
+}
+
 function hasWholeWord(text: string, word: 'free' | 'pro' | 'plus' | 'team' | 'premium'): boolean {
   const pattern = new RegExp(`(^|[^a-z0-9])${word}([^a-z0-9]|$)`);
   return pattern.test(text);
@@ -466,7 +475,7 @@ const codexStrategy: ProviderStrategy = {
     const quota = extractCodexQuotaInfo(response);
     const remainingThreshold = Math.max(0, Math.min(100, Math.floor(Number(options?.codexQuotaDisableRemainingPercent ?? 0) || 0)));
 
-    if (statusCode === 401 && (lower.includes('token_invalidated') || lower.includes('invalidated'))) {
+    if (statusCode === 401 && isCodexInvalidated401(lower)) {
       return { status: 'invalidated', reason: text || 'codex token invalidated', quota };
     }
     if (statusCode === 401 && lower.includes('deactivated')) {
@@ -474,6 +483,9 @@ const codexStrategy: ProviderStrategy = {
     }
     if (statusCode === 401) {
       return { status: 'unauthorized', reason: text || 'codex unauthorized', quota };
+    }
+    if (statusCode === 429) {
+      return { status: 'rate_limited', reason: text || 'codex rate limited (429)', quota };
     }
     if (quota?.exhausted) {
       const reasonParts = ['codex quota exhausted'];
@@ -521,6 +533,9 @@ const antigravityStrategy: ProviderStrategy = {
     if (statusCode === 401 || REDIRECT_CODES.has(statusCode)) {
       return { status: 'unauthorized', reason: text || `antigravity unauthorized (${statusCode})` };
     }
+    if (statusCode === 429) {
+      return { status: 'rate_limited', reason: text || 'antigravity rate limited (429)' };
+    }
     if (statusCode === 200 || statusCode === 201) {
       return { status: 'active', reason: '' };
     }
@@ -538,6 +553,9 @@ const defaultStrategy: ProviderStrategy = {
   classifyProbe: (response) => {
     const statusCode = toStatusCode(response.status_code);
     const text = normalizeProbeText(response);
+    if (statusCode === 429) {
+      return { status: 'rate_limited', reason: text || 'rate limited (429)' };
+    }
     if (statusCode === 200 || statusCode === 201) {
       return { status: 'active', reason: '' };
     }
@@ -576,7 +594,7 @@ export function canProbeCredential(cred: Credential): boolean {
 }
 
 export function shouldAutoDisable(status: ProbeUiStatus): boolean {
-  return status === 'invalidated' || status === 'deactivated' || status === 'unauthorized' || status === 'expired_by_time' || status === 'quota_exhausted' || status === 'quota_low_remaining';
+  return status === 'invalidated' || status === 'deactivated' || status === 'unauthorized' || status === 'expired_by_time' || status === 'quota_exhausted' || status === 'quota_low_remaining' || status === 'rate_limited';
 }
 
 export function toProbeErrorResponse(error: unknown): ProbeResponse {

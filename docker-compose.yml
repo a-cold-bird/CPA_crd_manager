@@ -9,6 +9,6 @@ services:
     environment:
       PORT: "8333"
     volumes:
-      - ${CPA_CONFIG_FILE:-./frontend/config.example.yaml}:/app/frontend/config.yaml
+      - ${CPA_CONFIG_FILE:-./frontend/config.yaml}:/app/frontend/config.yaml
       - ./runtime:/app/runtime
     restart: unless-stopped
