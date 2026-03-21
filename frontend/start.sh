@@ -8,6 +8,15 @@ if [[ "${1:-}" == "--no-build" ]]; then
   NO_BUILD=1
 fi
 
+ensure_npm_dependencies() {
+  if [[ -d node_modules && -x node_modules/.bin/node ]] || [[ -d node_modules && -x node_modules/.bin/vite ]]; then
+    return 0
+  fi
+
+  echo "[INFO] frontend dependencies missing. Running npm ci..."
+  npm ci
+}
+
 kill_port() {
   local port="$1"
   local pids=""
@@ -37,6 +46,7 @@ kill_port() {
 echo "[INFO] Starting CPA Console Backend and Frontend Delivery on port $PORT..."
 echo "[INFO] Checking and killing processes listening on port $PORT..."
 kill_port "$PORT"
+ensure_npm_dependencies
 
 if [[ "$NO_BUILD" != "1" ]]; then
   echo "[INFO] Building frontend assets..."

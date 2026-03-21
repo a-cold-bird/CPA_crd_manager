@@ -14,6 +14,15 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
+ensure_npm_dependencies() {
+  if [[ -d "$FRONTEND_DIR/node_modules" && -x "$FRONTEND_DIR/node_modules/.bin/vite" ]]; then
+    return 0
+  fi
+
+  echo "[INFO] frontend dependencies missing. Running npm ci..."
+  (cd "$FRONTEND_DIR" && npm ci)
+}
+
 kill_port() {
   local port="$1"
   local pids=""
@@ -56,6 +65,7 @@ trap cleanup INT TERM EXIT
 
 kill_port 8333
 kill_port 5173
+ensure_npm_dependencies
 
 echo "[INFO] Starting CPA dev servers with hot reload..."
 echo "[INFO] API  : http://127.0.0.1:8333"

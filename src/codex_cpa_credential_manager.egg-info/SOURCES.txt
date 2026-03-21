@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+src/codex_cpa_credential_manager/__init__.py
+src/codex_cpa_credential_manager/__main__.py
+src/codex_cpa_credential_manager/app_defaults.py
+src/codex_cpa_credential_manager/cli.py
+src/codex_cpa_credential_manager/cpa_callback_test.py
+src/codex_cpa_credential_manager/cpa_utils.py
+src/codex_cpa_credential_manager/email_utils.py
+src/codex_cpa_credential_manager/login_utils.py
+src/codex_cpa_credential_manager/turnstile_bypass.py
+src/codex_cpa_credential_manager.egg-info/PKG-INFO
+src/codex_cpa_credential_manager.egg-info/SOURCES.txt
+src/codex_cpa_credential_manager.egg-info/dependency_links.txt
+src/codex_cpa_credential_manager.egg-info/entry_points.txt
+src/codex_cpa_credential_manager.egg-info/requires.txt
+src/codex_cpa_credential_manager.egg-info/top_level.txt

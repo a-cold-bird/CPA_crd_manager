@@ -1,0 +1,60 @@
+Metadata-Version: 2.4
+Name: codex-cpa-credential-manager
+Version: 0.1.0
+Summary: Standalone CPA Codex credential manager
+Author: CPA Codex Credential Manager Contributors
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: requests>=2.31
+Requires-Dist: curl-cffi>=0.7.0
+
+﻿# CPA Credential Manager
+
+## 安装
+
+### 1) 克隆并进入项目目录
+
+```powershell
+git clone <your-repo-url>
+cd CPA_crd_manager
+```
+
+### 2) 配置前端本地连接参数
+
+编辑 `frontend/config.yaml`：
+
+```yaml
+cpa_url: http://127.0.0.1:8317
+management_key: sk-39c5bb
+```
+
+注意：`management_key` 需要替换成你自己的管理密码，并且必须与远程 CPA 服务端配置保持一致，否则 WebUI 登录会失败。
+
+### 3) 本地启动（Windows 推荐）
+
+```powershell
+.\start.bat
+```
+
+默认访问：`http://localhost:8333`
+
+Linux 本机启动：
+
+```bash
+./start.sh
+```
+
+### 4) Docker 启动（Linux / Windows 都支持）
+
+```powershell
+docker compose up -d --build
+```
+
+默认访问：`http://localhost:8333`
+
+说明：
+- Docker 镜像现在会自带 `python3` 和项目的 Python dependencies，所以 `replenish_codex.py` 在 Linux 容器里也能直接运行。
+- 如果你不是用 Docker，而是在 Linux 主机本机启动，请确保系统里有 `python3`、`pip`、`node`、`npm`，并且 Python 依赖已安装。
+- Linux 热更新开发可使用 `./start_dev.sh`。
