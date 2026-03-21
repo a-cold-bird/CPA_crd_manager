@@ -22,7 +22,9 @@ const BACKEND_SERVER_LOCK_PATH = path.join(PROJECT_ROOT, 'runtime', 'frontend_se
 
 const app = express();
 const PORT = Number(process.env.CPA_BACKEND_PORT || process.env.API_PORT || 8333);
-const CONFIG_PATH = path.join(process.cwd(), 'config.yaml');
+const DEFAULT_CONFIG_PATH = path.join(process.cwd(), 'config.yaml');
+const CONFIG_PATH = path.resolve(process.env.CPA_CONFIG_FILE || DEFAULT_CONFIG_PATH);
+const CONFIG_FALLBACK_PATH = path.join(process.cwd(), 'config.example.yaml');
 const RUNTIME_WAKE_INTERVAL_MS = 30_000;
 const CPA_REQUEST_TIMEOUT_MS = 20_000;
 const MAIL_REQUEST_TIMEOUT_MS = 15_000;
@@ -69,10 +71,13 @@ function readConfig() {
     auto_probe_interval_minutes: 60,
     codex_quota_disable_remaining_percent: 10,
   };
-  if (!fs.existsSync(CONFIG_PATH)) {
+  const configPathToRead = fs.existsSync(CONFIG_PATH)
+    ? CONFIG_PATH
+    : (fs.existsSync(CONFIG_FALLBACK_PATH) ? CONFIG_FALLBACK_PATH : '');
+  if (!configPathToRead) {
     return defaults;
   }
-  const file = fs.readFileSync(CONFIG_PATH, 'utf8');
+  const file = fs.readFileSync(configPathToRead, 'utf8');
   try {
     const parsed = yaml.load(file);
     if (!parsed || typeof parsed !== 'object') {
@@ -117,6 +122,7 @@ function writeConfig(data) {
   merged.mail_email_domain = normalizedMailEmailDomain;
   merged.mail_email_domains = normalizedMailEmailDomains;
   const str = yaml.dump(merged);
+  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
   fs.writeFileSync(CONFIG_PATH, str, 'utf-8');
 }
 
