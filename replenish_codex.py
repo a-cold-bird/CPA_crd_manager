@@ -11,7 +11,8 @@ import errno
 import ctypes
 import contextlib
 import threading
-from typing import Dict, Any, List, Optional, Set, Tuple
+import random
+from typing import Callable, Dict, Any, List, Optional, Set, Tuple
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -32,6 +33,8 @@ REPLENISHMENT_BATCH_HISTORY_LIMIT = 12
 REPLENISHMENT_BATCH_EVENT_LIMIT = 20
 REPLENISHMENT_BATCH_ACCOUNT_LIMIT = 16
 REPLENISHMENT_STATUS_LOCK = threading.RLock()
+REGISTER_TOKEN_WATCH_POLL_SECONDS = 0.75
+REGISTER_TOKEN_READY_AGE_NS = 1_000_000_000
 
 
 def normalize_domain_list(value: Any) -> List[str]:
@@ -233,6 +236,24 @@ def detect_changed_register_tokens(
     changed_files.sort(key=lambda file_name: after_snapshot[file_name][1])
     return changed_files
 
+def detect_ready_changed_register_tokens(
+    before_snapshot: Dict[str, Tuple[int, int]],
+    after_snapshot: Dict[str, Tuple[int, int]],
+    *,
+    emitted: Optional[Set[str]] = None,
+    allow_unstable: bool = False,
+) -> List[str]:
+    emitted_names = emitted or set()
+    now_ns = time.time_ns()
+    ready_files: List[str] = []
+    for file_name in detect_changed_register_tokens(before_snapshot, after_snapshot):
+        if file_name in emitted_names:
+            continue
+        _size, mtime_ns = after_snapshot[file_name]
+        if allow_unstable or now_ns - int(mtime_ns) >= REGISTER_TOKEN_READY_AGE_NS:
+            ready_files.append(file_name)
+    return ready_files
+
 def load_config(config_path: str) -> Dict[str, Any]:
     if not os.path.exists(config_path):
         return {}
@@ -371,6 +392,7 @@ def create_empty_replenishment_status() -> Dict[str, Any]:
         "target_count": None,
         "threshold": None,
         "batch_size": None,
+        "worker_count": None,
         "use_proxy": None,
         "healthy_count": None,
         "needed": None,
@@ -953,6 +975,7 @@ def start_replenishment_status(
     target_count = config.get('codex_replenish_target_count', config.get('codex_target_count'))
     threshold = config.get('codex_replenish_threshold')
     batch_size = config.get('codex_replenish_batch_size')
+    worker_count = config.get('codex_replenish_worker_count')
     log_file = os.path.join(ensure_runtime_dir(), f"replenishment_{mode}_{now_ms}.log")
     update_replenishment_status(
         mode=mode,
@@ -963,6 +986,7 @@ def start_replenishment_status(
         target_count=int(target_count) if target_count is not None else None,
         threshold=int(threshold) if threshold is not None else None,
         batch_size=int(batch_size) if batch_size is not None else None,
+        worker_count=int(worker_count) if worker_count is not None else None,
         use_proxy=bool(config.get('codex_replenish_use_proxy', False)),
         healthy_count=max(0, int(healthy_count)) if healthy_count is not None else None,
         needed=needed,
@@ -1065,6 +1089,7 @@ def write_replenishment_idle_status(
     target_count = config.get('codex_replenish_target_count', config.get('codex_target_count'))
     threshold = config.get('codex_replenish_threshold')
     batch_size = config.get('codex_replenish_batch_size')
+    worker_count = config.get('codex_replenish_worker_count')
     update_replenishment_status(
         mode='replenish',
         in_progress=False,
@@ -1073,6 +1098,7 @@ def write_replenishment_idle_status(
         target_count=int(target_count) if target_count is not None else None,
         threshold=int(threshold) if threshold is not None else None,
         batch_size=int(batch_size) if batch_size is not None else None,
+        worker_count=int(worker_count) if worker_count is not None else None,
         use_proxy=bool(config.get('codex_replenish_use_proxy', False)),
         healthy_count=max(0, int(healthy_count)) if healthy_count is not None else None,
         needed=max(0, int(needed)),
@@ -1291,10 +1317,8 @@ def resolve_replenishment_email_domain(config: Dict[str, Any]) -> Tuple[str, str
 
     if email_domains:
         if randomize_from_list and len(email_domains) > 1:
-            import random
-            selected_domain = random.choice(email_domains)
-            logger.info(f"Randomly selected email domain: {selected_domain} from {email_domains}")
-            return selected_domain, "random_from_list"
+            logger.info("Using per-account random email domain selection from %s", email_domains)
+            return "__mixed__", "per_account_random_from_list"
         if default_domain:
             logger.info(f"Using default email domain: {default_domain}")
             return default_domain, "default"
@@ -1305,6 +1329,68 @@ def resolve_replenishment_email_domain(config: Dict[str, Any]) -> Tuple[str, str
     selected_domain = default_domain
     logger.info(f"Using default email domain: {selected_domain}")
     return selected_domain, "default"
+
+def configure_register_email_domain_strategy(register_module, config: Dict[str, Any]) -> Dict[str, Any]:
+    email_domains = normalize_domain_list(config.get('mail_email_domains', ''))
+    default_domain = str(config.get('mail_email_domain', '') or '').strip().lower()
+    randomize_from_list = bool(config.get('mail_randomize_from_list', True))
+    if default_domain and default_domain not in email_domains:
+        email_domains.insert(0, default_domain)
+
+    if not email_domains:
+        email_domains = [default_domain] if default_domain else []
+
+    original_register_one = getattr(register_module, "_register_one", None)
+    if not callable(original_register_one):
+        raise AttributeError("internal register module does not expose _register_one")
+
+    def resolve_account_domain(explicit_domain: Optional[str]) -> Optional[str]:
+        normalized_explicit = str(explicit_domain or "").strip().lower()
+        if normalized_explicit and normalized_explicit != "__mixed__":
+            return normalized_explicit
+        if email_domains:
+            if randomize_from_list and len(email_domains) > 1:
+                return random.choice(email_domains)
+            if default_domain:
+                return default_domain
+            return email_domains[0]
+        return normalized_explicit or default_domain or None
+
+    def wrapped_register_one(
+        idx,
+        total,
+        proxy,
+        output_file,
+        email_provider="mailfree",
+        email_domain=None,
+        extract_codex=True,
+        progress_hook=None,
+        use_proxy=True,
+        debug=False,
+    ):
+        account_domain = resolve_account_domain(email_domain)
+        return original_register_one(
+            idx,
+            total,
+            proxy,
+            output_file,
+            email_provider=email_provider,
+            email_domain=account_domain,
+            extract_codex=extract_codex,
+            progress_hook=progress_hook,
+            use_proxy=use_proxy,
+            debug=debug,
+        )
+
+    register_module._register_one = wrapped_register_one
+    return {
+        "domains": list(email_domains),
+        "default_domain": default_domain,
+        "randomize_from_list": randomize_from_list,
+        "runtime_email_domain": "__mixed__" if randomize_from_list and len(email_domains) > 1 else (default_domain or (email_domains[0] if email_domains else "")),
+        "selection_mode": "per_account_random_from_list" if randomize_from_list and len(email_domains) > 1 else ("default" if default_domain else "first_available"),
+        "batch_domain_label": "multiple" if randomize_from_list and len(email_domains) > 1 else (default_domain or (email_domains[0] if email_domains else "")),
+    }
 
 def build_register_progress_hook(batch_attempt: int):
     def _progress_hook(event_type: str, **payload: Any) -> None:
@@ -1452,7 +1538,13 @@ def build_register_progress_hook(batch_attempt: int):
             )
     return _progress_hook
 
-def run_register_batch(batch_size: int, config: Dict[str, Any], *, batch_attempt: int) -> Tuple[List[str], str, str]:
+def run_register_batch(
+    batch_size: int,
+    config: Dict[str, Any],
+    *,
+    batch_attempt: int,
+    on_token_ready: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[str], str, str]:
     sync_register_mail_config(config)
 
     output_file = os.path.join(ensure_runtime_dir(), f"batch_register_{int(time.time())}.txt")
@@ -1465,24 +1557,69 @@ def run_register_batch(batch_size: int, config: Dict[str, Any], *, batch_attempt
     existing_snapshot = snapshot_register_token_files(register_token_dir)
     use_proxy = config.get('codex_replenish_use_proxy', True)
     proxy_pool_text = config.get('codex_replenish_proxy_pool', '')
-    selected_domain, email_selection_mode = resolve_replenishment_email_domain(config)
-    start_current_batch_status(
-        attempt=batch_attempt,
-        requested=batch_size,
-        workers=min(batch_size, 5),
-        selected_domain=selected_domain,
-        email_selection_mode=email_selection_mode,
-    )
+    configured_worker_count = max(1, int(config.get('codex_replenish_worker_count', batch_size) or batch_size))
+    actual_workers = min(batch_size, configured_worker_count)
+    runtime_email_domain, email_selection_mode = resolve_replenishment_email_domain(config)
+    selected_domain = runtime_email_domain
+    emitted_files: Set[str] = set()
+    watcher_stop = threading.Event()
+    watcher_error: List[str] = []
+
+    def _emit_ready_file(file_name: str) -> None:
+        if file_name in emitted_files:
+            return
+        emitted_files.add(file_name)
+        if on_token_ready:
+            on_token_ready(file_name)
+
+    def _watch_register_tokens() -> None:
+        if not on_token_ready:
+            return
+        while not watcher_stop.wait(REGISTER_TOKEN_WATCH_POLL_SECONDS):
+            try:
+                current_snapshot = snapshot_register_token_files(register_token_dir)
+                ready_files = detect_ready_changed_register_tokens(
+                    existing_snapshot,
+                    current_snapshot,
+                    emitted=emitted_files,
+                )
+                for file_name in ready_files:
+                    _emit_ready_file(file_name)
+            except Exception as exc:
+                message = f"register token watcher failed: {exc}"
+                watcher_error.append(message)
+                logger.warning(message)
+                append_replenishment_event(message)
+                return
+
+    watcher_thread = threading.Thread(
+        target=_watch_register_tokens,
+        name=f"replenish-watch-{batch_attempt}",
+        daemon=True,
+    ) if on_token_ready else None
 
     try:
         register = load_internal_register_module(config)
         proxy_runtime = configure_register_proxy_mode(register, bool(use_proxy), proxy_pool_text)
+        email_runtime = configure_register_email_domain_strategy(register, config)
+        selected_domain = str(email_runtime.get("batch_domain_label") or selected_domain or "")
+        runtime_email_domain = str(email_runtime.get("runtime_email_domain") or runtime_email_domain or "")
+        email_selection_mode = str(email_runtime.get("selection_mode") or email_selection_mode or "")
+        start_current_batch_status(
+            attempt=batch_attempt,
+            requested=batch_size,
+            workers=actual_workers,
+            selected_domain=selected_domain,
+            email_selection_mode=email_selection_mode,
+        )
         update_running_replenishment_status(
             proxy_pool_size=int(proxy_runtime.get("proxy_count") or 0),
             summary=build_replenishment_summary("running"),
         )
         log_file = str(read_replenishment_status().get("log_file") or output_file)
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        if watcher_thread:
+            watcher_thread.start()
         with open(log_file, 'a', encoding='utf-8') as log_handle:
             tee_stdout = TeeLineWriter(sys.stdout, log_handle)
             tee_stderr = TeeLineWriter(sys.stderr, log_handle)
@@ -1490,9 +1627,9 @@ def run_register_batch(batch_size: int, config: Dict[str, Any], *, batch_attempt
                 register.run_batch(
                     total_accounts=batch_size,
                     output_file=output_file,
-                    max_workers=min(batch_size, 5),
+                    max_workers=actual_workers,
                     proxy=None,
-                    email_domain=selected_domain,
+                    email_domain=runtime_email_domain,
                     extract_codex=True,
                     progress_hook=build_register_progress_hook(batch_attempt),
                 )
@@ -1502,19 +1639,34 @@ def run_register_batch(batch_size: int, config: Dict[str, Any], *, batch_attempt
         update_current_batch_status(status="failed", last_error=str(e), event_message=f"Register stage crashed: {e}")
         finish_current_batch_status(status="failed", error=str(e))
         raise
+    finally:
+        watcher_stop.set()
+        if watcher_thread:
+            watcher_thread.join(timeout=5)
 
     updated_snapshot = snapshot_register_token_files(register_token_dir)
+    if on_token_ready:
+        for file_name in detect_ready_changed_register_tokens(
+            existing_snapshot,
+            updated_snapshot,
+            emitted=emitted_files,
+            allow_unstable=True,
+        ):
+            _emit_ready_file(file_name)
     changed_files = detect_changed_register_tokens(existing_snapshot, updated_snapshot)
+    remaining_files = [file_name for file_name in changed_files if file_name not in emitted_files]
     logger.info(
-        "Registration batch finished. requested=%s changed_token_files=%s",
+        "Registration batch finished. requested=%s changed_token_files=%s streamed_token_files=%s remaining_token_files=%s",
         batch_size,
         len(changed_files),
+        len(emitted_files),
+        len(remaining_files),
     )
     update_current_batch_status(
         status="uploading",
-        event_message=f"Detected {len(changed_files)} token file(s) ready for upload.",
+        event_message=f"Detected {len(changed_files)} token file(s); streamed {len(emitted_files)} during registration, {len(remaining_files)} waiting for final upload.",
     )
-    return changed_files, selected_domain, email_selection_mode
+    return remaining_files, selected_domain, email_selection_mode
 
 def replenish(needed: int, config: Dict[str, Any], state_path: str):
     """
@@ -1533,6 +1685,7 @@ def replenish(needed: int, config: Dict[str, Any], state_path: str):
     total_new_files = 0
     registration_attempts = 0
     remaining_budget = max(needed * 3, needed + 10, configured_batch_size)
+    upload_state_lock = threading.Lock()
 
     estimated_active = count_normal_accounts(cpa_url, management_key, load_runtime_state(state_path))
     logger.info(f"Target reached: No, needed: {needed}. Starting replenishment...")
@@ -1574,10 +1727,84 @@ def replenish(needed: int, config: Dict[str, Any], state_path: str):
             new_token_files=total_new_files,
             summary=build_replenishment_summary("running"),
         )
-        new_files, _selected_domain, _email_selection_mode = run_register_batch(batch_size, config, batch_attempt=registration_attempts)
-        total_new_files += len(new_files)
+        batch_seen_files: Set[str] = set()
 
-        if not new_files:
+        def handle_batch_token(file_name: str) -> None:
+            nonlocal success_uploads, estimated_active, total_new_files
+            with upload_state_lock:
+                if file_name in batch_seen_files:
+                    return
+                batch_seen_files.add(file_name)
+                total_new_files += 1
+
+            full_path = os.path.join(get_register_token_dir(), file_name)
+            result = process_token_for_cpa(
+                cpa_url,
+                management_key,
+                full_path,
+                validate_before_upload=False,
+                cleanup_on_success=True,
+            )
+
+            with upload_state_lock:
+                if result["uploaded"]:
+                    success_uploads += 1
+                    if result["healthy"]:
+                        estimated_active += 1
+
+                    def _mutate_uploaded(current: Dict[str, Any]) -> None:
+                        batch = normalize_batch_status(current.get("current_batch")) or create_empty_batch_status()
+                        batch["upload_succeeded"] = int(batch.get("upload_succeeded") or 0) + 1
+                        upsert_batch_account(
+                            batch,
+                            email=file_name.removesuffix(".json"),
+                            status="completed" if not str(result.get("failure_reason") or "") else "uploaded",
+                            upload_ok=True,
+                            error="",
+                        )
+                        append_batch_event(batch, f"Uploaded {file_name} to CPA successfully.")
+                        current["current_batch"] = batch
+                    mutate_replenishment_status(_mutate_uploaded)
+                else:
+                    failed_names.append(file_name)
+                    failure_reason = str(result.get("failure_reason") or "unknown error")
+
+                    def _mutate_upload_failed(current: Dict[str, Any]) -> None:
+                        batch = normalize_batch_status(current.get("current_batch")) or create_empty_batch_status()
+                        batch["upload_failed"] = int(batch.get("upload_failed") or 0) + 1
+                        batch["last_error"] = failure_reason
+                        upsert_batch_account(
+                            batch,
+                            email=file_name.removesuffix(".json"),
+                            status="upload_failed",
+                            upload_ok=False,
+                            error=failure_reason,
+                        )
+                        append_batch_event(batch, f"Upload failed for {file_name}: {failure_reason}")
+                        current["current_batch"] = batch
+                    mutate_replenishment_status(_mutate_upload_failed)
+
+                update_running_replenishment_status(
+                    healthy_count=estimated_active,
+                    needed=max(0, target_limit - estimated_active),
+                    uploaded=success_uploads,
+                    failed=len(failed_names),
+                    failed_names=failed_names,
+                    new_token_files=total_new_files,
+                    summary=build_replenishment_summary("running"),
+                )
+
+        new_files, _selected_domain, _email_selection_mode = run_register_batch(
+            batch_size,
+            config,
+            batch_attempt=registration_attempts,
+            on_token_ready=handle_batch_token,
+        )
+
+        for file_name in new_files:
+            handle_batch_token(file_name)
+
+        if not batch_seen_files:
             logger.warning(
                 "Registration batch produced no changed token files. attempts=%s remaining_budget=%s",
                 registration_attempts,
@@ -1595,60 +1822,6 @@ def replenish(needed: int, config: Dict[str, Any], state_path: str):
             update_current_batch_status(status="failed", last_error="No token files were generated.", event_message="No Codex token artifacts were generated for this batch.")
             finish_current_batch_status(status="failed", error="No token files were generated.")
             break
-
-        for file_name in new_files:
-            full_path = os.path.join(get_register_token_dir(), file_name)
-            result = process_token_for_cpa(
-                cpa_url,
-                management_key,
-                full_path,
-                validate_before_upload=False,
-                cleanup_on_success=True,
-            )
-            if result["uploaded"]:
-                success_uploads += 1
-                if result["healthy"]:
-                    estimated_active += 1
-                def _mutate_uploaded(current: Dict[str, Any]) -> None:
-                    batch = normalize_batch_status(current.get("current_batch")) or create_empty_batch_status()
-                    batch["upload_succeeded"] = int(batch.get("upload_succeeded") or 0) + 1
-                    upsert_batch_account(
-                        batch,
-                        email=file_name.removesuffix(".json"),
-                        status="completed" if not str(result.get("failure_reason") or "") else "uploaded",
-                        upload_ok=True,
-                        error="",
-                    )
-                    append_batch_event(batch, f"Uploaded {file_name} to CPA successfully.")
-                    current["current_batch"] = batch
-                mutate_replenishment_status(_mutate_uploaded)
-            else:
-                failed_names.append(file_name)
-                failure_reason = str(result.get("failure_reason") or "unknown error")
-                def _mutate_upload_failed(current: Dict[str, Any]) -> None:
-                    batch = normalize_batch_status(current.get("current_batch")) or create_empty_batch_status()
-                    batch["upload_failed"] = int(batch.get("upload_failed") or 0) + 1
-                    batch["last_error"] = failure_reason
-                    upsert_batch_account(
-                        batch,
-                        email=file_name.removesuffix(".json"),
-                        status="upload_failed",
-                        upload_ok=False,
-                        error=failure_reason,
-                    )
-                    append_batch_event(batch, f"Upload failed for {file_name}: {failure_reason}")
-                    current["current_batch"] = batch
-                mutate_replenishment_status(_mutate_upload_failed)
-
-            update_running_replenishment_status(
-                healthy_count=estimated_active,
-                needed=max(0, target_limit - estimated_active),
-                uploaded=success_uploads,
-                failed=len(failed_names),
-                failed_names=failed_names,
-                new_token_files=total_new_files,
-                summary=build_replenishment_summary("running"),
-            )
 
         batch_snapshot = normalize_batch_status(read_replenishment_status().get("current_batch")) or create_empty_batch_status()
         batch_final_status = (

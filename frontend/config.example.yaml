@@ -13,5 +13,6 @@ codex_replenish_enabled: false
 codex_replenish_target_count: 5
 codex_replenish_threshold: 2
 codex_replenish_batch_size: 1
+codex_replenish_worker_count: 1
 codex_replenish_use_proxy: false
 codex_replenish_proxy_pool: ""

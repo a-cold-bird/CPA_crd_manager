@@ -109,6 +109,7 @@ function readConfig() {
     codex_replenish_target_count: 5, // Added
     codex_replenish_threshold: 2, // Added
     codex_replenish_batch_size: 1,
+    codex_replenish_worker_count: 1,
     codex_replenish_use_proxy: false, // Added
     codex_replenish_proxy_pool: '',
     auto_probe_enabled: false,
@@ -139,6 +140,7 @@ function readConfig() {
       codex_target_count: normalizedTargetCount,
       codex_replenish_threshold: normalizeCodexReplenishThreshold(parsed.codex_replenish_threshold, normalizedTargetCount, 2), // Added
       codex_replenish_batch_size: normalizeCodexReplenishBatchSize(parsed.codex_replenish_batch_size, 1),
+      codex_replenish_worker_count: normalizeCodexReplenishWorkerCount(parsed.codex_replenish_worker_count, 1),
       codex_replenish_use_proxy: parseBoolSafe(parsed.codex_replenish_use_proxy, false), // Added
       codex_replenish_proxy_pool: String(parsed.codex_replenish_proxy_pool || ''),
     };
@@ -161,12 +163,14 @@ function writeConfig(data) {
   const normalizedTargetCount = resolveCodexReplenishTargetCount(merged, 5);
   const normalizedThreshold = normalizeCodexReplenishThreshold(merged.codex_replenish_threshold, normalizedTargetCount, 2);
   const normalizedBatchSize = normalizeCodexReplenishBatchSize(merged.codex_replenish_batch_size, 1);
+  const normalizedWorkerCount = normalizeCodexReplenishWorkerCount(merged.codex_replenish_worker_count, 1);
   const normalizedMailEmailDomain = normalizeDomain(merged.mail_email_domain || '');
   const normalizedMailEmailDomains = normalizeDomainListText(merged.mail_email_domains, normalizedMailEmailDomain);
   merged.codex_replenish_target_count = normalizedTargetCount;
   merged.codex_target_count = normalizedTargetCount;
   merged.codex_replenish_threshold = normalizedThreshold;
   merged.codex_replenish_batch_size = normalizedBatchSize;
+  merged.codex_replenish_worker_count = normalizedWorkerCount;
   merged.mail_email_domain = normalizedMailEmailDomain;
   merged.mail_email_domains = normalizedMailEmailDomains;
   const str = yaml.dump(merged);
@@ -342,6 +346,10 @@ function normalizeCodexReplenishBatchSize(value, fallback = 1) {
   return Math.max(1, Math.min(50, normalizeNonNegativeInteger(value, fallback)));
 }
 
+function normalizeCodexReplenishWorkerCount(value, fallback = 1) {
+  return Math.max(1, Math.min(20, normalizeNonNegativeInteger(value, fallback)));
+}
+
 function readArchiveStore() {
   const storePath = resolveReadableFilePath(ARCHIVE_STORE_PATH);
   if (!storePath) {
@@ -462,6 +470,7 @@ function createEmptyReplenishmentStatus() {
     target_count: null,
     threshold: null,
     batch_size: null,
+    worker_count: null,
     use_proxy: false,
     healthy_count: null,
     needed: null,
@@ -496,6 +505,7 @@ function normalizeReplenishmentStatus(value) {
     target_count: normalizeNumberOrNull(source.target_count),
     threshold: normalizeNumberOrNull(source.threshold),
     batch_size: normalizeNumberOrNull(source.batch_size),
+    worker_count: normalizeNumberOrNull(source.worker_count),
     use_proxy: normalizeBoolean(source.use_proxy, false),
     healthy_count: normalizeNumberOrNull(source.healthy_count),
     needed: normalizeNumberOrNull(source.needed),
@@ -1511,6 +1521,7 @@ function buildRuntimeStatusPayload(config) {
       target_count: effectiveTargetCount,
       threshold: normalizeNumberOrNull(replenishmentStatus.threshold),
       batch_size: normalizeNumberOrNull(replenishmentStatus.batch_size) ?? normalizeCodexReplenishBatchSize(config?.codex_replenish_batch_size, 1),
+      worker_count: normalizeNumberOrNull(replenishmentStatus.worker_count) ?? normalizeCodexReplenishWorkerCount(config?.codex_replenish_worker_count, 1),
       use_proxy: normalizeBoolean(replenishmentStatus.use_proxy, false),
       needed: derivedNeeded,
       new_token_files: normalizeNumberOrNull(replenishmentStatus.new_token_files),
@@ -1987,6 +1998,9 @@ app.post('/api/config/update', (req, res) => {
       const nextCodexReplenishBatchSize = nextConfig.codex_replenish_batch_size !== undefined
         ? normalizeCodexReplenishBatchSize(nextConfig.codex_replenish_batch_size, config.codex_replenish_batch_size)
         : normalizeCodexReplenishBatchSize(config.codex_replenish_batch_size, 1);
+      const nextCodexReplenishWorkerCount = nextConfig.codex_replenish_worker_count !== undefined
+        ? normalizeCodexReplenishWorkerCount(nextConfig.codex_replenish_worker_count, config.codex_replenish_worker_count)
+        : normalizeCodexReplenishWorkerCount(config.codex_replenish_worker_count, 1);
 
       const nextCodexReplenishUseProxy = nextConfig.codex_replenish_use_proxy !== undefined
         ? parseBoolSafe(nextConfig.codex_replenish_use_proxy, config.codex_replenish_use_proxy)
@@ -2009,6 +2023,7 @@ app.post('/api/config/update', (req, res) => {
         codex_replenish_target_count: nextCodexReplenishTargetCount,
         codex_replenish_threshold: nextCodexReplenishThreshold,
         codex_replenish_batch_size: nextCodexReplenishBatchSize,
+        codex_replenish_worker_count: nextCodexReplenishWorkerCount,
         codex_replenish_use_proxy: nextCodexReplenishUseProxy,
         codex_replenish_proxy_pool: nextCodexReplenishProxyPool,
         auto_probe_enabled: nextAutoProbeEnabled,

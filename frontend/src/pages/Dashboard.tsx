@@ -88,6 +88,7 @@ export default function Dashboard() {
     const [codexReplenishTargetCount, setCodexReplenishTargetCount] = useState(5);
     const [codexReplenishThreshold, setCodexReplenishThreshold] = useState(2);
     const [codexReplenishBatchSize, setCodexReplenishBatchSize] = useState(1);
+    const [codexReplenishWorkerCount, setCodexReplenishWorkerCount] = useState(1);
     const [codexReplenishUseProxy, setCodexReplenishUseProxy] = useState(true);
     const [codexReplenishProxyPool, setCodexReplenishProxyPool] = useState('');
     const [autoProbeEnabled, setAutoProbeEnabled] = useState<boolean>(getInitialAutoProbeEnabled);
@@ -132,6 +133,7 @@ export default function Dashboard() {
                     setCodexReplenishTargetCount(parseIntSafe(data.config.codex_replenish_target_count, 5));
                     setCodexReplenishThreshold(parseIntSafe(data.config.codex_replenish_threshold, 2));
                     setCodexReplenishBatchSize(parseIntSafe(data.config.codex_replenish_batch_size, 1));
+                    setCodexReplenishWorkerCount(parseIntSafe(data.config.codex_replenish_worker_count, 1));
                     setCodexReplenishUseProxy(parseConfigBoolean(data.config.codex_replenish_use_proxy, true));
                     setCodexReplenishProxyPool(String(data.config.codex_replenish_proxy_pool || ''));
                     setAutoProbeEnabled(resolvedAutoProbeEnabled);
@@ -203,6 +205,7 @@ export default function Dashboard() {
                     codex_replenish_target_count: codexReplenishTargetCount,
                     codex_replenish_threshold: codexReplenishThreshold,
                     codex_replenish_batch_size: codexReplenishBatchSize,
+                    codex_replenish_worker_count: codexReplenishWorkerCount,
                     codex_replenish_use_proxy: codexReplenishUseProxy,
                     codex_replenish_proxy_pool: codexReplenishProxyPool,
                 },
@@ -235,6 +238,7 @@ export default function Dashboard() {
         codexReplenishTargetCount,
         codexReplenishThreshold,
         codexReplenishBatchSize,
+        codexReplenishWorkerCount,
         codexReplenishUseProxy,
         codexReplenishProxyPool,
     ]);
@@ -321,11 +325,13 @@ export default function Dashboard() {
                                 setCodexReplenishEnabled={setCodexReplenishEnabled}
                                 codexReplenishTargetCount={codexReplenishTargetCount}
                                 setCodexReplenishTargetCount={setCodexReplenishTargetCount}
-                                codexReplenishThreshold={codexReplenishThreshold}
-                                setCodexReplenishThreshold={setCodexReplenishThreshold}
-                                codexReplenishBatchSize={codexReplenishBatchSize}
-                                setCodexReplenishBatchSize={setCodexReplenishBatchSize}
-                                codexReplenishUseProxy={codexReplenishUseProxy}
+                            codexReplenishThreshold={codexReplenishThreshold}
+                            setCodexReplenishThreshold={setCodexReplenishThreshold}
+                            codexReplenishBatchSize={codexReplenishBatchSize}
+                            setCodexReplenishBatchSize={setCodexReplenishBatchSize}
+                            codexReplenishWorkerCount={codexReplenishWorkerCount}
+                            setCodexReplenishWorkerCount={setCodexReplenishWorkerCount}
+                            codexReplenishUseProxy={codexReplenishUseProxy}
                                 setCodexReplenishUseProxy={setCodexReplenishUseProxy}
                                 codexReplenishProxyPool={codexReplenishProxyPool}
                                 setCodexReplenishProxyPool={setCodexReplenishProxyPool}

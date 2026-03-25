@@ -171,6 +171,7 @@ export interface RuntimeStatusPayload {
     target_count: number | null;
     threshold: number | null;
     batch_size: number | null;
+    worker_count: number | null;
     use_proxy: boolean;
     needed: number | null;
     new_token_files: number | null;

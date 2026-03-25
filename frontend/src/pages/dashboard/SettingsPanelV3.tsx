@@ -52,6 +52,8 @@ interface SettingsPanelProps {
   setCodexReplenishThreshold: Dispatch<SetStateAction<number>>;
   codexReplenishBatchSize: number;
   setCodexReplenishBatchSize: Dispatch<SetStateAction<number>>;
+  codexReplenishWorkerCount: number;
+  setCodexReplenishWorkerCount: Dispatch<SetStateAction<number>>;
   codexReplenishUseProxy: boolean;
   setCodexReplenishUseProxy: Dispatch<SetStateAction<boolean>>;
   codexReplenishProxyPool: string;
@@ -94,6 +96,10 @@ function normalizeReplenishThreshold(value: unknown, targetCount: number, fallba
 
 function normalizeReplenishBatchSize(value: unknown, fallback = 1): number {
   return Math.max(1, Math.min(50, normalizeNonNegativeInteger(value, fallback)));
+}
+
+function normalizeReplenishWorkerCount(value: unknown, fallback = 1): number {
+  return Math.max(1, Math.min(20, normalizeNonNegativeInteger(value, fallback)));
 }
 
 function getReplenishmentResultLabel(
@@ -142,6 +148,8 @@ function formatBatchTime(value: number | null, text: (en: string, zh: string) =>
 
 function getEmailSelectionModeLabel(mode: string, text: (en: string, zh: string) => string): string {
   switch (String(mode || '').trim().toLowerCase()) {
+    case 'per_account_random_from_list':
+      return text('Per-account random', '每账号随机');
     case 'random_from_list':
       return text('Random from list', '从列表随机');
     case 'default':
@@ -340,6 +348,8 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
     setCodexReplenishThreshold,
     codexReplenishBatchSize,
     setCodexReplenishBatchSize,
+    codexReplenishWorkerCount,
+    setCodexReplenishWorkerCount,
     codexReplenishUseProxy,
     setCodexReplenishUseProxy,
     codexReplenishProxyPool,
@@ -375,6 +385,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
   const effectiveTargetCount = normalizeNonNegativeInteger(codexReplenishTargetCount, 0);
   const effectiveThreshold = normalizeReplenishThreshold(codexReplenishThreshold, effectiveTargetCount, 0);
   const effectiveBatchSize = normalizeReplenishBatchSize(codexReplenishBatchSize, 1);
+  const effectiveWorkerCount = normalizeReplenishWorkerCount(codexReplenishWorkerCount, 1);
   const replenishmentStatus = runtimeStatus?.replenishment ?? null;
   const replenishmentResultLabel = getReplenishmentResultLabel(replenishmentStatus, text);
   const simpleReplenishmentLogs = useMemo(
@@ -570,6 +581,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
           codex_replenish_target_count: effectiveTargetCount,
           codex_replenish_threshold: effectiveThreshold,
           codex_replenish_batch_size: effectiveBatchSize,
+          codex_replenish_worker_count: effectiveWorkerCount,
           codex_replenish_use_proxy: codexReplenishUseProxy,
           codex_replenish_proxy_pool: codexReplenishProxyPool,
         },
@@ -708,7 +720,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
             </label>
           </div>
 
-          <div className="grid gap-4 md:grid-cols-3">
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Target Account Count', '目标账号总数')}</label>
               <input type="number" min="0" step="1" value={effectiveTargetCount} onChange={(e) => { const nextTarget = normalizeNonNegativeInteger(e.target.value, 0); setCodexReplenishTargetCount(nextTarget); setCodexReplenishThreshold((prev) => normalizeReplenishThreshold(prev, nextTarget, 0)); }} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
@@ -724,10 +736,15 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
               <input type="number" min="1" max="50" step="1" value={effectiveBatchSize} onChange={(e) => setCodexReplenishBatchSize(normalizeReplenishBatchSize(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
               <p className="text-xs text-muted-foreground"><code>codex_replenish_batch_size</code></p>
             </div>
+            <div className="grid gap-2">
+              <label className="text-sm font-medium">{text('Worker Count', '并发 Worker 数')}</label>
+              <input type="number" min="1" max="20" step="1" value={effectiveWorkerCount} onChange={(e) => setCodexReplenishWorkerCount(normalizeReplenishWorkerCount(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
+              <p className="text-xs text-muted-foreground"><code>codex_replenish_worker_count</code></p>
+            </div>
           </div>
 
           <div className="rounded-lg border border-border/60 bg-background/40 p-4 text-sm text-muted-foreground">
-            {effectiveTargetCount > 0 ? text(`Trigger replenishment when healthy Codex accounts < ${effectiveThreshold}, then refill back to ${effectiveTargetCount}.`, `当健康 Codex 账号数低于 ${effectiveThreshold} 时触发补货，并补回到 ${effectiveTargetCount} 个。`) : text('Target count is 0, so replenishment will not create new accounts until you increase the target.', '当前目标数量为 0，在你把目标调高之前，自动补货不会新增账号。')}
+            {effectiveTargetCount > 0 ? text(`Trigger replenishment when healthy Codex accounts < ${effectiveThreshold}, then refill back to ${effectiveTargetCount}. Each batch creates up to ${effectiveBatchSize} accounts with up to ${effectiveWorkerCount} concurrent workers.`, `当健康 Codex 账号数低于 ${effectiveThreshold} 时触发补货，并补回到 ${effectiveTargetCount} 个。每批最多注册 ${effectiveBatchSize} 个账号，并发 worker 最多 ${effectiveWorkerCount} 个。`) : text('Target count is 0, so replenishment will not create new accounts until you increase the target.', '当前目标数量为 0，在你把目标调高之前，自动补货不会新增账号。')}
           </div>
 
           <label className="flex items-center gap-2 text-sm font-medium">
@@ -770,6 +787,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
                   <StatusCard label={text('Target', '目标数量')} value={replenishmentStatus.target_count ?? effectiveTargetCount} />
                   <StatusCard label={text('Missing', '缺失数量')} value={replenishmentStatus.needed ?? 0} />
                   <StatusCard label={text('Batch Size', '批量大小')} value={replenishmentStatus.batch_size ?? effectiveBatchSize} />
+                  <StatusCard label={text('Worker Count', '并发数')} value={replenishmentStatus.worker_count ?? effectiveWorkerCount} />
                   <StatusCard label={text('Mail Mode', '邮箱模式')} value={getEmailSelectionModeLabel(replenishmentStatus.email_selection_mode, text)} />
                   <StatusCard label={text('Last Domain', '最近域名')} value={replenishmentStatus.last_selected_domain || text('Unknown', '未知')} />
                   <StatusCard label={text('Last Started', '上次开始')} value={formatBatchTime(replenishmentStatus.last_started_at, text)} />
