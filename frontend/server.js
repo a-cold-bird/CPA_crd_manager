@@ -343,11 +343,11 @@ function normalizeCodexReplenishThreshold(value, targetCount, fallback = 0) {
 }
 
 function normalizeCodexReplenishBatchSize(value, fallback = 1) {
-  return Math.max(1, Math.min(50, normalizeNonNegativeInteger(value, fallback)));
+  return Math.max(1, Math.min(200, normalizeNonNegativeInteger(value, fallback)));
 }
 
 function normalizeCodexReplenishWorkerCount(value, fallback = 1) {
-  return Math.max(1, Math.min(20, normalizeNonNegativeInteger(value, fallback)));
+  return Math.max(1, Math.min(200, normalizeNonNegativeInteger(value, fallback)));
 }
 
 function readArchiveStore() {
@@ -1579,6 +1579,42 @@ function countNormalCodexAccountsFromRuntime(runtimeState, cpaUrlKey) {
   return count;
 }
 
+function countUsableCodexAccounts(credentials, runtimeState, cpaUrlKey) {
+  const files = Array.isArray(credentials) ? credentials : [];
+  const bucket = getRuntimeBucket(runtimeState, cpaUrlKey, { createIfMissing: false }) || normalizeRuntimeBucket({});
+  const bucketCredentials = bucket.credentials || {};
+  let count = 0;
+
+  files.forEach((credential) => {
+    const provider = normalizeStringOrEmpty(credential?.provider).toLowerCase();
+    if (provider !== 'codex') {
+      return;
+    }
+    if (normalizeBoolean(credential?.disabled, false)) {
+      return;
+    }
+
+    const name = normalizeCredentialName(credential?.name);
+    const runtimeEntry = bucketCredentials[name] || {};
+    const runtimeStatus = normalizeStringOrEmpty(runtimeEntry?.last_status).toLowerCase();
+    const cpaStatus = normalizeStringOrEmpty(credential?.status).toLowerCase();
+    const resolvedStatus = runtimeStatus || cpaStatus;
+    if (resolvedStatus !== 'active') {
+      return;
+    }
+    if (normalizeBoolean(runtimeEntry?.disabled_by_runtime, false)) {
+      return;
+    }
+    if (normalizeBoolean(runtimeEntry?.archived_by_runtime, false)) {
+      return;
+    }
+
+    count += 1;
+  });
+
+  return count;
+}
+
 async function runBackendAutomationCycle() {
   if (runtimeScheduler.cycleInProgress) {
     return;
@@ -1724,7 +1760,7 @@ async function runBackendAutomationCycle() {
     if (parseBoolSafe(config.codex_replenish_enabled, false)) {
       const targetCount = normalizeNonNegativeInteger(config.codex_replenish_target_count, normalizeNonNegativeInteger(config.codex_target_count, 0));
       const threshold = normalizeCodexReplenishThreshold(config.codex_replenish_threshold, targetCount, 0);
-      const normalCodexCount = countNormalCodexAccountsFromRuntime(runtimeState, cpaUrlKey);
+      const normalCodexCount = countUsableCodexAccounts(credentials, runtimeState, cpaUrlKey);
       if (normalCodexCount >= threshold) {
         console.log(`[Replenish] Skip spawn because healthy Codex count ${normalCodexCount} is above threshold ${threshold} (target ${targetCount})`);
         return;
@@ -1765,7 +1801,7 @@ async function spawnReplenishmentProcess(options = {}) {
   const scriptPath = path.join(PROJECT_ROOT, 'replenish_codex.py');
   const configPath = CONFIG_PATH;
   const statePath = RUNTIME_STATE_PATH;
-  const args = [scriptPath, '--config', configPath, '--state', statePath];
+  const args = ['-u', scriptPath, '--config', configPath, '--state', statePath];
   const needed = normalizeNumberOrNull(options?.needed);
   if (needed !== null && needed > 0) {
     args.push('--needed', String(needed));
@@ -1793,6 +1829,7 @@ async function spawnReplenishmentProcess(options = {}) {
     const child = spawn(pythonPath, args, {
       env: {
         ...process.env,
+        PYTHONUNBUFFERED: '1',
         PYTHONIOENCODING: 'utf-8',
         PYTHONUTF8: '1',
       },
@@ -2374,7 +2411,13 @@ app.post('/api/runtime/replenishment/start', async (req, res) => {
     const threshold = normalizeCodexReplenishThreshold(config.codex_replenish_threshold, targetCount, 0);
     const runtimeState = readRuntimeState();
     const cpaUrlKey = normalizeCpaUrlForArchive(config?.cpa_url, config?.cpa_url);
-    const healthyCount = countNormalCodexAccountsFromRuntime(runtimeState, cpaUrlKey);
+    let healthyCount = countNormalCodexAccountsFromRuntime(runtimeState, cpaUrlKey);
+    try {
+      const credentials = await fetchAuthFilesFromCpa(config);
+      healthyCount = countUsableCodexAccounts(credentials, runtimeState, cpaUrlKey);
+    } catch (error) {
+      console.warn(`[Replenish] Falling back to runtime-only healthy count for manual start: ${String(error?.message || error)}`);
+    }
     const needed = Math.max(0, targetCount - healthyCount);
 
     const tracked = getTrackedReplenishmentProcess();

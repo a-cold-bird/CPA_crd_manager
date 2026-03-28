@@ -95,11 +95,11 @@ function normalizeReplenishThreshold(value: unknown, targetCount: number, fallba
 }
 
 function normalizeReplenishBatchSize(value: unknown, fallback = 1): number {
-  return Math.max(1, Math.min(50, normalizeNonNegativeInteger(value, fallback)));
+  return Math.max(1, Math.min(200, normalizeNonNegativeInteger(value, fallback)));
 }
 
 function normalizeReplenishWorkerCount(value: unknown, fallback = 1): number {
-  return Math.max(1, Math.min(20, normalizeNonNegativeInteger(value, fallback)));
+  return Math.max(1, Math.min(200, normalizeNonNegativeInteger(value, fallback)));
 }
 
 function getReplenishmentResultLabel(
@@ -733,12 +733,12 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Batch Size', '批量大小')}</label>
-              <input type="number" min="1" max="50" step="1" value={effectiveBatchSize} onChange={(e) => setCodexReplenishBatchSize(normalizeReplenishBatchSize(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
+              <input type="number" min="1" max="200" step="1" value={effectiveBatchSize} onChange={(e) => setCodexReplenishBatchSize(normalizeReplenishBatchSize(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
               <p className="text-xs text-muted-foreground"><code>codex_replenish_batch_size</code></p>
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Worker Count', '并发 Worker 数')}</label>
-              <input type="number" min="1" max="20" step="1" value={effectiveWorkerCount} onChange={(e) => setCodexReplenishWorkerCount(normalizeReplenishWorkerCount(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
+              <input type="number" min="1" max="200" step="1" value={effectiveWorkerCount} onChange={(e) => setCodexReplenishWorkerCount(normalizeReplenishWorkerCount(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
               <p className="text-xs text-muted-foreground"><code>codex_replenish_worker_count</code></p>
             </div>
           </div>

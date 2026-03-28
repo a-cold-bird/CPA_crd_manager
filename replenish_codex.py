@@ -638,6 +638,22 @@ def fetch_cpa_auth_file_names(cpa_url: str, management_key: str) -> Set[str]:
     finally:
         session.close()
 
+def fetch_cpa_auth_files(cpa_url: str, management_key: str) -> List[Dict[str, Any]]:
+    if not normalize_cpa_url(cpa_url):
+        raise ValueError("cpa_url is required")
+    if not str(management_key or '').strip():
+        raise ValueError("management_key is required")
+
+    session = create_cpa_session(management_key)
+    try:
+        response = session.get(build_cpa_url(cpa_url, '/v0/management/auth-files'), timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        files = data.get('files', []) if isinstance(data, dict) else []
+        return [item for item in files if isinstance(item, dict)]
+    finally:
+        session.close()
+
 def remove_file_if_exists(file_path: str) -> bool:
     if not os.path.exists(file_path):
         return False
@@ -1110,33 +1126,56 @@ def write_replenishment_idle_status(
 
 def count_normal_accounts(cpa_url: str, management_key: str, runtime_state: Dict[str, Any]) -> int:
     """
-    Counts normal codex accounts: provider==codex, not disabled, status==active
+    Counts enabled and usable codex accounts for the current CPA target.
     """
-    count = 0
-    # The runtime_state structure is:
-    # { "by_cpa_url": { "cpa_key": { "credentials": { "name": { "last_status": "active", ... } } } } }
-    
-    # We should iterate through all credentials in all buckets if there are multiple CPAs, 
-    # but normally there's only one.
-    buckets = runtime_state.get('by_cpa_url', {})
-    for cpa_key, bucket in buckets.items():
-        credentials = bucket.get('credentials', {})
-        for name, state in credentials.items():
-            provider = str(state.get('provider') or '').strip().lower()
-            quota_cards = state.get('last_quota_cards') if isinstance(state.get('last_quota_cards'), list) else []
-            looks_like_codex = (
-                provider == 'codex'
-                or name.startswith('codex-')
-                or len(quota_cards) > 0
-                or state.get('last_quota_source') not in (None, '', 'unknown')
-            )
-            if not looks_like_codex:
+    normalized_cpa_url = normalize_cpa_url(cpa_url)
+    runtime_bucket = {}
+    if normalized_cpa_url:
+        runtime_bucket = ((runtime_state.get('by_cpa_url', {}) or {}).get(normalized_cpa_url) or {}).get('credentials', {}) or {}
+
+    try:
+        auth_files = fetch_cpa_auth_files(cpa_url, management_key)
+    except Exception as exc:
+        logger.warning("Falling back to runtime-only healthy count due to CPA auth-files fetch failure: %s", exc)
+        auth_files = []
+
+    if auth_files:
+        count = 0
+        for item in auth_files:
+            provider = str(item.get('provider') or '').strip().lower()
+            disabled = bool(item.get('disabled'))
+            if provider != 'codex' or disabled:
                 continue
 
-            status = state.get('last_status')
-            disabled_by_runtime = bool(state.get('disabled_by_runtime', False))
-            if status == 'active' and not disabled_by_runtime:
+            name = str(item.get('name') or '').strip()
+            runtime_entry = runtime_bucket.get(name) if isinstance(runtime_bucket, dict) else {}
+            runtime_status = str((runtime_entry or {}).get('last_status') or '').strip().lower()
+            cpa_status = str(item.get('status') or '').strip().lower()
+            resolved_status = runtime_status or cpa_status
+            disabled_by_runtime = bool((runtime_entry or {}).get('disabled_by_runtime', False))
+            archived_by_runtime = bool((runtime_entry or {}).get('archived_by_runtime', False))
+            if resolved_status == 'active' and not disabled_by_runtime and not archived_by_runtime:
                 count += 1
+        return count
+
+    count = 0
+    for name, state in (runtime_bucket or {}).items():
+        provider = str(state.get('provider') or '').strip().lower()
+        quota_cards = state.get('last_quota_cards') if isinstance(state.get('last_quota_cards'), list) else []
+        looks_like_codex = (
+            provider == 'codex'
+            or name.startswith('codex-')
+            or len(quota_cards) > 0
+            or state.get('last_quota_source') not in (None, '', 'unknown')
+        )
+        if not looks_like_codex:
+            continue
+
+        status = str(state.get('last_status') or '').strip().lower()
+        disabled_by_runtime = bool(state.get('disabled_by_runtime', False))
+        archived_by_runtime = bool(state.get('archived_by_runtime', False))
+        if status == 'active' and not disabled_by_runtime and not archived_by_runtime:
+            count += 1
     return count
 
 def sync_register_mail_config(config: Dict[str, Any]) -> None:
