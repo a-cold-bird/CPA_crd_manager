@@ -16,6 +16,7 @@ dependencies = [
   "PyYAML>=6.0",
   "requests>=2.31",
   "curl-cffi>=0.7.0",
+  "httpx[http2]>=0.27",
 ]
 
 [project.scripts]
