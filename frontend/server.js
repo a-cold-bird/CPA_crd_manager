@@ -93,16 +93,37 @@ function ensureWritableFilePath(filePath) {
   }
 }
 
+function normalizeMailProvider(value) {
+  const provider = String(value || '').trim().toLowerCase();
+  return provider === 'inbucket' ? 'inbucket' : 'mailfree';
+}
+
+function readMailMeta(config = readConfig()) {
+  const inbucketApiBase = normalizeCpaBaseUrl(config?.inbucket_mail_api_base || config?.mail_api_base || '');
+  const inbucketDomains = normalizeDomainListText(config?.inbucket_mail_domains || '').split(',').map((item) => item.trim()).filter(Boolean);
+  return {
+    provider_options: [
+      { value: 'mailfree', label: 'mailfree' },
+      { value: 'inbucket', label: 'inbucket' },
+    ],
+    inbucket_api_base: inbucketApiBase,
+    inbucket_domains: inbucketDomains,
+  };
+}
+
 // Helper to read config
 function readConfig() {
   const defaults = {
     cpa_url: '',
     management_key: '',
+    mail_email_provider: 'mailfree',
     mail_api_base: '',
     mail_username: '',
     mail_password: '',
     mail_email_domain: '',
     mail_email_domains: '', // Added
+    inbucket_mail_api_base: '',
+    inbucket_mail_domains: '',
     mail_randomize_from_list: true,
     codex_replenish_enabled: false, // Added
     codex_target_count: 5,
@@ -127,13 +148,19 @@ function readConfig() {
       return defaults;
     }
     const normalizedTargetCount = resolveCodexReplenishTargetCount(parsed, 5);
+    const normalizedMailEmailProvider = normalizeMailProvider(parsed.mail_email_provider || 'mailfree');
     const normalizedMailEmailDomain = normalizeDomain(parsed.mail_email_domain || '');
     const normalizedMailEmailDomains = normalizeDomainListText(parsed.mail_email_domains, normalizedMailEmailDomain);
+    const normalizedInbucketMailApiBase = normalizeCpaBaseUrl(parsed.inbucket_mail_api_base || '');
+    const normalizedInbucketMailDomains = normalizeDomainListText(parsed.inbucket_mail_domains);
     return {
       ...defaults,
       ...parsed,
+      mail_email_provider: normalizedMailEmailProvider,
       mail_email_domain: normalizedMailEmailDomain,
       mail_email_domains: normalizedMailEmailDomains,
+      inbucket_mail_api_base: normalizedInbucketMailApiBase,
+      inbucket_mail_domains: normalizedInbucketMailDomains,
       mail_randomize_from_list: parseBoolSafe(parsed.mail_randomize_from_list, true),
       codex_replenish_enabled: parseBoolSafe(parsed.codex_replenish_enabled, false), // Added
       codex_replenish_target_count: normalizedTargetCount,
@@ -164,15 +191,21 @@ function writeConfig(data) {
   const normalizedThreshold = normalizeCodexReplenishThreshold(merged.codex_replenish_threshold, normalizedTargetCount, 2);
   const normalizedBatchSize = normalizeCodexReplenishBatchSize(merged.codex_replenish_batch_size, 1);
   const normalizedWorkerCount = normalizeCodexReplenishWorkerCount(merged.codex_replenish_worker_count, 1);
+  const normalizedMailEmailProvider = normalizeMailProvider(merged.mail_email_provider || 'mailfree');
   const normalizedMailEmailDomain = normalizeDomain(merged.mail_email_domain || '');
   const normalizedMailEmailDomains = normalizeDomainListText(merged.mail_email_domains, normalizedMailEmailDomain);
+  const normalizedInbucketMailApiBase = normalizeCpaBaseUrl(merged.inbucket_mail_api_base || '');
+  const normalizedInbucketMailDomains = normalizeDomainListText(merged.inbucket_mail_domains);
   merged.codex_replenish_target_count = normalizedTargetCount;
   merged.codex_target_count = normalizedTargetCount;
   merged.codex_replenish_threshold = normalizedThreshold;
   merged.codex_replenish_batch_size = normalizedBatchSize;
   merged.codex_replenish_worker_count = normalizedWorkerCount;
+  merged.mail_email_provider = normalizedMailEmailProvider;
   merged.mail_email_domain = normalizedMailEmailDomain;
   merged.mail_email_domains = normalizedMailEmailDomains;
+  merged.inbucket_mail_api_base = normalizedInbucketMailApiBase;
+  merged.inbucket_mail_domains = normalizedInbucketMailDomains;
   const str = yaml.dump(merged);
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
   fs.writeFileSync(CONFIG_PATH, str, 'utf-8');
@@ -829,6 +862,7 @@ async function fetchMailService(config, {
 
 async function runMailDomainSmokeTest(targetConfig) {
   const domain = normalizeMailDomain(targetConfig?.domain);
+  const provider = normalizeMailProvider(targetConfig?.mail_email_provider || 'mailfree');
   const mailApiBase = normalizeCpaBaseUrl(targetConfig?.mail_api_base);
   const mailUsername = String(targetConfig?.mail_username || '').trim();
   const mailPassword = String(targetConfig?.mail_password || '').trim();
@@ -836,10 +870,10 @@ async function runMailDomainSmokeTest(targetConfig) {
   if (!mailApiBase) {
     throw new Error('mail_api_base is required');
   }
-  if (!mailUsername) {
+  if (provider === 'mailfree' && !mailUsername) {
     throw new Error('mail_username is required');
   }
-  if (!mailPassword) {
+  if (provider === 'mailfree' && !mailPassword) {
     throw new Error('mail_password is required');
   }
   if (!domain) {
@@ -851,6 +885,7 @@ async function runMailDomainSmokeTest(targetConfig) {
 
   const mailbox = buildMailDomainTestMailbox(domain);
   const payload = {
+    provider,
     domain,
     mailbox,
     ok: false,
@@ -859,6 +894,27 @@ async function runMailDomainSmokeTest(targetConfig) {
     message: '',
     error: '',
   };
+
+  if (provider === 'inbucket') {
+    const listResult = await fetchMailService(
+      { mail_api_base: mailApiBase },
+      {
+        method: 'GET',
+        pathname: `/api/v1/mailbox/${mailbox}`,
+        headers: {
+          'User-Agent': 'Mozilla/5.0',
+        },
+      },
+    );
+    payload.list_status = listResult.status;
+    if (!listResult.ok) {
+      payload.error = String(listResult.data?.error || listResult.data?.message || `mailbox list failed (${listResult.status})`);
+      throw createRequestError(payload.error, listResult.status, payload);
+    }
+    payload.ok = true;
+    payload.message = 'Inbucket mailbox listing succeeded.';
+    return payload;
+  }
 
   const loginResult = await fetchMailService(
     { mail_api_base: mailApiBase },
@@ -1984,7 +2040,7 @@ app.post('/api/auth/login', (req, res) => {
 app.post('/api/config', (req, res) => {
   const config = readConfig();
   if (isAuthorized(resolveRequestSecret(req), config)) {
-    res.json({ ok: true, config });
+    res.json({ ok: true, config, mail_meta: readMailMeta(config) });
   } else {
     res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
@@ -2049,11 +2105,14 @@ app.post('/api/config/update', (req, res) => {
       writeConfig({
         cpa_url: nextConfig.cpa_url !== undefined ? nextConfig.cpa_url : config.cpa_url,
         management_key: nextConfig.management_key !== undefined ? nextConfig.management_key : config.management_key,
+        mail_email_provider: nextConfig.mail_email_provider !== undefined ? normalizeMailProvider(nextConfig.mail_email_provider) : config.mail_email_provider,
         mail_api_base: nextConfig.mail_api_base !== undefined ? nextConfig.mail_api_base : config.mail_api_base,
         mail_username: nextConfig.mail_username !== undefined ? nextConfig.mail_username : config.mail_username,
         mail_password: nextConfig.mail_password !== undefined ? nextConfig.mail_password : config.mail_password,
         mail_email_domain: nextConfig.mail_email_domain !== undefined ? nextConfig.mail_email_domain : config.mail_email_domain,
         mail_email_domains: nextConfig.mail_email_domains !== undefined ? nextConfig.mail_email_domains : config.mail_email_domains,
+        inbucket_mail_api_base: nextConfig.inbucket_mail_api_base !== undefined ? nextConfig.inbucket_mail_api_base : config.inbucket_mail_api_base,
+        inbucket_mail_domains: nextConfig.inbucket_mail_domains !== undefined ? nextConfig.inbucket_mail_domains : config.inbucket_mail_domains,
         mail_randomize_from_list: nextConfig.mail_randomize_from_list !== undefined ? parseBoolSafe(nextConfig.mail_randomize_from_list, config.mail_randomize_from_list) : config.mail_randomize_from_list,
         codex_replenish_enabled: nextCodexReplenishEnabled,
         codex_target_count: nextCodexReplenishTargetCount,
@@ -2217,6 +2276,7 @@ app.post('/api/mail/domain-test', async (req, res) => {
   try {
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
     const payload = await runMailDomainSmokeTest({
+      mail_email_provider: body.mail_email_provider !== undefined ? body.mail_email_provider : config.mail_email_provider,
       mail_api_base: body.mail_api_base !== undefined ? body.mail_api_base : config.mail_api_base,
       mail_username: body.mail_username !== undefined ? body.mail_username : config.mail_username,
       mail_password: body.mail_password !== undefined ? body.mail_password : config.mail_password,

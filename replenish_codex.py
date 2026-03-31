@@ -56,6 +56,27 @@ def normalize_domain_list(value: Any) -> List[str]:
     return domains
 
 
+def load_provider_domain_list(config: Dict[str, Any]) -> List[str]:
+    provider = (
+        str(config.get("mail_email_provider", "mailfree") or "mailfree").strip().lower()
+    )
+    domain_source = config.get(
+        "inbucket_mail_domains" if provider == "inbucket" else "mail_email_domains",
+        "",
+    )
+    if provider == "inbucket" and not normalize_domain_list(domain_source):
+        domain_source = config.get("mail_email_domains", "")
+    configured_domains = normalize_domain_list(domain_source)
+    default_domain = str(config.get("mail_email_domain", "") or "").strip().lower()
+
+    if default_domain:
+        configured_domains = [
+            item for item in configured_domains if item != default_domain
+        ]
+        configured_domains.insert(0, default_domain)
+    return configured_domains
+
+
 def build_replenishment_summary(state: str) -> str:
     mapping = {
         "started": "Registration started.",
@@ -706,14 +727,29 @@ def get_local_backup_dir() -> str:
 
 
 def configure_internal_register_environment(config: Dict[str, Any]) -> None:
-    configured_domains = normalize_domain_list(config.get("mail_email_domains", ""))
+    configured_domains = load_provider_domain_list(config)
     default_domain = str(config.get("mail_email_domain", "") or "").strip().lower()
+    mail_provider = (
+        str(config.get("mail_email_provider", "mailfree") or "mailfree").strip().lower()
+    )
     if default_domain and default_domain not in configured_domains:
         configured_domains.insert(0, default_domain)
 
+    provider_api_base = str(
+        config.get(
+            "inbucket_mail_api_base"
+            if mail_provider == "inbucket"
+            else "mail_api_base",
+            "",
+        )
+        or config.get("mail_api_base", "")
+        or ""
+    ).strip()
+
     env_updates = {
-        "MAIL_API_BASE": str(config.get("mail_api_base", "") or "").strip(),
-        "DUCKMAIL_API_BASE": str(config.get("mail_api_base", "") or "").strip(),
+        "MAIL_EMAIL_PROVIDER": mail_provider,
+        "MAIL_API_BASE": provider_api_base,
+        "DUCKMAIL_API_BASE": provider_api_base,
         "MAIL_USERNAME": str(config.get("mail_username", "") or "").strip(),
         "MAIL_PASSWORD": str(config.get("mail_password", "") or ""),
         "MAIL_EMAIL_DOMAIN": default_domain,
@@ -1641,7 +1677,7 @@ def configure_register_proxy_mode(
 
 
 def resolve_replenishment_email_domain(config: Dict[str, Any]) -> Tuple[str, str]:
-    email_domains = normalize_domain_list(config.get("mail_email_domains", ""))
+    email_domains = load_provider_domain_list(config)
     default_domain = str(config.get("mail_email_domain", "") or "").strip().lower()
     randomize_from_list = bool(config.get("mail_randomize_from_list", True))
     if default_domain and default_domain not in email_domains:
@@ -1668,7 +1704,11 @@ def resolve_replenishment_email_domain(config: Dict[str, Any]) -> Tuple[str, str
 def configure_register_email_domain_strategy(
     register_module, config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    email_domains = normalize_domain_list(config.get("mail_email_domains", ""))
+    email_provider = (
+        str(config.get("mail_email_provider", "mailfree") or "mailfree").strip().lower()
+        or "mailfree"
+    )
+    email_domains = load_provider_domain_list(config)
     default_domain = str(config.get("mail_email_domain", "") or "").strip().lower()
     randomize_from_list = bool(config.get("mail_randomize_from_list", True))
     if default_domain and default_domain not in email_domains:
@@ -1698,7 +1738,7 @@ def configure_register_email_domain_strategy(
         total,
         proxy,
         output_file,
-        email_provider="mailfree",
+        email_provider=email_provider,
         email_domain=None,
         extract_codex=True,
         progress_hook=None,
@@ -1721,6 +1761,7 @@ def configure_register_email_domain_strategy(
 
     register_module._register_one = wrapped_register_one
     return {
+        "email_provider": email_provider,
         "domains": list(email_domains),
         "default_domain": default_domain,
         "randomize_from_list": randomize_from_list,
@@ -2032,6 +2073,11 @@ def run_register_batch(
                     output_file=output_file,
                     max_workers=actual_workers,
                     proxy=None,
+                    email_provider=str(
+                        email_runtime.get("email_provider")
+                        or config.get("mail_email_provider")
+                        or "mailfree"
+                    ),
                     email_domain=runtime_email_domain,
                     extract_codex=True,
                     progress_hook=build_register_progress_hook(batch_attempt),

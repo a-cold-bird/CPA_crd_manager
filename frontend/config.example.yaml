@@ -5,6 +5,8 @@ mail_username: admin
 mail_password: CHANGE_ME
 mail_email_domain: example.com
 mail_email_domains: "example.com,example.net"
+inbucket_mail_api_base: https://mail.example.inbucket.local
+inbucket_mail_domains: "example.inbucket.local,*.mail.example.inbucket.local"
 mail_randomize_from_list: true
 auto_probe_enabled: false
 auto_probe_interval_minutes: 60

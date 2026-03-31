@@ -82,6 +82,7 @@ progress.txt
 # Local-only references / archives
 archive/
 backup/
+bing/
 deploy_personal_data_*/
 deploy_personal_data_*.zip
 tests/

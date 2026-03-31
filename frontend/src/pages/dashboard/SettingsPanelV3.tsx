@@ -15,6 +15,7 @@ import {
   type RemotePushTestPayload,
   type RuntimeStatusPayload,
 } from '../../lib/api';
+import { buildEmailDomainStats } from '../../lib/domainStats.js';
 
 interface SettingsMessage {
   type: '' | 'success' | 'error';
@@ -38,10 +39,14 @@ interface SettingsPanelProps {
   setMailUsername: Dispatch<SetStateAction<string>>;
   mailPassword: string;
   setMailPassword: Dispatch<SetStateAction<string>>;
+  mailEmailProvider: 'mailfree' | 'inbucket';
+  setMailEmailProvider: Dispatch<SetStateAction<'mailfree' | 'inbucket'>>;
+  inbucketApiBase: string;
   mailEmailDomain: string;
   setMailEmailDomain: Dispatch<SetStateAction<string>>;
   mailEmailDomains: string;
   setMailEmailDomains: Dispatch<SetStateAction<string>>;
+  inbucketDomains: string[];
   mailRandomizeFromList: boolean;
   setMailRandomizeFromList: Dispatch<SetStateAction<boolean>>;
   codexReplenishEnabled: boolean;
@@ -130,6 +135,13 @@ function StatusCard({ label, value }: { label: string; value: string | number })
       <div>{value}</div>
     </div>
   );
+}
+
+function getSuccessRateBadgeClass(rate: number | null): string {
+  if (rate === null) return 'border-border/60 bg-background/60 text-muted-foreground';
+  if (rate >= 70) return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400';
+  if (rate >= 30) return 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400';
+  return 'border-destructive/30 bg-destructive/10 text-destructive';
 }
 
 function formatBatchTime(value: number | null, text: (en: string, zh: string) => string): string {
@@ -322,6 +334,174 @@ function ReplenishmentAccountsCard({
   );
 }
 
+function ReplenishmentRuntimeCard({
+  replenishmentStatus,
+  replenishmentResultLabel,
+  effectiveTargetCount,
+  effectiveBatchSize,
+  effectiveWorkerCount,
+  runtimeStatusError,
+  startingReplenishment,
+  stoppingReplenishment,
+  runtimeStatusLoading,
+  onStart,
+  onStop,
+  onRefresh,
+  simpleReplenishmentLogs,
+  replenishmentAccounts,
+  text,
+}: {
+  replenishmentStatus: RuntimeStatusPayload['replenishment'] | null;
+  replenishmentResultLabel: string;
+  effectiveTargetCount: number;
+  effectiveBatchSize: number;
+  effectiveWorkerCount: number;
+  runtimeStatusError: string;
+  startingReplenishment: boolean;
+  stoppingReplenishment: boolean;
+  runtimeStatusLoading: boolean;
+  onStart: () => void;
+  onStop: () => void;
+  onRefresh: () => void;
+  simpleReplenishmentLogs: string[];
+  replenishmentAccounts: ReplenishmentBatchStatus['accounts'];
+  text: (en: string, zh: string) => string;
+}) {
+  return (
+    <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4 xl:sticky xl:top-6">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <div className="space-y-1">
+          <h3 className="text-base font-semibold">{text('Runtime Status', '补货状态')}</h3>
+          <p className="text-xs text-muted-foreground">{text('Simple live summary of the backend replenishment worker.', '后端补货 worker 的简化实时摘要。')}</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" onClick={onStart} disabled={startingReplenishment || Boolean(replenishmentStatus?.in_progress)} className="inline-flex h-9 items-center justify-center rounded-md border border-primary/30 bg-primary/10 px-3 text-sm font-medium text-primary hover:bg-primary/15 disabled:opacity-50">{startingReplenishment ? text('Starting...', '启动中...') : text('Start Replenishment', '开始补货')}</button>
+          <button type="button" onClick={onStop} disabled={stoppingReplenishment || !replenishmentStatus?.in_progress} className="inline-flex h-9 items-center justify-center rounded-md border border-destructive/40 bg-destructive/5 px-3 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50">{stoppingReplenishment ? text('Stopping...', '停止中...') : text('Stop Replenishment', '停止补货')}</button>
+          <button type="button" onClick={onRefresh} disabled={runtimeStatusLoading} className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted disabled:opacity-50">{runtimeStatusLoading ? text('Refreshing...', '刷新中...') : text('Refresh Status', '刷新状态')}</button>
+        </div>
+      </div>
+
+      {runtimeStatusError && <div className="mb-3 rounded-md border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive">{runtimeStatusError}</div>}
+
+      {!replenishmentStatus ? (
+        <div className="rounded-md border border-dashed border-border/70 bg-muted/20 px-4 py-5 text-sm text-muted-foreground">{text('No runtime status available yet.', '暂无 runtime 状态。')}</div>
+      ) : (
+        <div className="space-y-3 text-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-medium">{text('Status', '状态')}:</span>
+            <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${replenishmentStatus.in_progress ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400' : replenishmentStatus.enabled ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400' : 'bg-muted text-muted-foreground'}`}>
+              {replenishmentStatus.in_progress ? text('Running', '运行中') : replenishmentStatus.enabled ? text('Idle', '空闲') : text('Disabled', '已禁用')}
+            </span>
+            {replenishmentStatus.mode && <span className="text-muted-foreground">{text('Mode', '模式')}: {replenishmentStatus.mode}</span>}
+            {replenishmentStatus.process_pid && <span className="text-muted-foreground">PID: {replenishmentStatus.process_pid}</span>}
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <StatusCard label={text('Last Result', '最近结果')} value={replenishmentResultLabel} />
+            <StatusCard label={text('Healthy', '已有数量')} value={replenishmentStatus.healthy_count ?? 0} />
+            <StatusCard label={text('Target', '目标数量')} value={replenishmentStatus.target_count ?? effectiveTargetCount} />
+            <StatusCard label={text('Missing', '缺失数量')} value={replenishmentStatus.needed ?? 0} />
+            <StatusCard label={text('Batch Size', '批量大小')} value={replenishmentStatus.batch_size ?? effectiveBatchSize} />
+            <StatusCard label={text('Worker Count', '并发数')} value={replenishmentStatus.worker_count ?? effectiveWorkerCount} />
+            <StatusCard label={text('Mail Mode', '邮箱模式')} value={getEmailSelectionModeLabel(replenishmentStatus.email_selection_mode, text)} />
+            <StatusCard label={text('Last Domain', '最近域名')} value={replenishmentStatus.last_selected_domain || text('Unknown', '未知')} />
+            <StatusCard label={text('Last Started', '上次开始')} value={formatBatchTime(replenishmentStatus.last_started_at, text)} />
+            <StatusCard label={text('Last Finished', '上次结束')} value={formatBatchTime(replenishmentStatus.last_finished_at, text)} />
+          </div>
+
+          <SimpleReplenishmentLogCard lines={simpleReplenishmentLogs} text={text} />
+          <ReplenishmentAccountsCard accounts={replenishmentAccounts} text={text} />
+
+          <div className="rounded-md border border-border/60 bg-card/60 px-3 py-2">
+            <div className="text-xs text-muted-foreground">{text('Backend Detail', '后端详情')}</div>
+            <div>{text('The UI now focuses on account-level progress. Full raw logs are still written to the backend log file.', '前端现在聚焦账号级进度，完整原始日志仍写入后端日志文件。')}</div>
+            {replenishmentStatus.log_file && <div className="mt-1 text-xs text-muted-foreground"><code>{replenishmentStatus.log_file}</code></div>}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function CodexReplenishmentConfigCard({
+  codexReplenishEnabled,
+  setCodexReplenishEnabled,
+  effectiveTargetCount,
+  setCodexReplenishTargetCount,
+  effectiveThreshold,
+  setCodexReplenishThreshold,
+  effectiveBatchSize,
+  setCodexReplenishBatchSize,
+  effectiveWorkerCount,
+  setCodexReplenishWorkerCount,
+  codexReplenishUseProxy,
+  setCodexReplenishUseProxy,
+  text,
+}: {
+  codexReplenishEnabled: boolean;
+  setCodexReplenishEnabled: Dispatch<SetStateAction<boolean>>;
+  effectiveTargetCount: number;
+  setCodexReplenishTargetCount: Dispatch<SetStateAction<number>>;
+  effectiveThreshold: number;
+  setCodexReplenishThreshold: Dispatch<SetStateAction<number>>;
+  effectiveBatchSize: number;
+  setCodexReplenishBatchSize: Dispatch<SetStateAction<number>>;
+  effectiveWorkerCount: number;
+  setCodexReplenishWorkerCount: Dispatch<SetStateAction<number>>;
+  codexReplenishUseProxy: boolean;
+  setCodexReplenishUseProxy: Dispatch<SetStateAction<boolean>>;
+  text: (en: string, zh: string) => string;
+}) {
+  return (
+    <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4">
+      <div className="flex items-center justify-between">
+        <div className="space-y-1">
+          <h3 className="text-base font-semibold">{text('Codex Account Replenishment', 'Codex 自动补货')}</h3>
+          <p className="text-xs text-muted-foreground">{text('These values are saved into config and used by the backend runtime.', '这些值会写入配置文件，并由后端 runtime 使用。')}</p>
+        </div>
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input type="checkbox" checked={codexReplenishEnabled} onChange={(e) => setCodexReplenishEnabled(e.target.checked)} className="h-4 w-4 rounded border-input bg-background/50 accent-primary" />
+          {text('Enabled', '启用')}
+        </label>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid gap-2">
+          <label className="text-sm font-medium">{text('Target Account Count', '目标账号总数')}</label>
+          <input type="number" min="0" step="1" value={effectiveTargetCount} onChange={(e) => { const nextTarget = normalizeNonNegativeInteger(e.target.value, 0); setCodexReplenishTargetCount(nextTarget); setCodexReplenishThreshold((prev) => normalizeReplenishThreshold(prev, nextTarget, 0)); }} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
+          <p className="text-xs text-muted-foreground"><code>codex_replenish_target_count</code></p>
+        </div>
+        <div className="grid gap-2">
+          <label className="text-sm font-medium">{text('Replenish Threshold', '补货触发阈值')}</label>
+          <input type="number" min="0" max={String(effectiveTargetCount)} step="1" value={effectiveThreshold} onChange={(e) => setCodexReplenishThreshold(normalizeReplenishThreshold(e.target.value, effectiveTargetCount, 0))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
+          <p className="text-xs text-muted-foreground"><code>codex_replenish_threshold</code></p>
+        </div>
+        <div className="grid gap-2">
+          <label className="text-sm font-medium">{text('Batch Size', '批量大小')}</label>
+          <input type="number" min="1" max="200" step="1" value={effectiveBatchSize} onChange={(e) => setCodexReplenishBatchSize(normalizeReplenishBatchSize(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
+          <p className="text-xs text-muted-foreground"><code>codex_replenish_batch_size</code></p>
+        </div>
+        <div className="grid gap-2">
+          <label className="text-sm font-medium">{text('Worker Count', '并发 Worker 数')}</label>
+          <input type="number" min="1" max="200" step="1" value={effectiveWorkerCount} onChange={(e) => setCodexReplenishWorkerCount(normalizeReplenishWorkerCount(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
+          <p className="text-xs text-muted-foreground"><code>codex_replenish_worker_count</code></p>
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-border/60 bg-background/40 p-4 text-sm text-muted-foreground">
+        {effectiveTargetCount > 0 ? text(`Trigger replenishment when healthy Codex accounts < ${effectiveThreshold}, then refill back to ${effectiveTargetCount}. Each batch creates up to ${effectiveBatchSize} accounts with up to ${effectiveWorkerCount} concurrent workers.`, `当健康 Codex 账号数低于 ${effectiveThreshold} 时触发补货，并补回到 ${effectiveTargetCount} 个。每批最多注册 ${effectiveBatchSize} 个账号，并发 worker 最多 ${effectiveWorkerCount} 个。`) : text('Target count is 0, so replenishment will not create new accounts until you increase the target.', '当前目标数量为 0，在你把目标调高之前，自动补货不会新增账号。')}
+      </div>
+
+      <label className="flex items-center gap-2 text-sm font-medium">
+        <input type="checkbox" checked={codexReplenishUseProxy} onChange={(e) => setCodexReplenishUseProxy(e.target.checked)} className="h-4 w-4 rounded border-input bg-background/50 accent-primary" />
+        {text('Use Proxy for Registration', '注册时使用代理')}
+      </label>
+
+      <p className="text-xs text-muted-foreground">{text('External proxy pool remains in config. The settings page only shows the proxy switch now.', '外部代理池仍保留在配置文件中，设置界面现在只显示代理开关。')}</p>
+    </section>
+  );
+}
+
 export default function SettingsPanelV3(props: SettingsPanelProps) {
   const {
     cpaUrl,
@@ -334,10 +514,14 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
     setMailUsername,
     mailPassword,
     setMailPassword,
+    mailEmailProvider,
+    setMailEmailProvider,
+    inbucketApiBase,
     mailEmailDomain,
     setMailEmailDomain,
     mailEmailDomains,
     setMailEmailDomains,
+    inbucketDomains,
     mailRandomizeFromList,
     setMailRandomizeFromList,
     codexReplenishEnabled,
@@ -375,12 +559,21 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
   const [startingReplenishment, setStartingReplenishment] = useState(false);
   const [stoppingReplenishment, setStoppingReplenishment] = useState(false);
 
-  const emailDomainOptions = useMemo(() => {
+  const inbucketDomainOptions = useMemo(() => {
+    const parsed = Array.from(new Set((inbucketDomains || []).map((item) => normalizeDomain(String(item || ''))).filter(Boolean)));
+    const current = normalizeDomain(mailEmailDomain);
+    if (mailEmailProvider === 'inbucket' && current && !parsed.includes(current)) parsed.unshift(current);
+    return parsed;
+  }, [inbucketDomains, mailEmailDomain, mailEmailProvider]);
+
+  const mailfreeDomainOptions = useMemo(() => {
     const parsed = parseDomainList(mailEmailDomains);
     const current = normalizeDomain(mailEmailDomain);
-    if (current && !parsed.includes(current)) parsed.unshift(current);
+    if (mailEmailProvider === 'mailfree' && current && !parsed.includes(current)) parsed.unshift(current);
     return parsed;
-  }, [mailEmailDomain, mailEmailDomains]);
+  }, [mailEmailDomain, mailEmailDomains, mailEmailProvider]);
+
+  const emailDomainOptions = mailEmailProvider === 'inbucket' ? inbucketDomainOptions : mailfreeDomainOptions;
 
   const effectiveTargetCount = normalizeNonNegativeInteger(codexReplenishTargetCount, 0);
   const effectiveThreshold = normalizeReplenishThreshold(codexReplenishThreshold, effectiveTargetCount, 0);
@@ -404,6 +597,23 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
       .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0))
       .slice(0, 20);
   }, [replenishmentStatus]);
+
+  const emailDomainStats = useMemo(() => {
+    const batches = [
+      replenishmentStatus?.current_batch ?? null,
+      ...(replenishmentStatus?.batch_history ?? []),
+    ].filter(Boolean) as ReplenishmentBatchStatus[];
+
+    return new Map(Object.entries(buildEmailDomainStats(batches, emailDomainOptions)));
+  }, [emailDomainOptions, replenishmentStatus]);
+
+  useEffect(() => {
+    const normalized = normalizeDomain(mailEmailDomain);
+    if (emailDomainOptions.length === 0) return;
+    if (!normalized || !emailDomainOptions.includes(normalized)) {
+      setMailEmailDomain(emailDomainOptions[0] || '');
+    }
+  }, [emailDomainOptions, mailEmailDomain, setMailEmailDomain]);
 
   const loadRuntimeStatus = async (silent = false) => {
     if (!silent) setRuntimeStatusLoading(true);
@@ -476,6 +686,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
     setDomainTestStates((prev) => ({ ...prev, [normalized]: { status: 'testing', message: text('Testing domain...', '正在测试域名...'), payload: null } }));
     try {
       const data = await runMailDomainTest({
+        mail_email_provider: mailEmailProvider,
         domain: normalized,
         mail_api_base: mailApiBase.trim() || undefined,
         mail_username: mailUsername.trim() || undefined,
@@ -571,6 +782,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
         new_config: {
           cpa_url: cpaUrl || undefined,
           management_key: newPassword || undefined,
+          mail_email_provider: mailEmailProvider,
           mail_api_base: mailApiBase,
           mail_username: mailUsername,
           mail_password: mailPassword,
@@ -611,13 +823,14 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
     }
   };
   return (
-    <div className="rounded-2xl border border-border bg-card/95 p-6 shadow-sm">
+    <div className="w-full max-w-[1800px] rounded-2xl border border-border bg-card/95 p-6 shadow-sm">
       <h2 className="mb-6 flex items-center gap-2 text-xl font-semibold">
         <Settings className="h-5 w-5" />
         {text('Service Configuration', '服务配置')}
       </h2>
 
-      <div className="max-w-4xl space-y-6">
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_720px]">
+        <div className="space-y-6">
         <div className="grid gap-6 md:grid-cols-2">
           <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4">
             <div className="space-y-1">
@@ -640,16 +853,29 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
               <p className="text-xs text-muted-foreground">{text('Mailbox backend used during registration.', '注册流程使用的邮箱后端配置。')}</p>
             </div>
             <div className="grid gap-2">
+              <label className="text-sm font-medium">{text('Mail Provider', '邮箱提供方')}</label>
+              <select value={mailEmailProvider} onChange={(e) => setMailEmailProvider(e.target.value === 'inbucket' ? 'inbucket' : 'mailfree')} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm">
+                <option value="mailfree">mailfree</option>
+                <option value="inbucket">inbucket</option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                {mailEmailProvider === 'inbucket'
+                  ? text('Using the preconfigured Inbucket mail service and read-only domain list.', '当前使用预配置的 Inbucket 邮件服务和只读域名列表。')
+                  : text('Using the editable mailfree configuration below.', '当前使用可编辑的 mailfree 配置。')}
+              </p>
+            </div>
+            <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Mail API Base', '邮件 API 地址')}</label>
-              <input type="url" value={mailApiBase} onChange={(e) => setMailApiBase(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" placeholder="https://mail-api.example.com" />
+              <input type="url" value={mailApiBase} onChange={(e) => setMailApiBase(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="https://mail-api.example.com" disabled={mailEmailProvider === 'inbucket'} />
+              {mailEmailProvider === 'inbucket' && inbucketApiBase && <p className="text-xs text-muted-foreground">{text('Loaded from Inbucket config', '读取自 Inbucket 配置')}: <code>{inbucketApiBase}</code></p>}
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Mail Username', '邮箱用户名')}</label>
-              <input type="text" value={mailUsername} onChange={(e) => setMailUsername(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" placeholder="admin" />
+              <input type="text" value={mailUsername} onChange={(e) => setMailUsername(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="admin" disabled={mailEmailProvider === 'inbucket'} />
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Mail Password', '邮箱密码')}</label>
-              <input type="password" value={mailPassword} onChange={(e) => setMailPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" placeholder={text('Mail service password', '邮箱服务密码')} />
+              <input type="password" value={mailPassword} onChange={(e) => setMailPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder={text('Mail service password', '邮箱服务密码')} disabled={mailEmailProvider === 'inbucket'} />
             </div>
           </section>
         </div>
@@ -657,12 +883,18 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
         <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4">
           <div className="space-y-1">
             <h3 className="text-base font-semibold">{text('Mail Domains', '邮箱域名')}</h3>
-            <p className="text-xs text-muted-foreground">{text('Maintain the allowed email domain list for registration.', '维护注册时可用的邮箱域名列表。')}</p>
+            <p className="text-xs text-muted-foreground">
+              {mailEmailProvider === 'inbucket'
+                ? text('Read-only domains loaded from the configured Inbucket source.', '只读展示当前 Inbucket 配置源里的域名列表。')
+                : text('Maintain the allowed email domain list for registration.', '维护注册时可用的邮箱域名列表。')}
+            </p>
           </div>
-          <div className="flex flex-col gap-3 md:flex-row">
-            <input type="text" value={domainDraft} onChange={(e) => setDomainDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleAddDomain(); } }} className="flex h-10 flex-1 rounded-md border border-input bg-background/50 px-3 py-2 text-sm" placeholder="example.com" />
-            <button type="button" onClick={handleAddDomain} className="inline-flex h-10 items-center justify-center rounded-md border border-border bg-background px-4 py-2 text-sm font-medium hover:bg-muted">{text('Add Domain', '添加域名')}</button>
-          </div>
+          {mailEmailProvider === 'mailfree' && (
+            <div className="flex flex-col gap-3 md:flex-row">
+              <input type="text" value={domainDraft} onChange={(e) => setDomainDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleAddDomain(); } }} className="flex h-10 flex-1 rounded-md border border-input bg-background/50 px-3 py-2 text-sm" placeholder="example.com" />
+              <button type="button" onClick={handleAddDomain} className="inline-flex h-10 items-center justify-center rounded-md border border-border bg-background px-4 py-2 text-sm font-medium hover:bg-muted">{text('Add Domain', '添加域名')}</button>
+            </div>
+          )}
           {domainEditorError && <div className="rounded-md border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive">{domainEditorError}</div>}
           <div className="grid gap-3">
             {emailDomainOptions.length === 0 ? (
@@ -670,6 +902,9 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
             ) : emailDomainOptions.map((domain) => {
               const testState = domainTestStates[domain];
               const isTesting = testState?.status === 'testing';
+              const stat = emailDomainStats.get(domain);
+              const successRateValue = stat && stat.total > 0 ? Math.round((stat.success / stat.total) * 100) : null;
+              const successRate = successRateValue === null ? '--' : `${successRateValue}%`;
               return (
                 <div key={domain} className="rounded-lg border border-border/70 bg-card/60 px-4 py-3">
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
@@ -677,13 +912,23 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-medium">{domain}</span>
                         {domain === normalizeDomain(mailEmailDomain) && <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">{text('Default', '默认')}</span>}
+                        <span className="rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-[11px] text-sky-700 dark:text-sky-300">
+                          {text('Total', '总次数')}: {stat?.total ?? 0}
+                        </span>
+                        <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-700 dark:text-emerald-300">
+                          {text('Success', '成功次数')}: {stat?.success ?? 0}
+                        </span>
+                        <span className={`rounded-full border px-2 py-0.5 text-[11px] ${getSuccessRateBadgeClass(successRateValue)}`}>
+                          {text('Success Rate', '成功率')}: {successRate}
+                        </span>
                       </div>
                       {testState?.message && <p className={`text-xs ${testState.status === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}>{testState.message}</p>}
+                      {mailEmailProvider === 'inbucket' && <p className="text-xs text-muted-foreground">{text('Example mailbox', '示例邮箱')}: <code>sample@{domain}</code></p>}
                     </div>
                     <div className="flex flex-wrap gap-2">
                       <button type="button" onClick={() => setMailEmailDomain(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted">{text('Use as Default', '设为默认')}</button>
                       <button type="button" onClick={() => { void handleMailDomainTest(domain); }} disabled={isTesting} className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted disabled:opacity-50">{isTesting ? text('Testing...', '测试中...') : text('Test Domain', '测试域名')}</button>
-                      <button type="button" onClick={() => handleRemoveDomain(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-destructive/40 bg-destructive/5 px-3 text-sm font-medium text-destructive hover:bg-destructive/10">{text('Remove', '移除')}</button>
+                      {mailEmailProvider === 'mailfree' && <button type="button" onClick={() => handleRemoveDomain(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-destructive/40 bg-destructive/5 px-3 text-sm font-medium text-destructive hover:bg-destructive/10">{text('Remove', '移除')}</button>}
                     </div>
                   </div>
                 </div>
@@ -709,106 +954,6 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
         </section>
 
         <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4">
-          <div className="flex items-center justify-between">
-            <div className="space-y-1">
-              <h3 className="text-base font-semibold">{text('Codex Account Replenishment', 'Codex 自动补货')}</h3>
-              <p className="text-xs text-muted-foreground">{text('These values are saved into config and used by the backend runtime.', '这些值会写入配置文件，并由后端 runtime 使用。')}</p>
-            </div>
-            <label className="flex items-center gap-2 text-sm font-medium">
-              <input type="checkbox" checked={codexReplenishEnabled} onChange={(e) => setCodexReplenishEnabled(e.target.checked)} className="h-4 w-4 rounded border-input bg-background/50 accent-primary" />
-              {text('Enabled', '启用')}
-            </label>
-          </div>
-
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-            <div className="grid gap-2">
-              <label className="text-sm font-medium">{text('Target Account Count', '目标账号总数')}</label>
-              <input type="number" min="0" step="1" value={effectiveTargetCount} onChange={(e) => { const nextTarget = normalizeNonNegativeInteger(e.target.value, 0); setCodexReplenishTargetCount(nextTarget); setCodexReplenishThreshold((prev) => normalizeReplenishThreshold(prev, nextTarget, 0)); }} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
-              <p className="text-xs text-muted-foreground"><code>codex_replenish_target_count</code></p>
-            </div>
-            <div className="grid gap-2">
-              <label className="text-sm font-medium">{text('Replenish Threshold', '补货触发阈值')}</label>
-              <input type="number" min="0" max={String(effectiveTargetCount)} step="1" value={effectiveThreshold} onChange={(e) => setCodexReplenishThreshold(normalizeReplenishThreshold(e.target.value, effectiveTargetCount, 0))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
-              <p className="text-xs text-muted-foreground"><code>codex_replenish_threshold</code></p>
-            </div>
-            <div className="grid gap-2">
-              <label className="text-sm font-medium">{text('Batch Size', '批量大小')}</label>
-              <input type="number" min="1" max="200" step="1" value={effectiveBatchSize} onChange={(e) => setCodexReplenishBatchSize(normalizeReplenishBatchSize(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
-              <p className="text-xs text-muted-foreground"><code>codex_replenish_batch_size</code></p>
-            </div>
-            <div className="grid gap-2">
-              <label className="text-sm font-medium">{text('Worker Count', '并发 Worker 数')}</label>
-              <input type="number" min="1" max="200" step="1" value={effectiveWorkerCount} onChange={(e) => setCodexReplenishWorkerCount(normalizeReplenishWorkerCount(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
-              <p className="text-xs text-muted-foreground"><code>codex_replenish_worker_count</code></p>
-            </div>
-          </div>
-
-          <div className="rounded-lg border border-border/60 bg-background/40 p-4 text-sm text-muted-foreground">
-            {effectiveTargetCount > 0 ? text(`Trigger replenishment when healthy Codex accounts < ${effectiveThreshold}, then refill back to ${effectiveTargetCount}. Each batch creates up to ${effectiveBatchSize} accounts with up to ${effectiveWorkerCount} concurrent workers.`, `当健康 Codex 账号数低于 ${effectiveThreshold} 时触发补货，并补回到 ${effectiveTargetCount} 个。每批最多注册 ${effectiveBatchSize} 个账号，并发 worker 最多 ${effectiveWorkerCount} 个。`) : text('Target count is 0, so replenishment will not create new accounts until you increase the target.', '当前目标数量为 0，在你把目标调高之前，自动补货不会新增账号。')}
-          </div>
-
-          <label className="flex items-center gap-2 text-sm font-medium">
-            <input type="checkbox" checked={codexReplenishUseProxy} onChange={(e) => setCodexReplenishUseProxy(e.target.checked)} className="h-4 w-4 rounded border-input bg-background/50 accent-primary" />
-            {text('Use Proxy for Registration', '注册时使用代理')}
-          </label>
-
-          <p className="text-xs text-muted-foreground">{text('External proxy pool remains in config. The settings page only shows the proxy switch now.', '外部代理池仍保留在配置文件中，设置界面现在只显示代理开关。')}</p>
-          <div className="rounded-lg border border-border/60 bg-background/40 p-4">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-              <div className="space-y-1">
-                <h4 className="text-sm font-semibold">{text('Runtime Status', 'Runtime 状态')}</h4>
-                <p className="text-xs text-muted-foreground">{text('Simple live summary of the backend replenishment worker.', '后端补货 worker 的简化实时摘要。')}</p>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <button type="button" onClick={() => { void handleStartReplenishment(); }} disabled={startingReplenishment || Boolean(replenishmentStatus?.in_progress)} className="inline-flex h-9 items-center justify-center rounded-md border border-primary/30 bg-primary/10 px-3 text-sm font-medium text-primary hover:bg-primary/15 disabled:opacity-50">{startingReplenishment ? text('Starting...', '启动中...') : text('Start Replenishment', '开始补货')}</button>
-                <button type="button" onClick={() => { void handleStopReplenishment(); }} disabled={stoppingReplenishment || !replenishmentStatus?.in_progress} className="inline-flex h-9 items-center justify-center rounded-md border border-destructive/40 bg-destructive/5 px-3 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50">{stoppingReplenishment ? text('Stopping...', '停止中...') : text('Stop Replenishment', '停止补货')}</button>
-                <button type="button" onClick={() => { void loadRuntimeStatus(false); }} disabled={runtimeStatusLoading} className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted disabled:opacity-50">{runtimeStatusLoading ? text('Refreshing...', '刷新中...') : text('Refresh Status', '刷新状态')}</button>
-              </div>
-            </div>
-
-            {runtimeStatusError && <div className="mb-3 rounded-md border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive">{runtimeStatusError}</div>}
-
-            {!replenishmentStatus ? (
-              <div className="rounded-md border border-dashed border-border/70 bg-muted/20 px-4 py-5 text-sm text-muted-foreground">{text('No runtime status available yet.', '暂无 runtime 状态。')}</div>
-            ) : (
-              <div className="space-y-3 text-sm">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-medium">{text('Status', '状态')}:</span>
-                  <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${replenishmentStatus.in_progress ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400' : replenishmentStatus.enabled ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400' : 'bg-muted text-muted-foreground'}`}>
-                    {replenishmentStatus.in_progress ? text('Running', '运行中') : replenishmentStatus.enabled ? text('Idle', '空闲') : text('Disabled', '已禁用')}
-                  </span>
-                  {replenishmentStatus.mode && <span className="text-muted-foreground">{text('Mode', '模式')}: {replenishmentStatus.mode}</span>}
-                  {replenishmentStatus.process_pid && <span className="text-muted-foreground">PID: {replenishmentStatus.process_pid}</span>}
-                </div>
-
-                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                  <StatusCard label={text('Last Result', '最近结果')} value={replenishmentResultLabel} />
-                  <StatusCard label={text('Healthy', '已有数量')} value={replenishmentStatus.healthy_count ?? 0} />
-                  <StatusCard label={text('Target', '目标数量')} value={replenishmentStatus.target_count ?? effectiveTargetCount} />
-                  <StatusCard label={text('Missing', '缺失数量')} value={replenishmentStatus.needed ?? 0} />
-                  <StatusCard label={text('Batch Size', '批量大小')} value={replenishmentStatus.batch_size ?? effectiveBatchSize} />
-                  <StatusCard label={text('Worker Count', '并发数')} value={replenishmentStatus.worker_count ?? effectiveWorkerCount} />
-                  <StatusCard label={text('Mail Mode', '邮箱模式')} value={getEmailSelectionModeLabel(replenishmentStatus.email_selection_mode, text)} />
-                  <StatusCard label={text('Last Domain', '最近域名')} value={replenishmentStatus.last_selected_domain || text('Unknown', '未知')} />
-                  <StatusCard label={text('Last Started', '上次开始')} value={formatBatchTime(replenishmentStatus.last_started_at, text)} />
-                  <StatusCard label={text('Last Finished', '上次结束')} value={formatBatchTime(replenishmentStatus.last_finished_at, text)} />
-                </div>
-
-                <SimpleReplenishmentLogCard lines={simpleReplenishmentLogs} text={text} />
-
-                <ReplenishmentAccountsCard accounts={replenishmentAccounts} text={text} />
-
-                <div className="rounded-md border border-border/60 bg-card/60 px-3 py-2">
-                  <div className="text-xs text-muted-foreground">{text('Backend Detail', '后端详情')}</div>
-                  <div>{text('The UI now focuses on account-level progress. Full raw logs are still written to the backend log file.', '前端现在聚焦账号级进度，完整原始日志仍写入后端日志文件。')}</div>
-                  {replenishmentStatus.log_file && <div className="mt-1 text-xs text-muted-foreground"><code>{replenishmentStatus.log_file}</code></div>}
-                </div>
-              </div>
-            )}
-          </div>
-        </section>
-
-        <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4">
           <div className="space-y-1">
             <h3 className="text-base font-semibold">{text('Remote Push Test', '远程推送测试')}</h3>
             <p className="text-xs text-muted-foreground">{text('Smoke test the current remote CPA target by reading, uploading, and deleting a temporary auth file.', '通过读取、上传、删除临时 auth file 的方式，对当前远程 CPA 目标执行 smoke test。')}</p>
@@ -821,6 +966,42 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
         {message.text && <div className={`rounded-md border px-4 py-3 text-sm ${message.type === 'success' ? 'border-primary/50 bg-primary/10 text-primary' : 'border-destructive/50 bg-destructive/10 text-destructive'}`}>{message.text}</div>}
 
         <button onClick={() => { void handleSave(); }} disabled={savingSettings} className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{savingSettings ? text('Saving...', '保存中...') : text('Save Configuration', '保存配置')}</button>
+        </div>
+
+        <div className="space-y-6">
+          <CodexReplenishmentConfigCard
+            codexReplenishEnabled={codexReplenishEnabled}
+            setCodexReplenishEnabled={setCodexReplenishEnabled}
+            effectiveTargetCount={effectiveTargetCount}
+            setCodexReplenishTargetCount={setCodexReplenishTargetCount}
+            effectiveThreshold={effectiveThreshold}
+            setCodexReplenishThreshold={setCodexReplenishThreshold}
+            effectiveBatchSize={effectiveBatchSize}
+            setCodexReplenishBatchSize={setCodexReplenishBatchSize}
+            effectiveWorkerCount={effectiveWorkerCount}
+            setCodexReplenishWorkerCount={setCodexReplenishWorkerCount}
+            codexReplenishUseProxy={codexReplenishUseProxy}
+            setCodexReplenishUseProxy={setCodexReplenishUseProxy}
+            text={text}
+          />
+          <ReplenishmentRuntimeCard
+            replenishmentStatus={replenishmentStatus}
+            replenishmentResultLabel={replenishmentResultLabel}
+            effectiveTargetCount={effectiveTargetCount}
+            effectiveBatchSize={effectiveBatchSize}
+            effectiveWorkerCount={effectiveWorkerCount}
+            runtimeStatusError={runtimeStatusError}
+            startingReplenishment={startingReplenishment}
+            stoppingReplenishment={stoppingReplenishment}
+            runtimeStatusLoading={runtimeStatusLoading}
+            onStart={() => { void handleStartReplenishment(); }}
+            onStop={() => { void handleStopReplenishment(); }}
+            onRefresh={() => { void loadRuntimeStatus(false); }}
+            simpleReplenishmentLogs={simpleReplenishmentLogs}
+            replenishmentAccounts={replenishmentAccounts}
+            text={text}
+          />
+        </div>
       </div>
     </div>
   );

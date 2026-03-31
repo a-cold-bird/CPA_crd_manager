@@ -16,6 +16,7 @@ USERNAME = ""
 PASSWORD = "REDACTED"
 EMAIL_DOMAIN = "REDACTED_DOMAIN"
 EMAIL_DOMAINS = [EMAIL_DOMAIN]
+EMAIL_PROVIDERS = {}
 
 
 def _normalize_domain_list(value):
@@ -29,6 +30,27 @@ def _normalize_domain_list(value):
         if domain and domain not in domains:
             domains.append(domain)
     return domains
+
+
+def _provider_mode(provider_config):
+    mode = str((provider_config or {}).get("mode") or "").strip().lower()
+    if mode:
+        return mode
+    api_base = str((provider_config or {}).get("api_base") or "").strip().lower()
+    if (
+        "/api/v1/" in api_base
+        or "inbucket" in api_base
+        or "mailapizv.uton.me" in api_base
+    ):
+        return "inbucket"
+    return "mailfree"
+
+
+def _expand_domain_pattern(domain_pattern, local_part):
+    domain_value = str(domain_pattern or "").strip().lower().lstrip("@")
+    if domain_value.startswith("*."):
+        return f"{local_part}.{domain_value[2:]}"
+    return domain_value
 
 
 def _load_mail_config():
@@ -49,6 +71,18 @@ def _load_mail_config():
             print(f"Failed to load mail config from config.json: {e}")
 
 
+DEFAULT_EMAIL_PROVIDER = "mailfree"
+EMAIL_PROVIDERS = {
+    "mailfree": {
+        "id": "mailfree",
+        "label": "Domain Mailbox",
+        "api_base": API_BASE,
+        "domains": EMAIL_DOMAINS,
+        "mode": "mailfree",
+    }
+}
+
+
 _load_mail_config()
 
 API_BASE = str(os.environ.get("MAIL_API_BASE", API_BASE) or API_BASE).strip()
@@ -66,14 +100,19 @@ EMAIL_DOMAINS = (
 )
 if EMAIL_DOMAIN and EMAIL_DOMAIN not in EMAIL_DOMAINS:
     EMAIL_DOMAINS.insert(0, EMAIL_DOMAIN)
-DEFAULT_EMAIL_PROVIDER = "mailfree"
-EMAIL_PROVIDERS = {
-    "mailfree": {
-        "id": "mailfree",
-        "label": "Domain Mailbox",
-        "api_base": API_BASE,
-        "domains": EMAIL_DOMAINS,
-    }
+EMAIL_PROVIDERS["mailfree"] = {
+    "id": "mailfree",
+    "label": "Domain Mailbox",
+    "api_base": API_BASE,
+    "domains": EMAIL_DOMAINS,
+    "mode": "mailfree",
+}
+EMAIL_PROVIDERS["inbucket"] = {
+    "id": "inbucket",
+    "label": "Inbucket Mailbox",
+    "api_base": API_BASE,
+    "domains": EMAIL_DOMAINS,
+    "mode": "inbucket",
 }
 
 # 会话管理 — 异步安全
@@ -214,18 +253,20 @@ def _extract_message_timestamp(message):
 def _build_email_content(detail):
     if not isinstance(detail, dict):
         return ""
-    return " ".join(
-        str(detail.get(key) or "")
-        for key in (
-            "subject",
-            "verification_code",
-            "text",
-            "preview",
-            "html",
-            "html_content",
-            "content",
-        )
-    )
+    raw_body = detail.get("body")
+    body = raw_body if isinstance(raw_body, dict) else {}
+    parts = [
+        detail.get("subject"),
+        detail.get("verification_code"),
+        detail.get("text"),
+        detail.get("preview"),
+        detail.get("html"),
+        detail.get("html_content"),
+        detail.get("content"),
+        body.get("text"),
+        body.get("html"),
+    ]
+    return " ".join(str(part or "") for part in parts)
 
 
 def _to_base36(value):
@@ -291,10 +332,15 @@ def get_email_provider_options():
 async def create_test_email(provider=None, domain=None):
     """创建邮箱 - 直接生成邮箱地址，无需调用 API 创建"""
     try:
+        global API_BASE, _session_cookie
         provider_id = str(provider or DEFAULT_EMAIL_PROVIDER).strip().lower()
         provider_config = EMAIL_PROVIDERS.get(provider_id)
         if not provider_config:
             raise ValueError(f"Unsupported email provider: {provider}")
+        provider_api_base = str(provider_config.get("api_base") or API_BASE).strip()
+        if provider_api_base and provider_api_base != API_BASE:
+            API_BASE = provider_api_base
+            _session_cookie = {}
         allowed_domains = {
             str(item).strip().lower() for item in provider_config.get("domains") or []
         }
@@ -308,7 +354,11 @@ async def create_test_email(provider=None, domain=None):
                 f"Unsupported email domain for {provider_id}: {domain_value}"
             )
         random_name = generate_random_name()
+        domain_value = _expand_domain_pattern(domain_value, random_name)
         email = f"{random_name}@{domain_value}"
+
+        if _provider_mode(provider_config) == "inbucket":
+            return email, email
 
         # 登录获取 session (用于后续读取邮件)
         if not await _login():
@@ -325,16 +375,22 @@ async def create_test_email(provider=None, domain=None):
 async def list_mailbox_emails(mailbox) -> list:
     """获取邮箱列表，用于 snapshot 和过滤旧 OTP。"""
     try:
-        if not await _ensure_mail_session():
-            return []
-
         client = _get_http_client()
-        res = await client.get(
-            f"{API_BASE}/api/emails",
-            params={"mailbox": mailbox},
-            cookies=_session_cookie,
-            headers={"Content-Type": "application/json"},
-        )
+        if "mailapizv.uton.me" in API_BASE or "/api/v1" in API_BASE:
+            res = await client.get(
+                f"{API_BASE.rstrip('/')}/api/v1/mailbox/{mailbox}",
+                headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+            )
+        else:
+            if not await _ensure_mail_session():
+                return []
+
+            res = await client.get(
+                f"{API_BASE}/api/emails",
+                params={"mailbox": mailbox},
+                cookies=_session_cookie,
+                headers={"Content-Type": "application/json"},
+            )
 
         if res.status_code != 200:
             return []
@@ -369,15 +425,28 @@ async def snapshot_mailbox_max_id(mailbox):
 
 async def fetch_email_detail(email_id):
     try:
-        if not await _ensure_mail_session():
-            return None
+        if isinstance(email_id, tuple) and len(email_id) == 2:
+            mailbox, message_id = email_id
+        else:
+            mailbox, message_id = None, email_id
 
         client = _get_http_client()
-        detail_res = await client.get(
-            f"{API_BASE}/api/email/{email_id}",
-            cookies=_session_cookie,
-            headers={"Content-Type": "application/json"},
-        )
+        if "mailapizv.uton.me" in API_BASE or "/api/v1" in API_BASE:
+            if not mailbox:
+                return None
+            detail_res = await client.get(
+                f"{API_BASE.rstrip('/')}/api/v1/mailbox/{mailbox}/{message_id}",
+                headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+            )
+        else:
+            if not await _ensure_mail_session():
+                return None
+
+            detail_res = await client.get(
+                f"{API_BASE}/api/email/{message_id}",
+                cookies=_session_cookie,
+                headers={"Content-Type": "application/json"},
+            )
 
         if detail_res.status_code != 200:
             return None
@@ -399,7 +468,7 @@ async def fetch_first_email(mailbox):
     if not email_id:
         return None
 
-    detail = await fetch_email_detail(email_id)
+    detail = await fetch_email_detail((mailbox, email_id))
     if not detail:
         return None
     return _build_email_content(detail)
@@ -477,7 +546,7 @@ async def fetch_verification_code(
                 )
                 continue
 
-            detail = await fetch_email_detail(email_id)
+            detail = await fetch_email_detail((mailbox, email_id))
             payload = detail if isinstance(detail, dict) else message
             if not isinstance(payload, dict):
                 emit(f"[OTP] 新邮件 {email_id} 数据尚未就绪，继续重试")

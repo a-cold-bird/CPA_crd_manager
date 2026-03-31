@@ -215,6 +215,7 @@ export interface RemotePushTestPayload {
 }
 
 export interface MailDomainTestPayload {
+  provider?: string;
   domain: string;
   mailbox: string;
   ok: boolean;
@@ -430,6 +431,7 @@ export const runRemotePushTest = async (payload?: {
 };
 
 export const runMailDomainTest = async (payload: {
+  mail_email_provider?: 'mailfree' | 'inbucket';
   domain: string;
   mail_api_base?: string;
   mail_username?: string;

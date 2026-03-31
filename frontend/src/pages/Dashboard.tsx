@@ -79,10 +79,13 @@ export default function Dashboard() {
     const [cpaUrl, setCpaUrl] = useState('');
     const [newPassword, setNewPassword] = useState('');
     const [mailApiBase, setMailApiBase] = useState('');
+    const [inbucketApiBase, setInbucketApiBase] = useState('');
     const [mailUsername, setMailUsername] = useState('');
     const [mailPassword, setMailPassword] = useState('');
+    const [mailEmailProvider, setMailEmailProvider] = useState<'mailfree' | 'inbucket'>('mailfree');
     const [mailEmailDomain, setMailEmailDomain] = useState('');
     const [mailEmailDomains, setMailEmailDomains] = useState('');
+    const [inbucketDomains, setInbucketDomains] = useState<string[]>([]);
     const [mailRandomizeFromList, setMailRandomizeFromList] = useState(true);
     const [codexReplenishEnabled, setCodexReplenishEnabled] = useState(false);
     const [codexReplenishTargetCount, setCodexReplenishTargetCount] = useState(5);
@@ -123,11 +126,14 @@ export default function Dashboard() {
                     );
                     cpaApi.defaults.baseURL = '/api/cpa';
                     setCpaUrl(resolvedUrl);
+                    setMailEmailProvider(String(data.config.mail_email_provider || 'mailfree') === 'inbucket' ? 'inbucket' : 'mailfree');
                     setMailApiBase(String(data.config.mail_api_base || ''));
                     setMailUsername(String(data.config.mail_username || ''));
                     setMailPassword(String(data.config.mail_password || ''));
                     setMailEmailDomain(String(data.config.mail_email_domain || ''));
                     setMailEmailDomains(String(data.config.mail_email_domains || ''));
+                    setInbucketApiBase(String(data.mail_meta?.inbucket_api_base || ''));
+                    setInbucketDomains(Array.isArray(data.mail_meta?.inbucket_domains) ? data.mail_meta.inbucket_domains.map((item: unknown) => String(item || '').trim()).filter(Boolean) : []);
                     setMailRandomizeFromList(parseConfigBoolean(data.config.mail_randomize_from_list, true));
                     setCodexReplenishEnabled(parseConfigBoolean(data.config.codex_replenish_enabled, false));
                     setCodexReplenishTargetCount(parseIntSafe(data.config.codex_replenish_target_count, 5));
@@ -167,6 +173,12 @@ export default function Dashboard() {
     }, [theme]);
 
     useEffect(() => {
+        if (mailEmailProvider === 'inbucket' && inbucketApiBase && mailApiBase !== inbucketApiBase) {
+            setMailApiBase(inbucketApiBase);
+        }
+    }, [inbucketApiBase, mailApiBase, mailEmailProvider]);
+
+    useEffect(() => {
         try {
             localStorage.setItem('probe_auto_enabled', autoProbeEnabled ? '1' : '0');
             localStorage.setItem('probe_auto_interval_minutes', String(autoProbeIntervalMinutes));
@@ -195,6 +207,7 @@ export default function Dashboard() {
                     mail_api_base: mailApiBase,
                     mail_username: mailUsername,
                     mail_password: mailPassword,
+                    mail_email_provider: mailEmailProvider,
                     mail_email_domain: mailEmailDomain,
                     mail_email_domains: mailEmailDomains,
                     auto_probe_enabled: autoProbeEnabled,
@@ -228,6 +241,7 @@ export default function Dashboard() {
         mailApiBase,
         mailUsername,
         mailPassword,
+        mailEmailProvider,
         mailEmailDomain,
         mailEmailDomains,
         autoProbeEnabled,
@@ -315,10 +329,14 @@ export default function Dashboard() {
                                 setMailUsername={setMailUsername}
                                 mailPassword={mailPassword}
                                 setMailPassword={setMailPassword}
+                                mailEmailProvider={mailEmailProvider}
+                                setMailEmailProvider={setMailEmailProvider}
+                                inbucketApiBase={inbucketApiBase}
                                 mailEmailDomain={mailEmailDomain}
                                 setMailEmailDomain={setMailEmailDomain}
                                 mailEmailDomains={mailEmailDomains}
                                 setMailEmailDomains={setMailEmailDomains}
+                                inbucketDomains={inbucketDomains}
                                 mailRandomizeFromList={mailRandomizeFromList}
                                 setMailRandomizeFromList={setMailRandomizeFromList}
                                 codexReplenishEnabled={codexReplenishEnabled}
