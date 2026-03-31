@@ -2090,7 +2090,7 @@ class ChatGPTRegister:
         async def _bootstrap_oauth_session():
             primary_resp = None
             fallback_resp = None
-            self._print("[OAuth] 1/7 GET /oauth/authorize")
+            await self._print("[OAuth] 1/7 GET /oauth/authorize")
             try:
                 r = await self.session.get(
                     authorize_url,
@@ -2706,7 +2706,7 @@ async def _register_one(
             )
 
             # 1. Create a temporary mailbox.
-            reg._print("[DuckMail] creating temporary mailbox...")
+            await reg._print("[DuckMail] creating temporary mailbox...")
             email, email_pwd, mail_token = await reg.create_temp_email()
             tag = email.split("@")[0]
             reg.tag = tag
@@ -2759,11 +2759,12 @@ async def _register_one(
 
             # 5. Persist account credentials.
             async with _file_lock:
-                with open(output_file, "a", encoding="utf-8") as out:
-                    out.write(
-                        f"{email}----{chatgpt_password}----{email_pwd}"
-                        f"----oauth={'ok' if oauth_ok else 'fail'}----proxy={proxy_label}\n"
-                    )
+                await asyncio.to_thread(
+                    _write_append,
+                    output_file,
+                    f"{email}----{chatgpt_password}----{email_pwd}"
+                    f"----oauth={'ok' if oauth_ok else 'fail'}----proxy={proxy_label}\n",
+                )
 
             async with _print_lock:
                 oauth_suffix = " | oauth=ok" if oauth_ok else " | oauth=fail"
@@ -2809,6 +2810,13 @@ async def _register_one(
                     error=last_error,
                     final=attempt >= PROXY_RETRY_ATTEMPTS_PER_ACCOUNT,
                 )
+
+            if reg and reg.session:
+                try:
+                    await reg.session.close()
+                except Exception:
+                    pass
+                reg.session = None
 
             if attempt >= PROXY_RETRY_ATTEMPTS_PER_ACCOUNT:
                 async with _print_lock:
@@ -2929,7 +2937,7 @@ def run_batch(
     print(f"  Total accounts: {total_accounts} | workers: {actual_workers}")
     print(f"  DuckMail: {DUCKMAIL_API_BASE}")
     print(f"  Debug: {'on' if debug else 'off'}")
-    print(f"  Concurrency: asyncio.Semaphore({actual_workers}) [真异步并发]")
+    print(f"  Concurrency: asyncio.Semaphore({actual_workers}) [true-async]")
     print(
         f"  Proxy mode: {'proxy_utils candidate pool (round-robin) with direct fallback' if use_proxy else 'direct (no proxy)'}"
     )
