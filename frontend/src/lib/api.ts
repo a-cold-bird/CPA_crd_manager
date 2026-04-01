@@ -161,6 +161,7 @@ export interface RuntimeStatusPayload {
     last_error: string;
   };
   replenishment: {
+    domain_stats: Record<string, { total: number; success: number; fail: number }>;
     enabled: boolean;
     in_progress: boolean;
     stop_requested: boolean;

@@ -41,9 +41,10 @@ export function buildEmailDomainStats(batches, configuredDomains) {
       if (!actualDomain || !isTerminalAccountStatus(account?.status || '')) continue;
       const groupDomain = matchConfiguredDomain(actualDomain, configuredDomains);
       if (!groupDomain) continue;
-      const current = stats[groupDomain] || { total: 0, success: 0 };
+      const current = stats[groupDomain] || { total: 0, success: 0, fail: 0 };
       current.total += 1;
-      if (account?.register_ok) current.success += 1;
+      if (account?.register_ok && account?.codex_ok) current.success += 1;
+      else current.fail += 1;
       stats[groupDomain] = current;
     }
   }

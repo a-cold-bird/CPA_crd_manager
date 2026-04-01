@@ -599,6 +599,11 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
   }, [replenishmentStatus]);
 
   const emailDomainStats = useMemo(() => {
+    const persistedStats = replenishmentStatus?.domain_stats;
+    if (persistedStats && typeof persistedStats === 'object') {
+      return new Map(Object.entries(persistedStats));
+    }
+
     const batches = [
       replenishmentStatus?.current_batch ?? null,
       ...(replenishmentStatus?.batch_history ?? []),
@@ -917,6 +922,9 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
                         </span>
                         <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-700 dark:text-emerald-300">
                           {text('Success', '成功次数')}: {stat?.success ?? 0}
+                        </span>
+                        <span className="rounded-full border border-destructive/20 bg-destructive/10 px-2 py-0.5 text-[11px] text-destructive">
+                          {text('Fail', '失败次数')}: {stat?.fail ?? 0}
                         </span>
                         <span className={`rounded-full border px-2 py-0.5 text-[11px] ${getSuccessRateBadgeClass(successRateValue)}`}>
                           {text('Success Rate', '成功率')}: {successRate}

@@ -521,6 +521,7 @@ function createEmptyReplenishmentStatus() {
     log_tail: [],
     email_selection_mode: '',
     last_selected_domain: '',
+    domain_stats: {},
     current_batch: null,
     batch_history: [],
   };
@@ -528,6 +529,21 @@ function createEmptyReplenishmentStatus() {
 
 function normalizeReplenishmentStatus(value) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const rawDomainStats = source.domain_stats && typeof source.domain_stats === 'object' && !Array.isArray(source.domain_stats)
+    ? source.domain_stats
+    : {};
+  const domainStats = {};
+  Object.entries(rawDomainStats).forEach(([domain, stat]) => {
+    const normalizedDomain = normalizeStringOrEmpty(domain).toLowerCase();
+    if (!normalizedDomain || !stat || typeof stat !== 'object' || Array.isArray(stat)) {
+      return;
+    }
+    domainStats[normalizedDomain] = {
+      total: normalizeNumberOrNull(stat.total) ?? 0,
+      success: normalizeNumberOrNull(stat.success) ?? 0,
+      fail: normalizeNumberOrNull(stat.fail) ?? 0,
+    };
+  });
   return {
     mode: normalizeStringOrEmpty(source.mode),
     in_progress: normalizeBoolean(source.in_progress, false),
@@ -562,6 +578,7 @@ function normalizeReplenishmentStatus(value) {
       : [],
     email_selection_mode: normalizeStringOrEmpty(source.email_selection_mode),
     last_selected_domain: normalizeStringOrEmpty(source.last_selected_domain),
+    domain_stats: domainStats,
     current_batch: source.current_batch && typeof source.current_batch === 'object'
       ? normalizeBatchStatus(source.current_batch)
       : null,
@@ -1599,6 +1616,7 @@ function buildRuntimeStatusPayload(config) {
       last_summary: normalizeStringOrEmpty(replenishmentStatus.last_summary),
       email_selection_mode: normalizeStringOrEmpty(replenishmentStatus.email_selection_mode),
       last_selected_domain: normalizeStringOrEmpty(replenishmentStatus.last_selected_domain),
+      domain_stats: replenishmentStatus.domain_stats && typeof replenishmentStatus.domain_stats === 'object' ? replenishmentStatus.domain_stats : {},
       current_batch: replenishmentStatus.current_batch && typeof replenishmentStatus.current_batch === 'object' ? replenishmentStatus.current_batch : null,
       batch_history: Array.isArray(replenishmentStatus.batch_history) ? replenishmentStatus.batch_history : [],
     },

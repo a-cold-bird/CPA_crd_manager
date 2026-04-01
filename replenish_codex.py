@@ -77,6 +77,69 @@ def load_provider_domain_list(config: Dict[str, Any]) -> List[str]:
     return configured_domains
 
 
+def extract_email_domain(email: str) -> str:
+    normalized = str(email or "").strip().lower()
+    at_index = normalized.rfind("@")
+    if at_index <= 0 or at_index >= len(normalized) - 1:
+        return ""
+    return normalized[at_index + 1 :]
+
+
+def match_configured_domain(actual_domain: str, configured_domains: List[str]) -> str:
+    normalized_actual = str(actual_domain or "").strip().lower()
+    if not normalized_actual:
+        return ""
+
+    for configured_domain in configured_domains or []:
+        normalized_configured = str(configured_domain or "").strip().lower()
+        if not normalized_configured:
+            continue
+        if not normalized_configured.startswith("*."):
+            if normalized_configured == normalized_actual:
+                return normalized_configured
+            continue
+        suffix = normalized_configured[2:]
+        if normalized_actual == suffix:
+            continue
+        if normalized_actual.endswith(f".{suffix}"):
+            return normalized_configured
+
+    return normalized_actual
+
+
+def record_domain_stat_result(
+    config: Dict[str, Any], *, email: str, register_ok: bool, codex_ok: bool
+) -> None:
+    actual_domain = extract_email_domain(email)
+    if not actual_domain:
+        return
+    configured_domains = load_provider_domain_list(config)
+    grouped_domain = match_configured_domain(actual_domain, configured_domains)
+    if not grouped_domain:
+        return
+
+    def _mutate(current: Dict[str, Any]) -> None:
+        domain_stats = current.get("domain_stats")
+        if not isinstance(domain_stats, dict):
+            domain_stats = {}
+        current_stat = domain_stats.get(grouped_domain)
+        if not isinstance(current_stat, dict):
+            current_stat = {"total": 0, "success": 0, "fail": 0}
+        current_stat["total"] = int(current_stat.get("total") or 0) + 1
+        if bool(register_ok) and bool(codex_ok):
+            current_stat["success"] = int(current_stat.get("success") or 0) + 1
+        else:
+            current_stat["fail"] = int(current_stat.get("fail") or 0) + 1
+        domain_stats[grouped_domain] = {
+            "total": int(current_stat.get("total") or 0),
+            "success": int(current_stat.get("success") or 0),
+            "fail": int(current_stat.get("fail") or 0),
+        }
+        current["domain_stats"] = domain_stats
+
+    mutate_replenishment_status(_mutate)
+
+
 def build_replenishment_summary(state: str) -> str:
     mapping = {
         "started": "Registration started.",
@@ -270,6 +333,21 @@ def sanitize_replenishment_status(status: Dict[str, Any]) -> Dict[str, Any]:
         ]
     current["email_selection_mode"] = str(current.get("email_selection_mode") or "")
     current["last_selected_domain"] = str(current.get("last_selected_domain") or "")
+    raw_domain_stats = current.get("domain_stats")
+    if isinstance(raw_domain_stats, dict):
+        normalized_domain_stats: Dict[str, Dict[str, int]] = {}
+        for key, value in raw_domain_stats.items():
+            domain = str(key or "").strip().lower()
+            if not domain or not isinstance(value, dict):
+                continue
+            normalized_domain_stats[domain] = {
+                "total": int(value.get("total") or 0),
+                "success": int(value.get("success") or 0),
+                "fail": int(value.get("fail") or 0),
+            }
+        current["domain_stats"] = normalized_domain_stats
+    else:
+        current["domain_stats"] = {}
     current["current_batch"] = normalize_batch_status(current.get("current_batch"))
     current["batch_history"] = [
         item
@@ -514,6 +592,7 @@ def create_empty_replenishment_status() -> Dict[str, Any]:
         "log_tail": [],
         "email_selection_mode": "",
         "last_selected_domain": "",
+        "domain_stats": {},
         "current_batch": None,
         "batch_history": [],
     }
@@ -1777,7 +1856,7 @@ def configure_register_email_domain_strategy(
     }
 
 
-def build_register_progress_hook(batch_attempt: int):
+def build_register_progress_hook(batch_attempt: int, config: Dict[str, Any]):
     def _progress_hook(event_type: str, **payload: Any) -> None:
         if event_type == "batch_started":
             workers = int(payload.get("workers") or 0)
@@ -1856,6 +1935,12 @@ def build_register_progress_hook(batch_attempt: int):
                 current["current_batch"] = batch
 
             mutate_replenishment_status(_mutate)
+            record_domain_stat_result(
+                config,
+                email=email,
+                register_ok=True,
+                codex_ok=oauth_ok,
+            )
             return
 
         if event_type == "account_attempt_failed":
@@ -1889,6 +1974,12 @@ def build_register_progress_hook(batch_attempt: int):
                     current["current_batch"] = batch
 
                 mutate_replenishment_status(_mutate)
+                record_domain_stat_result(
+                    config,
+                    email=email,
+                    register_ok=False,
+                    codex_ok=False,
+                )
                 return
 
             def _mutate_retry(current: Dict[str, Any]) -> None:
@@ -1945,6 +2036,12 @@ def build_register_progress_hook(batch_attempt: int):
                 current["current_batch"] = batch
 
             mutate_replenishment_status(_mutate)
+            record_domain_stat_result(
+                config,
+                email=email,
+                register_ok=False,
+                codex_ok=False,
+            )
             return
 
         if event_type == "batch_finished":
@@ -2080,7 +2177,7 @@ def run_register_batch(
                     ),
                     email_domain=runtime_email_domain,
                     extract_codex=True,
-                    progress_hook=build_register_progress_hook(batch_attempt),
+                    progress_hook=build_register_progress_hook(batch_attempt, config),
                 )
     except Exception as e:
         logger.error(f"Registration failed: {e}")

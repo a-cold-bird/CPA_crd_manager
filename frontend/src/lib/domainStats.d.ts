@@ -1,6 +1,7 @@
 export interface EmailDomainStat {
   total: number;
   success: number;
+  fail: number;
 }
 
 export declare function buildEmailDomainStats(
