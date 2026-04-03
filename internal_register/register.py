@@ -907,6 +907,14 @@ async def build_sentinel_token(
         )
         if browser_token:
             return browser_token
+        if isinstance(error_sink, dict) and not error_sink.get("code"):
+            error_sink.update(
+                {
+                    "code": "sentinel_browser_required",
+                    "message": "Browser-based sentinel token is required for this flow",
+                }
+            )
+        return None
 
     challenge = await fetch_sentinel_challenge(
         session,
@@ -1756,8 +1764,14 @@ class ChatGPTRegister:
         if sentinel_token:
             headers["openai-sentinel-token"] = sentinel_token
         else:
-            await self._print(
-                "[Sentinel] register token missing; fallback to legacy register request"
+            sentinel_code = str(sentinel_error.get("code") or "").strip()
+            sentinel_message = str(sentinel_error.get("message") or "").strip()
+            detail = " | ".join(
+                [part for part in [sentinel_code, sentinel_message] if part]
+            )
+            raise Exception(
+                "Sentinel token required for register; browser token generation failed"
+                + (f": {detail}" if detail else "")
             )
         r = await self.session.post(
             url, json={"username": email, "password": password}, headers=headers
