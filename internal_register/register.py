@@ -63,6 +63,13 @@ def _load_config():
         "ak_file": "ak.txt",
         "rk_file": "rk.txt",
         "token_json_dir": "codex_tokens",
+        "sentinel_browser_enabled": True,
+        "sentinel_browser_timeout_seconds": 45,
+        "sentinel_browser_headless": True,
+        "sentinel_browser_pool_size": 4,
+        "sentinel_browser_reuse_limit": 30,
+        "sentinel_browser_max_age_seconds": 900,
+        "sentinel_browser_prewarm": True,
     }
 
     config_path = os.path.join(
@@ -73,6 +80,10 @@ def _load_config():
             with open(config_path, "r", encoding="utf-8") as f:
                 file_config = json.load(f)
                 config.update(file_config)
+                if file_config.get("duckmail_api_key") and not file_config.get(
+                    "duckmail_bearer"
+                ):
+                    config["duckmail_bearer"] = file_config.get("duckmail_api_key")
         except Exception as e:
             print(f"[Config] Failed to load config.json: {e}")
 
@@ -81,7 +92,8 @@ def _load_config():
         "DUCKMAIL_API_BASE", config["duckmail_api_base"]
     )
     config["duckmail_bearer"] = os.environ.get(
-        "DUCKMAIL_BEARER", config["duckmail_bearer"]
+        "DUCKMAIL_BEARER",
+        os.environ.get("DUCKMAIL_API_KEY", config["duckmail_bearer"]),
     )
     config["proxy"] = os.environ.get("PROXY", config["proxy"])
     config["proxy_list_url"] = os.environ.get(
@@ -141,6 +153,37 @@ def _load_config():
     config["token_json_dir"] = os.environ.get(
         "TOKEN_JSON_DIR", config["token_json_dir"]
     )
+    config["sentinel_browser_enabled"] = os.environ.get(
+        "SENTINEL_BROWSER_ENABLED", config["sentinel_browser_enabled"]
+    )
+    config["sentinel_browser_timeout_seconds"] = float(
+        os.environ.get(
+            "SENTINEL_BROWSER_TIMEOUT_SECONDS",
+            config["sentinel_browser_timeout_seconds"],
+        )
+    )
+    config["sentinel_browser_headless"] = os.environ.get(
+        "SENTINEL_BROWSER_HEADLESS", config["sentinel_browser_headless"]
+    )
+    config["sentinel_browser_pool_size"] = int(
+        os.environ.get(
+            "SENTINEL_BROWSER_POOL_SIZE", config["sentinel_browser_pool_size"]
+        )
+    )
+    config["sentinel_browser_reuse_limit"] = int(
+        os.environ.get(
+            "SENTINEL_BROWSER_REUSE_LIMIT", config["sentinel_browser_reuse_limit"]
+        )
+    )
+    config["sentinel_browser_max_age_seconds"] = float(
+        os.environ.get(
+            "SENTINEL_BROWSER_MAX_AGE_SECONDS",
+            config["sentinel_browser_max_age_seconds"],
+        )
+    )
+    config["sentinel_browser_prewarm"] = os.environ.get(
+        "SENTINEL_BROWSER_PREWARM", config["sentinel_browser_prewarm"]
+    )
 
     return config
 
@@ -187,6 +230,24 @@ OAUTH_REDIRECT_URI = _CONFIG["oauth_redirect_uri"]
 AK_FILE = _CONFIG["ak_file"]
 RK_FILE = _CONFIG["rk_file"]
 TOKEN_JSON_DIR = _CONFIG["token_json_dir"]
+SENTINEL_BROWSER_ENABLED = _as_bool(_CONFIG.get("sentinel_browser_enabled", True))
+SENTINEL_BROWSER_TIMEOUT_SECONDS = max(
+    10.0, float(_CONFIG.get("sentinel_browser_timeout_seconds", 45))
+)
+SENTINEL_BROWSER_HEADLESS = _as_bool(_CONFIG.get("sentinel_browser_headless", True))
+SENTINEL_BROWSER_POOL_SIZE = max(1, int(_CONFIG.get("sentinel_browser_pool_size", 4)))
+SENTINEL_BROWSER_REUSE_LIMIT = max(
+    1, int(_CONFIG.get("sentinel_browser_reuse_limit", 30))
+)
+SENTINEL_BROWSER_MAX_AGE_SECONDS = max(
+    60.0, float(_CONFIG.get("sentinel_browser_max_age_seconds", 900))
+)
+SENTINEL_BROWSER_PREWARM = _as_bool(_CONFIG.get("sentinel_browser_prewarm", True))
+SENTINEL_FRAME_URL = "https://sentinel.openai.com/backend-api/sentinel/frame.html"
+DEFAULT_SENTINEL_SDK_PATH = "/sentinel/20260124ceb8/sdk.js"
+_SENTINEL_SDK_PATH_CACHE = DEFAULT_SENTINEL_SDK_PATH
+_SENTINEL_SDK_PATH_CACHE_AT = 0.0
+_SENTINEL_SDK_CACHE_TTL_SECONDS = 600
 
 # Shared DuckMail mailbox session helper.
 # asyncio.Lock：用于异步注册流程的打印/文件操作
@@ -194,6 +255,12 @@ _print_lock = asyncio.Lock()
 _file_lock = asyncio.Lock()
 # threading.Lock：仅用于 ProxyPool 内部同步线程池打印（在 asyncio.to_thread 中运行）
 _proxy_print_lock = threading.Lock()
+_SENTINEL_BROWSER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=SENTINEL_BROWSER_POOL_SIZE,
+    thread_name_prefix="sentinel-browser",
+)
+_SENTINEL_BROWSER_PREWARMED = False
+_SENTINEL_BROWSER_PREWARM_LOCK = asyncio.Lock()
 
 
 def _log_timestamp():
@@ -595,12 +662,16 @@ class SentinelTokenGenerator:
     MAX_ATTEMPTS = 500000
     ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 
-    def __init__(self, device_id=None, user_agent=None):
+    def __init__(self, device_id=None, user_agent=None, sentinel_sdk_path=None):
         self.device_id = device_id or str(uuid.uuid4())
         self.user_agent = user_agent or (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/145.0.0.0 Safari/537.36"
+        )
+        self.sentinel_sdk_path = (
+            str(sentinel_sdk_path or DEFAULT_SENTINEL_SDK_PATH).strip()
+            or DEFAULT_SENTINEL_SDK_PATH
         )
         self.requirements_seed = str(random.random())
         self.sid = str(uuid.uuid4())
@@ -659,7 +730,7 @@ class SentinelTokenGenerator:
             4294705152,
             random.random(),
             self.user_agent,
-            "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js",
+            f"https://sentinel.openai.com{self.sentinel_sdk_path}",
             None,
             None,
             "en-US",
@@ -725,7 +796,17 @@ async def fetch_sentinel_challenge(
     impersonate=None,
     error_sink=None,
 ):
-    generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
+    sentinel_sdk_path = await _resolve_sentinel_sdk_path(
+        session,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        impersonate=impersonate,
+    )
+    generator = SentinelTokenGenerator(
+        device_id=device_id,
+        user_agent=user_agent,
+        sentinel_sdk_path=sentinel_sdk_path,
+    )
     req_body = {
         "p": generator.generate_requirements_token(),
         "id": device_id,
@@ -807,8 +888,26 @@ async def build_sentinel_token(
     user_agent=None,
     sec_ch_ua=None,
     impersonate=None,
+    browser_proxy=None,
     error_sink=None,
 ):
+    use_browser_for_flow = SENTINEL_BROWSER_ENABLED and flow in {
+        "username_password_create",
+        "oauth_create_account",
+    }
+    if use_browser_for_flow:
+        browser_token = await _build_sentinel_token_via_browser(
+            flow=flow,
+            user_agent=user_agent,
+            browser_proxy=browser_proxy,
+            session=session,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            error_sink=error_sink,
+        )
+        if browser_token:
+            return browser_token
+
     challenge = await fetch_sentinel_challenge(
         session,
         device_id,
@@ -833,7 +932,17 @@ async def build_sentinel_token(
         return None
 
     pow_data = challenge.get("proofofwork") or {}
-    generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
+    sentinel_sdk_path = await _resolve_sentinel_sdk_path(
+        session,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        impersonate=impersonate,
+    )
+    generator = SentinelTokenGenerator(
+        device_id=device_id,
+        user_agent=user_agent,
+        sentinel_sdk_path=sentinel_sdk_path,
+    )
 
     if pow_data.get("required") and pow_data.get("seed"):
         p_value = generator.generate_token(
@@ -853,6 +962,180 @@ async def build_sentinel_token(
         },
         separators=(",", ":"),
     )
+
+
+def _extract_sentinel_version_from_sdk_path(sdk_path: str):
+    match = re.search(r"/sentinel/([^/]+)/sdk\.js", str(sdk_path or ""))
+    if not match:
+        return ""
+    return str(match.group(1) or "").strip()
+
+
+def _build_sentinel_frame_url_with_version(sdk_path: str):
+    version = _extract_sentinel_version_from_sdk_path(sdk_path)
+    if not version:
+        return SENTINEL_FRAME_URL
+    return f"{SENTINEL_FRAME_URL}?sv={version}"
+
+
+def _normalize_browser_proxy_value(browser_proxy):
+    if isinstance(browser_proxy, str):
+        value = browser_proxy.strip()
+        return value or None
+    if isinstance(browser_proxy, dict):
+        for key in ("https", "http"):
+            value = str(browser_proxy.get(key) or "").strip()
+            if value:
+                return value
+    return None
+
+
+async def _build_sentinel_token_via_browser(
+    flow,
+    user_agent,
+    browser_proxy,
+    session,
+    sec_ch_ua,
+    impersonate,
+    error_sink,
+):
+    try:
+        from .sentinel_browser import (
+            get_sentinel_token_via_browser,
+            prepare_sentinel_browser_runtime,
+        )
+    except Exception as exc:
+        if isinstance(error_sink, dict):
+            error_sink.update(
+                {
+                    "code": "sentinel_browser_unavailable",
+                    "message": clean_display_text(str(exc))[:500],
+                }
+            )
+        return None
+
+    try:
+        sdk_path = await _resolve_sentinel_sdk_path(
+            session,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+        )
+    except Exception:
+        sdk_path = DEFAULT_SENTINEL_SDK_PATH
+
+    frame_url = _build_sentinel_frame_url_with_version(sdk_path)
+    normalized_proxy = _normalize_browser_proxy_value(browser_proxy)
+    timeout_ms = int(SENTINEL_BROWSER_TIMEOUT_SECONDS * 1000)
+
+    if SENTINEL_BROWSER_PREWARM:
+        try:
+            await _ensure_sentinel_browser_prewarm(prepare_sentinel_browser_runtime)
+        except Exception:
+            pass
+
+    try:
+        loop = asyncio.get_running_loop()
+        token = await loop.run_in_executor(
+            _SENTINEL_BROWSER_EXECUTOR,
+            lambda: get_sentinel_token_via_browser(
+                flow=flow,
+                user_agent=user_agent,
+                proxy=normalized_proxy,
+                timeout_ms=timeout_ms,
+                frame_url=frame_url,
+                headless=SENTINEL_BROWSER_HEADLESS,
+                reuse_limit=SENTINEL_BROWSER_REUSE_LIMIT,
+                max_age_seconds=SENTINEL_BROWSER_MAX_AGE_SECONDS,
+            ),
+        )
+    except Exception as exc:
+        if isinstance(error_sink, dict):
+            error_sink.update(
+                {
+                    "code": "sentinel_browser_failed",
+                    "message": clean_display_text(str(exc))[:500],
+                }
+            )
+        return None
+
+    if not token:
+        if isinstance(error_sink, dict):
+            error_sink.update(
+                {
+                    "code": "sentinel_browser_empty",
+                    "message": "Playwright sentinel token generation returned empty result",
+                }
+            )
+        return None
+
+    return token
+
+
+async def _ensure_sentinel_browser_prewarm(prepare_runtime_fn):
+    global _SENTINEL_BROWSER_PREWARMED
+    if _SENTINEL_BROWSER_PREWARMED:
+        return
+
+    async with _SENTINEL_BROWSER_PREWARM_LOCK:
+        if _SENTINEL_BROWSER_PREWARMED:
+            return
+
+        loop = asyncio.get_running_loop()
+        tasks = [
+            loop.run_in_executor(
+                _SENTINEL_BROWSER_EXECUTOR,
+                lambda: prepare_runtime_fn(headless=SENTINEL_BROWSER_HEADLESS),
+            )
+            for _ in range(SENTINEL_BROWSER_POOL_SIZE)
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        _SENTINEL_BROWSER_PREWARMED = True
+
+
+async def _resolve_sentinel_sdk_path(
+    session,
+    user_agent=None,
+    sec_ch_ua=None,
+    impersonate=None,
+):
+    global _SENTINEL_SDK_PATH_CACHE
+    global _SENTINEL_SDK_PATH_CACHE_AT
+
+    now = time.time()
+    if (
+        _SENTINEL_SDK_PATH_CACHE
+        and now - _SENTINEL_SDK_PATH_CACHE_AT < _SENTINEL_SDK_CACHE_TTL_SECONDS
+    ):
+        return _SENTINEL_SDK_PATH_CACHE
+
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": user_agent or "Mozilla/5.0",
+        "sec-ch-ua": sec_ch_ua
+        or '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
+
+    kwargs = {"headers": headers, "timeout": 20}
+    if impersonate:
+        kwargs["impersonate"] = impersonate
+
+    try:
+        resp = await session.get(SENTINEL_FRAME_URL, **kwargs)
+        if resp.status_code == 200:
+            html = resp.text or ""
+            match = re.search(r"/sentinel/[^/]+/sdk\.js", html)
+            if match:
+                _SENTINEL_SDK_PATH_CACHE = match.group(0)
+                _SENTINEL_SDK_PATH_CACHE_AT = now
+                return _SENTINEL_SDK_PATH_CACHE
+    except Exception:
+        pass
+
+    return _SENTINEL_SDK_PATH_CACHE or DEFAULT_SENTINEL_SDK_PATH
 
 
 def _extract_code_from_url(url: str):
@@ -1368,6 +1651,7 @@ class ChatGPTRegister:
             "prompt": "login",
             "ext-oai-did": self.device_id,
             "auth_session_logging_id": self.auth_session_logging_id,
+            "ext-passkey-client-capabilities": "0111",
             "screen_hint": "login_or_signup",
             "login_hint": email,
         }
@@ -1454,8 +1738,27 @@ class ChatGPTRegister:
             "Accept": "application/json",
             "Referer": f"{self.AUTH}/create-account/password",
             "Origin": self.AUTH,
+            "User-Agent": self.ua,
+            "oai-device-id": self.device_id,
         }
         headers.update(_make_trace_headers())
+        sentinel_error = {}
+        sentinel_token = await build_sentinel_token(
+            self.session,
+            self.device_id,
+            flow="username_password_create",
+            user_agent=self.ua,
+            sec_ch_ua=self.sec_ch_ua,
+            impersonate=self.impersonate,
+            browser_proxy=self.proxy,
+            error_sink=sentinel_error,
+        )
+        if sentinel_token:
+            headers["openai-sentinel-token"] = sentinel_token
+        else:
+            await self._print(
+                "[Sentinel] register token missing; fallback to legacy register request"
+            )
         r = await self.session.post(
             url, json={"username": email, "password": password}, headers=headers
         )
@@ -1579,12 +1882,16 @@ class ChatGPTRegister:
         need_otp = False
 
         if "create-account/password" in final_path:
-            await self._print("[Auth] reached an unsupported auth step")
+            await self._print(
+                "[Auth] create-account/password detected; using register API"
+            )
             await _random_delay(0.5, 1.0)
             status, data = await self.register(email, password)
             if status != 200:
                 raise Exception(f"Register failed ({status}): {data}")
-            # Account registration succeeded; send OTP and continue with verification.
+            await self._print(
+                "[Auth] register API accepted account creation; sending OTP"
+            )
             await _random_delay(0.3, 0.8)
             await self.send_otp()
             need_otp = True
@@ -2260,9 +2567,11 @@ class ChatGPTRegister:
             await self._print(
                 "[OAuth] invalid_auth_step; retrying bootstrap via authorize"
             )
-            has_login_session, authorize_final_url, bootstrap_ok = (
-                _bootstrap_oauth_session()
-            )
+            (
+                has_login_session,
+                authorize_final_url,
+                bootstrap_ok,
+            ) = await _bootstrap_oauth_session()
             if not authorize_final_url or not bootstrap_ok:
                 return None
             continue_referer = (
@@ -2539,6 +2848,7 @@ class ChatGPTRegister:
 
         code = None
         consent_url = continue_url
+        last_follow_url = ""
         if consent_url and consent_url.startswith("/"):
             consent_url = f"{OAUTH_ISSUER}{consent_url}"
 
@@ -2552,9 +2862,10 @@ class ChatGPTRegister:
             await self._print(
                 "[OAuth] 5/7 follow continue_url to resolve authorization code"
             )
-            code, _ = await self._oauth_follow_for_code(
+            code, follow_url = await self._oauth_follow_for_code(
                 consent_url, referer=f"{OAUTH_ISSUER}/log-in/password"
             )
+            last_follow_url = str(follow_url or "")
 
         consent_hint = (
             ("consent" in (consent_url or ""))
@@ -2576,12 +2887,21 @@ class ChatGPTRegister:
             await self._print("[OAuth] 6/7 falling back to consent path")
             code = await self._oauth_submit_workspace_and_org(fallback_consent)
             if not code:
-                code, _ = await self._oauth_follow_for_code(
+                code, follow_url = await self._oauth_follow_for_code(
                     fallback_consent, referer=f"{OAUTH_ISSUER}/log-in/password"
                 )
+                last_follow_url = str(follow_url or "")
 
         if not code:
             await self._print("[OAuth] missing authorization code")
+            blocker_url = str(last_follow_url or consent_url or continue_url or "")
+            if "add-phone" in blocker_url:
+                _remember_protocol_error(
+                    "authorization_code",
+                    code="add_phone_required",
+                    message="Auth flow redirected to add-phone and blocked code issuance",
+                )
+                return None
             _remember_protocol_error(
                 "authorization_code",
                 code="authorization_code_missing",
@@ -2729,6 +3049,7 @@ async def _register_one(
 
             # 3. Optionally extract Codex OAuth credentials.
             oauth_ok = not bool(extract_codex)
+            oauth_error = ""
             if ENABLE_OAUTH and extract_codex:
                 await reg._print("[OAuth] extracting Codex token...")
                 tokens = await reg.perform_codex_oauth_login_http(
@@ -2740,12 +3061,27 @@ async def _register_one(
                     await reg._print("[OAuth] token artifacts persisted")
                 else:
                     msg = "OAuth extraction failed"
+                    protocol_error = reg.last_protocol_error or {}
+                    reason_parts = []
+                    stage = str(protocol_error.get("stage") or "").strip()
+                    code = str(protocol_error.get("code") or "").strip()
+                    message = str(protocol_error.get("message") or "").strip()
+                    if stage:
+                        reason_parts.append(f"stage={stage}")
+                    if code:
+                        reason_parts.append(f"code={code}")
+                    if message:
+                        reason_parts.append(f"message={message}")
+                    if reason_parts:
+                        oauth_error = " | ".join(reason_parts)
                     if OAUTH_REQUIRED:
                         await reg._print(
-                            f"[OAuth] {msg} (preserving registered account with oauth=fail)"
+                            f"[OAuth] {msg} (preserving registered account with oauth=fail){(': ' + oauth_error) if oauth_error else ''}"
                         )
                     else:
-                        await reg._print(f"[OAuth] {msg} (continuing by config)")
+                        await reg._print(
+                            f"[OAuth] {msg} (continuing by config){(': ' + oauth_error) if oauth_error else ''}"
+                        )
             elif not extract_codex:
                 await reg._print(
                     "[OAuth] Codex extraction disabled for this registration batch"
@@ -2780,6 +3116,7 @@ async def _register_one(
                     email=email,
                     proxy=proxy_label,
                     oauth_ok=bool(oauth_ok),
+                    oauth_error=oauth_error,
                 )
             if reg.session:
                 await reg.session.close()

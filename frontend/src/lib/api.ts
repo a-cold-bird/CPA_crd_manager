@@ -432,11 +432,12 @@ export const runRemotePushTest = async (payload?: {
 };
 
 export const runMailDomainTest = async (payload: {
-  mail_email_provider?: 'mailfree' | 'inbucket';
+  mail_email_provider?: 'mailfree' | 'inbucket' | 'duckmail';
   domain: string;
   mail_api_base?: string;
   mail_username?: string;
   mail_password?: string;
+  duckmail_api_key?: string;
 }): Promise<LocalCliResult<MailDomainTestPayload>> => {
   const password = getManagementKeyOrThrow();
   const res = await configApi.post('/mail/domain-test', {

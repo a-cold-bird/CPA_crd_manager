@@ -31,6 +31,7 @@ const MAIL_REQUEST_TIMEOUT_MS = 15_000;
 const RATE_LIMIT_RETRY_MS = 30 * 60_000;
 const RUNTIME_RECHECK_FLOOR_MS = 30_000;
 const AUTO_REPLENISH_RESTART_GUARD_MS = 5 * 60_000;
+const REPLENISHMENT_STALL_TIMEOUT_MS = Number(process.env.REPLENISHMENT_STALL_TIMEOUT_MS || 180_000);
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -44,6 +45,8 @@ const runtimeScheduler = {
   replenishmentChild: null,
   replenishmentPid: null,
   replenishmentStopRequested: false,
+  replenishmentLastOutputAt: null,
+  replenishmentWatchdogInProgress: false,
 };
 
 let backendServerLockHeld = false;
@@ -95,19 +98,26 @@ function ensureWritableFilePath(filePath) {
 
 function normalizeMailProvider(value) {
   const provider = String(value || '').trim().toLowerCase();
-  return provider === 'inbucket' ? 'inbucket' : 'mailfree';
+  if (provider === 'inbucket') return 'inbucket';
+  if (provider === 'duckmail') return 'duckmail';
+  return 'mailfree';
 }
 
 function readMailMeta(config = readConfig()) {
   const inbucketApiBase = normalizeCpaBaseUrl(config?.inbucket_mail_api_base || config?.mail_api_base || '');
   const inbucketDomains = normalizeDomainListText(config?.inbucket_mail_domains || '').split(',').map((item) => item.trim()).filter(Boolean);
+  const duckmailApiBase = normalizeCpaBaseUrl(config?.duckmail_api_base || 'https://api.duckmail.sbs');
+  const duckmailDomains = normalizeDomainListText(config?.duckmail_mail_domains || '').split(',').map((item) => item.trim()).filter(Boolean);
   return {
     provider_options: [
       { value: 'mailfree', label: 'mailfree' },
       { value: 'inbucket', label: 'inbucket' },
+      { value: 'duckmail', label: 'duckmail' },
     ],
     inbucket_api_base: inbucketApiBase,
     inbucket_domains: inbucketDomains,
+    duckmail_api_base: duckmailApiBase,
+    duckmail_domains: duckmailDomains,
   };
 }
 
@@ -124,6 +134,9 @@ function readConfig() {
     mail_email_domains: '', // Added
     inbucket_mail_api_base: '',
     inbucket_mail_domains: '',
+    duckmail_api_base: 'https://api.duckmail.sbs',
+    duckmail_api_key: '',
+    duckmail_mail_domains: '',
     mail_randomize_from_list: true,
     codex_replenish_enabled: false, // Added
     codex_target_count: 5,
@@ -153,6 +166,8 @@ function readConfig() {
     const normalizedMailEmailDomains = normalizeDomainListText(parsed.mail_email_domains, normalizedMailEmailDomain);
     const normalizedInbucketMailApiBase = normalizeCpaBaseUrl(parsed.inbucket_mail_api_base || '');
     const normalizedInbucketMailDomains = normalizeDomainListText(parsed.inbucket_mail_domains);
+    const normalizedDuckmailApiBase = normalizeCpaBaseUrl(parsed.duckmail_api_base || 'https://api.duckmail.sbs');
+    const normalizedDuckmailMailDomains = normalizeDomainListText(parsed.duckmail_mail_domains);
     return {
       ...defaults,
       ...parsed,
@@ -161,6 +176,9 @@ function readConfig() {
       mail_email_domains: normalizedMailEmailDomains,
       inbucket_mail_api_base: normalizedInbucketMailApiBase,
       inbucket_mail_domains: normalizedInbucketMailDomains,
+      duckmail_api_base: normalizedDuckmailApiBase,
+      duckmail_api_key: String(parsed.duckmail_api_key || ''),
+      duckmail_mail_domains: normalizedDuckmailMailDomains,
       mail_randomize_from_list: parseBoolSafe(parsed.mail_randomize_from_list, true),
       codex_replenish_enabled: parseBoolSafe(parsed.codex_replenish_enabled, false), // Added
       codex_replenish_target_count: normalizedTargetCount,
@@ -196,6 +214,8 @@ function writeConfig(data) {
   const normalizedMailEmailDomains = normalizeDomainListText(merged.mail_email_domains, normalizedMailEmailDomain);
   const normalizedInbucketMailApiBase = normalizeCpaBaseUrl(merged.inbucket_mail_api_base || '');
   const normalizedInbucketMailDomains = normalizeDomainListText(merged.inbucket_mail_domains);
+  const normalizedDuckmailApiBase = normalizeCpaBaseUrl(merged.duckmail_api_base || 'https://api.duckmail.sbs');
+  const normalizedDuckmailMailDomains = normalizeDomainListText(merged.duckmail_mail_domains);
   merged.codex_replenish_target_count = normalizedTargetCount;
   merged.codex_target_count = normalizedTargetCount;
   merged.codex_replenish_threshold = normalizedThreshold;
@@ -206,6 +226,9 @@ function writeConfig(data) {
   merged.mail_email_domains = normalizedMailEmailDomains;
   merged.inbucket_mail_api_base = normalizedInbucketMailApiBase;
   merged.inbucket_mail_domains = normalizedInbucketMailDomains;
+  merged.duckmail_api_base = normalizedDuckmailApiBase;
+  merged.duckmail_api_key = String(merged.duckmail_api_key || '');
+  merged.duckmail_mail_domains = normalizedDuckmailMailDomains;
   const str = yaml.dump(merged);
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
   fs.writeFileSync(CONFIG_PATH, str, 'utf-8');
@@ -661,6 +684,56 @@ function clearStaleTrackedReplenishmentStatus() {
   });
 }
 
+function isTrackedReplenishmentStalled(trackedProcess) {
+  if (!trackedProcess) {
+    return false;
+  }
+  const lastOutputAt = normalizeNumberOrNull(runtimeScheduler.replenishmentLastOutputAt);
+  if (!lastOutputAt) {
+    return false;
+  }
+  return Date.now() - lastOutputAt > REPLENISHMENT_STALL_TIMEOUT_MS;
+}
+
+async function enforceReplenishmentWatchdog() {
+  if (runtimeScheduler.replenishmentWatchdogInProgress) {
+    return;
+  }
+  const tracked = getTrackedReplenishmentProcess();
+  if (!tracked || runtimeScheduler.replenishmentStopRequested || !isTrackedReplenishmentStalled(tracked)) {
+    return;
+  }
+
+  runtimeScheduler.replenishmentWatchdogInProgress = true;
+  const pid = Number(tracked.pid || 0);
+  const lastOutputAt = normalizeNumberOrNull(runtimeScheduler.replenishmentLastOutputAt);
+  try {
+    if (pid > 0) {
+      console.warn(`[Replenish] Watchdog terminating stalled process ${pid}; no output for ${Date.now() - (lastOutputAt || Date.now())}ms`);
+      await terminateTrackedProcess(pid);
+    }
+    const lockPayload = readProcessLock(REPLENISHMENT_LOCK_PATH);
+    if (normalizeNumberOrNull(lockPayload.pid) === pid) {
+      removeProcessLock(REPLENISHMENT_LOCK_PATH);
+    }
+    runtimeScheduler.replenishmentInProgress = false;
+    runtimeScheduler.replenishmentChild = null;
+    runtimeScheduler.replenishmentPid = null;
+    runtimeScheduler.replenishmentStopRequested = false;
+    runtimeScheduler.replenishmentLastOutputAt = null;
+    updateReplenishmentStatus({
+      in_progress: false,
+      last_finished_at: Date.now(),
+      last_error: 'Replenishment watchdog terminated stalled process (no progress).',
+      last_summary: 'Replenishment stalled and was restarted by watchdog.',
+    });
+  } catch (error) {
+    console.error(`[Replenish] Watchdog failed: ${String(error?.message || error)}`);
+  } finally {
+    runtimeScheduler.replenishmentWatchdogInProgress = false;
+  }
+}
+
 function normalizeCredentialRuntimeEntry(value) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   const quotaCards = Array.isArray(source.last_quota_cards)
@@ -796,7 +869,7 @@ function normalizeMailDomain(rawDomain) {
 }
 
 function isValidMailDomain(domain) {
-  return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i.test(domain);
+  return /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i.test(domain);
 }
 
 function buildCookieHeaderFromResponse(response) {
@@ -822,7 +895,12 @@ function shouldDelayAutoReplenishment(status, nowMs = Date.now()) {
 
 function buildMailDomainTestMailbox(domain) {
   const randomPart = Math.random().toString(36).slice(2, 10);
-  return `cpamc-domain-test-${Date.now()}-${randomPart}@${domain}`;
+  const normalized = normalizeMailDomain(domain);
+  const localPart = `cpamc-domain-test-${Date.now()}-${randomPart}`;
+  if (normalized.startsWith('*.')) {
+    return `${localPart}@${localPart}.${normalized.slice(2)}`;
+  }
+  return `${localPart}@${normalized}`;
 }
 
 async function fetchMailService(config, {
@@ -883,6 +961,7 @@ async function runMailDomainSmokeTest(targetConfig) {
   const mailApiBase = normalizeCpaBaseUrl(targetConfig?.mail_api_base);
   const mailUsername = String(targetConfig?.mail_username || '').trim();
   const mailPassword = String(targetConfig?.mail_password || '').trim();
+  const duckmailApiKey = String(targetConfig?.duckmail_api_key || '').trim();
 
   if (!mailApiBase) {
     throw new Error('mail_api_base is required');
@@ -930,6 +1009,69 @@ async function runMailDomainSmokeTest(targetConfig) {
     }
     payload.ok = true;
     payload.message = 'Inbucket mailbox listing succeeded.';
+    return payload;
+  }
+
+  if (provider === 'duckmail') {
+    if (!duckmailApiKey) {
+      throw new Error('duckmail_api_key is required');
+    }
+    const accountPassword = `Dm!${Math.random().toString(36).slice(2, 12)}A1`;
+    const createResult = await fetchMailService(
+      { mail_api_base: mailApiBase },
+      {
+        method: 'POST',
+        pathname: '/accounts',
+        headers: {
+          Authorization: `Bearer ${duckmailApiKey}`,
+        },
+        body: {
+          address: mailbox,
+          password: accountPassword,
+          expiresIn: 3600,
+        },
+      },
+    );
+    if (!createResult.ok && createResult.status !== 409) {
+      payload.error = String(createResult.data?.error || createResult.data?.message || `duckmail account create failed (${createResult.status})`);
+      throw createRequestError(payload.error, createResult.status, payload);
+    }
+
+    const tokenResult = await fetchMailService(
+      { mail_api_base: mailApiBase },
+      {
+        method: 'POST',
+        pathname: '/token',
+        body: {
+          address: mailbox,
+          password: accountPassword,
+        },
+      },
+    );
+    payload.login_status = tokenResult.status;
+    const bearerToken = String(tokenResult.data?.token || '').trim();
+    if (!tokenResult.ok || !bearerToken) {
+      payload.error = String(tokenResult.data?.error || tokenResult.data?.message || `duckmail token failed (${tokenResult.status})`);
+      throw createRequestError(payload.error, tokenResult.status, payload);
+    }
+
+    const listResult = await fetchMailService(
+      { mail_api_base: mailApiBase },
+      {
+        method: 'GET',
+        pathname: '/messages',
+        headers: {
+          Authorization: `Bearer ${bearerToken}`,
+        },
+      },
+    );
+    payload.list_status = listResult.status;
+    if (!listResult.ok) {
+      payload.error = String(listResult.data?.error || listResult.data?.message || `duckmail mailbox list failed (${listResult.status})`);
+      throw createRequestError(payload.error, listResult.status, payload);
+    }
+    payload.ok = true;
+    payload.message = 'DuckMail mailbox create/token/list succeeded.';
     return payload;
   }
 
@@ -1557,7 +1699,9 @@ function buildRuntimeStatusPayload(config) {
   const configEnabled = parseBoolSafe(config?.auto_probe_enabled, false);
   const hasRuntimeConfig = Boolean(normalizeCpaBaseUrl(config?.cpa_url) && String(config?.management_key || '').trim());
   const healthyCodexCount = countNormalCodexAccountsFromRuntime(runtimeState, cpaUrlKey);
-  const replenishmentTracked = Boolean(trackedReplenishment) || normalizeBoolean(replenishmentStatus.in_progress, false);
+  const replenishmentStalled = isTrackedReplenishmentStalled(trackedReplenishment);
+  const replenishmentTracked = (Boolean(trackedReplenishment) && !replenishmentStalled)
+    || (!trackedReplenishment && normalizeBoolean(replenishmentStatus.in_progress, false));
   const statusHealthyCount = normalizeNumberOrNull(replenishmentStatus.healthy_count);
   const derivedHealthyCount = statusHealthyCount ?? healthyCodexCount;
   const statusTargetCount = normalizeNumberOrNull(replenishmentStatus.target_count);
@@ -1588,6 +1732,9 @@ function buildRuntimeStatusPayload(config) {
         in_progress: replenishmentTracked,
         stop_requested: runtimeScheduler.replenishmentStopRequested,
         process_pid: trackedReplenishment?.pid ?? normalizeNumberOrNull(runtimeScheduler.replenishmentPid),
+        stalled: replenishmentStalled,
+        last_output_at: normalizeNumberOrNull(runtimeScheduler.replenishmentLastOutputAt),
+        last_output_at_iso: formatRuntimeTime(runtimeScheduler.replenishmentLastOutputAt),
         mode: normalizeStringOrEmpty(replenishmentStatus.mode),
       healthy_count: derivedHealthyCount,
       proxy_pool_size: normalizeNumberOrNull(replenishmentStatus.proxy_pool_size),
@@ -1690,6 +1837,7 @@ function countUsableCodexAccounts(credentials, runtimeState, cpaUrlKey) {
 }
 
 async function runBackendAutomationCycle() {
+  await enforceReplenishmentWatchdog();
   if (runtimeScheduler.cycleInProgress) {
     return;
   }
@@ -1893,6 +2041,7 @@ async function spawnReplenishmentProcess(options = {}) {
         runtimeScheduler.replenishmentChild = null;
         runtimeScheduler.replenishmentPid = null;
         runtimeScheduler.replenishmentStopRequested = false;
+        runtimeScheduler.replenishmentLastOutputAt = null;
       }
       if (!settled) {
         settled = true;
@@ -1917,6 +2066,7 @@ async function spawnReplenishmentProcess(options = {}) {
       text.split(/\r?\n/).forEach((line) => {
         const trimmed = line.trimEnd();
         if (trimmed) {
+          runtimeScheduler.replenishmentLastOutputAt = Date.now();
           writer(`${prefix}${trimmed}`);
         }
       });
@@ -1951,6 +2101,7 @@ async function spawnReplenishmentProcess(options = {}) {
 
     runtimeScheduler.replenishmentChild = child;
     runtimeScheduler.replenishmentPid = child.pid || null;
+    runtimeScheduler.replenishmentLastOutputAt = Date.now();
   });
 }
 
@@ -2012,6 +2163,7 @@ async function stopTrackedReplenishmentProcess() {
   runtimeScheduler.replenishmentChild = null;
   runtimeScheduler.replenishmentPid = null;
   runtimeScheduler.replenishmentStopRequested = false;
+  runtimeScheduler.replenishmentLastOutputAt = null;
   const lockPayload = readProcessLock(REPLENISHMENT_LOCK_PATH);
   if (normalizeNumberOrNull(lockPayload.pid) === pid) {
     removeProcessLock(REPLENISHMENT_LOCK_PATH);
@@ -2037,8 +2189,10 @@ function startBackendAutomationScheduler() {
   }
   runtimeScheduler.started = true;
   runtimeScheduler.timer = setInterval(() => {
+    void enforceReplenishmentWatchdog();
     void runBackendAutomationCycle();
   }, RUNTIME_WAKE_INTERVAL_MS);
+  void enforceReplenishmentWatchdog();
   void runBackendAutomationCycle();
 }
 
@@ -2131,6 +2285,9 @@ app.post('/api/config/update', (req, res) => {
         mail_email_domains: nextConfig.mail_email_domains !== undefined ? nextConfig.mail_email_domains : config.mail_email_domains,
         inbucket_mail_api_base: nextConfig.inbucket_mail_api_base !== undefined ? nextConfig.inbucket_mail_api_base : config.inbucket_mail_api_base,
         inbucket_mail_domains: nextConfig.inbucket_mail_domains !== undefined ? nextConfig.inbucket_mail_domains : config.inbucket_mail_domains,
+        duckmail_api_base: nextConfig.duckmail_api_base !== undefined ? nextConfig.duckmail_api_base : config.duckmail_api_base,
+        duckmail_api_key: nextConfig.duckmail_api_key !== undefined ? nextConfig.duckmail_api_key : config.duckmail_api_key,
+        duckmail_mail_domains: nextConfig.duckmail_mail_domains !== undefined ? nextConfig.duckmail_mail_domains : config.duckmail_mail_domains,
         mail_randomize_from_list: nextConfig.mail_randomize_from_list !== undefined ? parseBoolSafe(nextConfig.mail_randomize_from_list, config.mail_randomize_from_list) : config.mail_randomize_from_list,
         codex_replenish_enabled: nextCodexReplenishEnabled,
         codex_target_count: nextCodexReplenishTargetCount,
@@ -2298,6 +2455,7 @@ app.post('/api/mail/domain-test', async (req, res) => {
       mail_api_base: body.mail_api_base !== undefined ? body.mail_api_base : config.mail_api_base,
       mail_username: body.mail_username !== undefined ? body.mail_username : config.mail_username,
       mail_password: body.mail_password !== undefined ? body.mail_password : config.mail_password,
+      duckmail_api_key: body.duckmail_api_key !== undefined ? body.duckmail_api_key : config.duckmail_api_key,
       domain: body.domain !== undefined ? body.domain : config.mail_email_domain,
     });
     res.json({ ok: true, payload });

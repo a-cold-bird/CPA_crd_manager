@@ -80,12 +80,15 @@ export default function Dashboard() {
     const [newPassword, setNewPassword] = useState('');
     const [mailApiBase, setMailApiBase] = useState('');
     const [inbucketApiBase, setInbucketApiBase] = useState('');
+    const [duckmailApiBase, setDuckmailApiBase] = useState('');
+    const [duckmailApiKey, setDuckmailApiKey] = useState('');
     const [mailUsername, setMailUsername] = useState('');
     const [mailPassword, setMailPassword] = useState('');
-    const [mailEmailProvider, setMailEmailProvider] = useState<'mailfree' | 'inbucket'>('mailfree');
+    const [mailEmailProvider, setMailEmailProvider] = useState<'mailfree' | 'inbucket' | 'duckmail'>('mailfree');
     const [mailEmailDomain, setMailEmailDomain] = useState('');
     const [mailEmailDomains, setMailEmailDomains] = useState('');
     const [inbucketDomains, setInbucketDomains] = useState<string[]>([]);
+    const [duckmailDomains, setDuckmailDomains] = useState<string[]>([]);
     const [mailRandomizeFromList, setMailRandomizeFromList] = useState(true);
     const [codexReplenishEnabled, setCodexReplenishEnabled] = useState(false);
     const [codexReplenishTargetCount, setCodexReplenishTargetCount] = useState(5);
@@ -126,14 +129,20 @@ export default function Dashboard() {
                     );
                     cpaApi.defaults.baseURL = '/api/cpa';
                     setCpaUrl(resolvedUrl);
-                    setMailEmailProvider(String(data.config.mail_email_provider || 'mailfree') === 'inbucket' ? 'inbucket' : 'mailfree');
+                    {
+                        const provider = String(data.config.mail_email_provider || 'mailfree').trim().toLowerCase();
+                        setMailEmailProvider(provider === 'inbucket' || provider === 'duckmail' ? provider : 'mailfree');
+                    }
                     setMailApiBase(String(data.config.mail_api_base || ''));
+                    setDuckmailApiBase(String(data.config.duckmail_api_base || data.mail_meta?.duckmail_api_base || ''));
+                    setDuckmailApiKey(String(data.config.duckmail_api_key || ''));
                     setMailUsername(String(data.config.mail_username || ''));
                     setMailPassword(String(data.config.mail_password || ''));
                     setMailEmailDomain(String(data.config.mail_email_domain || ''));
                     setMailEmailDomains(String(data.config.mail_email_domains || ''));
                     setInbucketApiBase(String(data.mail_meta?.inbucket_api_base || ''));
                     setInbucketDomains(Array.isArray(data.mail_meta?.inbucket_domains) ? data.mail_meta.inbucket_domains.map((item: unknown) => String(item || '').trim()).filter(Boolean) : []);
+                    setDuckmailDomains(Array.isArray(data.mail_meta?.duckmail_domains) ? data.mail_meta.duckmail_domains.map((item: unknown) => String(item || '').trim()).filter(Boolean) : []);
                     setMailRandomizeFromList(parseConfigBoolean(data.config.mail_randomize_from_list, true));
                     setCodexReplenishEnabled(parseConfigBoolean(data.config.codex_replenish_enabled, false));
                     setCodexReplenishTargetCount(parseIntSafe(data.config.codex_replenish_target_count, 5));
@@ -176,7 +185,10 @@ export default function Dashboard() {
         if (mailEmailProvider === 'inbucket' && inbucketApiBase && mailApiBase !== inbucketApiBase) {
             setMailApiBase(inbucketApiBase);
         }
-    }, [inbucketApiBase, mailApiBase, mailEmailProvider]);
+        if (mailEmailProvider === 'duckmail' && duckmailApiBase && mailApiBase !== duckmailApiBase) {
+            setMailApiBase(duckmailApiBase);
+        }
+    }, [duckmailApiBase, inbucketApiBase, mailApiBase, mailEmailProvider]);
 
     useEffect(() => {
         try {
@@ -332,11 +344,15 @@ export default function Dashboard() {
                                 mailEmailProvider={mailEmailProvider}
                                 setMailEmailProvider={setMailEmailProvider}
                                 inbucketApiBase={inbucketApiBase}
+                                duckmailApiBase={duckmailApiBase}
+                                duckmailApiKey={duckmailApiKey}
+                                setDuckmailApiKey={setDuckmailApiKey}
                                 mailEmailDomain={mailEmailDomain}
                                 setMailEmailDomain={setMailEmailDomain}
                                 mailEmailDomains={mailEmailDomains}
                                 setMailEmailDomains={setMailEmailDomains}
                                 inbucketDomains={inbucketDomains}
+                                duckmailDomains={duckmailDomains}
                                 mailRandomizeFromList={mailRandomizeFromList}
                                 setMailRandomizeFromList={setMailRandomizeFromList}
                                 codexReplenishEnabled={codexReplenishEnabled}

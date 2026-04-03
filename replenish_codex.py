@@ -60,11 +60,17 @@ def load_provider_domain_list(config: Dict[str, Any]) -> List[str]:
     provider = (
         str(config.get("mail_email_provider", "mailfree") or "mailfree").strip().lower()
     )
-    domain_source = config.get(
-        "inbucket_mail_domains" if provider == "inbucket" else "mail_email_domains",
-        "",
+    domain_source_key = (
+        "inbucket_mail_domains"
+        if provider == "inbucket"
+        else "duckmail_mail_domains"
+        if provider == "duckmail"
+        else "mail_email_domains"
     )
+    domain_source = config.get(domain_source_key, "")
     if provider == "inbucket" and not normalize_domain_list(domain_source):
+        domain_source = config.get("mail_email_domains", "")
+    if provider == "duckmail" and not normalize_domain_list(domain_source):
         domain_source = config.get("mail_email_domains", "")
     configured_domains = normalize_domain_list(domain_source)
     default_domain = str(config.get("mail_email_domain", "") or "").strip().lower()
@@ -818,6 +824,8 @@ def configure_internal_register_environment(config: Dict[str, Any]) -> None:
         config.get(
             "inbucket_mail_api_base"
             if mail_provider == "inbucket"
+            else "duckmail_api_base"
+            if mail_provider == "duckmail"
             else "mail_api_base",
             "",
         )
@@ -829,6 +837,8 @@ def configure_internal_register_environment(config: Dict[str, Any]) -> None:
         "MAIL_EMAIL_PROVIDER": mail_provider,
         "MAIL_API_BASE": provider_api_base,
         "DUCKMAIL_API_BASE": provider_api_base,
+        "DUCKMAIL_BEARER": str(config.get("duckmail_api_key", "") or "").strip(),
+        "DUCKMAIL_MAIL_DOMAINS": ",".join(configured_domains),
         "MAIL_USERNAME": str(config.get("mail_username", "") or "").strip(),
         "MAIL_PASSWORD": str(config.get("mail_password", "") or ""),
         "MAIL_EMAIL_DOMAIN": default_domain,
@@ -1150,10 +1160,13 @@ def try_upload_request(
         )
 
     if response.ok:
+        payload_name = ""
+        if isinstance(json_payload, dict):
+            payload_name = str(json_payload.get("name", "") or "")
         logger.info(
             "CPA upload succeeded via mode=%s file=%s",
             mode,
-            filename or json_payload.get("name", ""),
+            filename or payload_name,
         )
         return True
 
@@ -1896,6 +1909,7 @@ def build_register_progress_hook(batch_attempt: int, config: Dict[str, Any]):
 
         if event_type == "account_succeeded":
             oauth_ok = bool(payload.get("oauth_ok"))
+            oauth_error = str(payload.get("oauth_error") or "").strip()
             email = str(payload.get("email") or "")
             proxy = str(payload.get("proxy") or "")
             idx = int(payload.get("idx") or 0)
@@ -1926,11 +1940,27 @@ def build_register_progress_hook(batch_attempt: int, config: Dict[str, Any]):
                     status="registered" if oauth_ok else "codex_failed",
                     register_ok=True,
                     codex_ok=oauth_ok,
-                    error="" if oauth_ok else "Codex extraction failed",
+                    error=(
+                        ""
+                        if oauth_ok
+                        else (
+                            f"Codex extraction failed: {oauth_error}"
+                            if oauth_error
+                            else "Codex extraction failed"
+                        )
+                    ),
                 )
                 append_batch_event(
                     batch,
-                    f"Account {idx}/{total} registered: {email or 'unknown'} | Codex {'ok' if oauth_ok else 'fail'}.",
+                    (
+                        f"Account {idx}/{total} registered: {email or 'unknown'} | Codex ok."
+                        if oauth_ok
+                        else (
+                            f"Account {idx}/{total} registered: {email or 'unknown'} | Codex fail: {oauth_error}."
+                            if oauth_error
+                            else f"Account {idx}/{total} registered: {email or 'unknown'} | Codex fail."
+                        )
+                    ),
                 )
                 current["current_batch"] = batch
 

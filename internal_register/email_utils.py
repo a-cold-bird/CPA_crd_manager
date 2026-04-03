@@ -14,6 +14,9 @@ import json
 API_BASE = "REDACTED_BASE"
 USERNAME = ""
 PASSWORD = "REDACTED"
+DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
+DUCKMAIL_BEARER = ""
+DUCKMAIL_DOMAINS = ["duckmail.sbs"]
 EMAIL_DOMAIN = "REDACTED_DOMAIN"
 EMAIL_DOMAINS = [EMAIL_DOMAIN]
 EMAIL_PROVIDERS = {}
@@ -36,7 +39,11 @@ def _provider_mode(provider_config):
     mode = str((provider_config or {}).get("mode") or "").strip().lower()
     if mode:
         return mode
+    if str((provider_config or {}).get("id") or "").strip().lower() == "duckmail":
+        return "duckmail"
     api_base = str((provider_config or {}).get("api_base") or "").strip().lower()
+    if "duckmail" in api_base:
+        return "duckmail"
     if (
         "/api/v1/" in api_base
         or "inbucket" in api_base
@@ -54,7 +61,16 @@ def _expand_domain_pattern(domain_pattern, local_part):
 
 
 def _load_mail_config():
-    global API_BASE, USERNAME, PASSWORD, EMAIL_DOMAIN, EMAIL_DOMAINS, EMAIL_PROVIDERS
+    global \
+        API_BASE, \
+        USERNAME, \
+        PASSWORD, \
+        DUCKMAIL_API_BASE, \
+        DUCKMAIL_BEARER, \
+        DUCKMAIL_DOMAINS, \
+        EMAIL_DOMAIN, \
+        EMAIL_DOMAINS, \
+        EMAIL_PROVIDERS
     base_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(base_dir, "config.json")
     if os.path.exists(config_path):
@@ -64,6 +80,12 @@ def _load_mail_config():
                 API_BASE = c.get("mail_api_base", API_BASE)
                 USERNAME = c.get("mail_username", USERNAME)
                 PASSWORD = c.get("mail_password", PASSWORD)
+                DUCKMAIL_API_BASE = c.get("duckmail_api_base", DUCKMAIL_API_BASE)
+                DUCKMAIL_BEARER = c.get("duckmail_api_key", DUCKMAIL_BEARER)
+                DUCKMAIL_DOMAINS = (
+                    _normalize_domain_list(c.get("duckmail_mail_domains"))
+                    or DUCKMAIL_DOMAINS
+                )
                 EMAIL_DOMAIN = c.get("mail_email_domain", EMAIL_DOMAIN)
                 configured_domains = _normalize_domain_list(c.get("mail_email_domains"))
                 EMAIL_DOMAINS = configured_domains or [EMAIL_DOMAIN]
@@ -88,6 +110,15 @@ _load_mail_config()
 API_BASE = str(os.environ.get("MAIL_API_BASE", API_BASE) or API_BASE).strip()
 USERNAME = str(os.environ.get("MAIL_USERNAME", USERNAME) or USERNAME).strip()
 PASSWORD = str(os.environ.get("MAIL_PASSWORD", PASSWORD) or PASSWORD)
+DUCKMAIL_API_BASE = str(
+    os.environ.get("DUCKMAIL_API_BASE", DUCKMAIL_API_BASE) or DUCKMAIL_API_BASE
+).strip()
+DUCKMAIL_BEARER = str(
+    os.environ.get("DUCKMAIL_BEARER", DUCKMAIL_BEARER) or DUCKMAIL_BEARER
+).strip()
+DUCKMAIL_DOMAINS = (
+    _normalize_domain_list(os.environ.get("DUCKMAIL_MAIL_DOMAINS")) or DUCKMAIL_DOMAINS
+)
 EMAIL_DOMAIN = (
     str(os.environ.get("MAIL_EMAIL_DOMAIN", EMAIL_DOMAIN) or EMAIL_DOMAIN)
     .strip()
@@ -114,12 +145,21 @@ EMAIL_PROVIDERS["inbucket"] = {
     "domains": EMAIL_DOMAINS,
     "mode": "inbucket",
 }
+EMAIL_PROVIDERS["duckmail"] = {
+    "id": "duckmail",
+    "label": "DuckMail",
+    "api_base": DUCKMAIL_API_BASE,
+    "domains": DUCKMAIL_DOMAINS,
+    "mode": "duckmail",
+    "api_key": DUCKMAIL_BEARER,
+}
 
 # 会话管理 — 异步安全
 _session_cookie: dict = {}
 _login_lock = asyncio.Lock()
 # 模块级持久 httpx 客户端（连接复用）
 _http_client: httpx.AsyncClient | None = None
+_duckmail_tokens: dict[str, str] = {}
 
 DIRECT_PROXIES = {"http": "", "https": ""}
 OTP_PRESTART_GRACE_SECONDS = 8.0
@@ -153,6 +193,7 @@ def _get_http_client() -> httpx.AsyncClient:
             verify=False,
             timeout=30.0,
             follow_redirects=True,
+            trust_env=False,
         )
     return _http_client
 
@@ -357,6 +398,52 @@ async def create_test_email(provider=None, domain=None):
         domain_value = _expand_domain_pattern(domain_value, random_name)
         email = f"{random_name}@{domain_value}"
 
+        if _provider_mode(provider_config) == "duckmail":
+            api_base = str(provider_config.get("api_base") or DUCKMAIL_API_BASE).rstrip(
+                "/"
+            )
+            api_key = str(provider_config.get("api_key") or DUCKMAIL_BEARER).strip()
+            if not api_base:
+                raise ValueError("DuckMail api_base is required")
+            if not api_key:
+                raise ValueError("DuckMail api key is required")
+
+            create_password = secrets.token_urlsafe(12)
+            client = _get_http_client()
+            create_resp = await client.post(
+                f"{api_base}/accounts",
+                json={
+                    "address": email,
+                    "password": create_password,
+                    "expiresIn": 86400,
+                },
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+            )
+            if create_resp.status_code not in (200, 201, 409):
+                raise ValueError(
+                    f"DuckMail create account failed ({create_resp.status_code})"
+                )
+            token_resp = await client.post(
+                f"{api_base}/token",
+                json={"address": email, "password": create_password},
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+            )
+            if token_resp.status_code != 200:
+                raise ValueError(f"DuckMail token failed ({token_resp.status_code})")
+            token_data = token_resp.json() if token_resp.content else {}
+            token = str((token_data or {}).get("token") or "").strip()
+            if not token:
+                raise ValueError("DuckMail token is empty")
+            _duckmail_tokens[email] = token
+            return email, email
+
         if _provider_mode(provider_config) == "inbucket":
             return email, email
 
@@ -375,7 +462,23 @@ async def create_test_email(provider=None, domain=None):
 async def list_mailbox_emails(mailbox) -> list:
     """获取邮箱列表，用于 snapshot 和过滤旧 OTP。"""
     try:
+        mailbox_key = str(mailbox or "").strip()
         client = _get_http_client()
+        duckmail_token = _duckmail_tokens.get(mailbox_key)
+        if duckmail_token:
+            resp = await client.get(
+                f"{DUCKMAIL_API_BASE.rstrip('/')}/messages",
+                headers={
+                    "Authorization": f"Bearer {duckmail_token}",
+                    "Accept": "application/json",
+                },
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            items = data.get("hydra:member") if isinstance(data, dict) else []
+            return items if isinstance(items, list) else []
+
         if "mailapizv.uton.me" in API_BASE or "/api/v1" in API_BASE:
             res = await client.get(
                 f"{API_BASE.rstrip('/')}/api/v1/mailbox/{mailbox}",
@@ -431,6 +534,21 @@ async def fetch_email_detail(email_id):
             mailbox, message_id = None, email_id
 
         client = _get_http_client()
+        mailbox_key = str(mailbox or "").strip()
+        duckmail_token = _duckmail_tokens.get(mailbox_key)
+        if duckmail_token:
+            detail_res = await client.get(
+                f"{DUCKMAIL_API_BASE.rstrip('/')}/messages/{message_id}",
+                headers={
+                    "Authorization": f"Bearer {duckmail_token}",
+                    "Accept": "application/json",
+                },
+            )
+            if detail_res.status_code != 200:
+                return None
+            detail = detail_res.json()
+            return detail if isinstance(detail, dict) else None
+
         if "mailapizv.uton.me" in API_BASE or "/api/v1" in API_BASE:
             if not mailbox:
                 return None
