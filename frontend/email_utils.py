@@ -10,10 +10,10 @@ import requests
 import json
 
 # 默认域名邮箱配置
-API_BASE = "REDACTED_BASE"
+API_BASE = ""
 USERNAME = ""
 PASSWORD = ""
-EMAIL_DOMAIN = "REDACTED_DOMAIN"
+EMAIL_DOMAIN = "example.com"
 EMAIL_DOMAINS = [EMAIL_DOMAIN]
 
 

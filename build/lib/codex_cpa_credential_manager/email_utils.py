@@ -1,4 +1,4 @@
-﻿import os
+import os
 import random
 import re
 import time
@@ -6,10 +6,12 @@ from typing import Optional
 
 import requests
 
-API_BASE = os.environ.get("MAIL_API_BASE", "REDACTED_BASE").strip()
+API_BASE = os.environ.get("MAIL_API_BASE", "").strip()
 USERNAME = os.environ.get("MAIL_USERNAME", "").strip()
 PASSWORD = os.environ.get("MAIL_PASSWORD", "").strip()
-EMAIL_DOMAIN = os.environ.get("MAIL_EMAIL_DOMAIN", "example.com").strip() or "example.com"
+EMAIL_DOMAIN = (
+    os.environ.get("MAIL_EMAIL_DOMAIN", "example.com").strip() or "example.com"
+)
 
 _session_cookie = None
 
@@ -39,8 +41,30 @@ def _login() -> bool:
 
 
 def generate_random_name() -> str:
-    first_names = ["john", "james", "robert", "michael", "david", "william", "mary", "patricia", "jennifer", "linda"]
-    last_names = ["smith", "johnson", "williams", "brown", "jones", "miller", "davis", "garcia", "wilson", "moore"]
+    first_names = [
+        "john",
+        "james",
+        "robert",
+        "michael",
+        "david",
+        "william",
+        "mary",
+        "patricia",
+        "jennifer",
+        "linda",
+    ]
+    last_names = [
+        "smith",
+        "johnson",
+        "williams",
+        "brown",
+        "jones",
+        "miller",
+        "davis",
+        "garcia",
+        "wilson",
+        "moore",
+    ]
     first_name = random.choice(first_names)
     last_name = random.choice(last_names)
     random_num = random.randint(100, 9999)
@@ -124,7 +148,9 @@ def extract_verification_code(content: str) -> Optional[str]:
     return None
 
 
-def fetch_verification_code(mailbox: str, max_wait: int = 60, interval: int = 1) -> Optional[str]:
+def fetch_verification_code(
+    mailbox: str, max_wait: int = 60, interval: int = 1
+) -> Optional[str]:
     for _ in range(max_wait):
         content = fetch_first_email(mailbox)
         code = extract_verification_code(content or "")
