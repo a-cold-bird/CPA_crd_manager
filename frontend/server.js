@@ -103,7 +103,58 @@ function normalizeMailProvider(value) {
   return 'mailfree';
 }
 
+function deriveActiveMailFields(config) {
+  const provider = normalizeMailProvider(config?.mail_email_provider || 'mailfree');
+  const pickFirstDomain = (domainsText, fallbackDomain = '') => {
+    const list = normalizeDomainListText(domainsText, fallbackDomain)
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    return list[0] || normalizeDomain(fallbackDomain);
+  };
+
+  if (provider === 'inbucket') {
+    const domainsText = normalizeDomainListText(config?.inbucket_mail_domains || '', config?.inbucket_mail_domain || '');
+    return {
+      ...config,
+      mail_api_base: normalizeCpaBaseUrl(config?.inbucket_mail_api_base || config?.mail_api_base || ''),
+      mail_username: String(config?.inbucket_mail_username ?? config?.mail_username ?? ''),
+      mail_password: String(config?.inbucket_mail_password ?? config?.mail_password ?? ''),
+      mail_email_domain: normalizeDomain(config?.inbucket_mail_domain || pickFirstDomain(domainsText)),
+      mail_email_domains: domainsText,
+    };
+  }
+
+  if (provider === 'duckmail') {
+    const domainsText = normalizeDomainListText(config?.duckmail_mail_domains || '', config?.duckmail_mail_domain || '');
+    return {
+      ...config,
+      mail_api_base: normalizeCpaBaseUrl(config?.duckmail_api_base || config?.mail_api_base || 'https://api.duckmail.sbs'),
+      mail_username: '',
+      mail_password: '',
+      mail_email_domain: normalizeDomain(config?.duckmail_mail_domain || pickFirstDomain(domainsText)),
+      mail_email_domains: domainsText,
+      duckmail_api_key: String(config?.duckmail_api_key || ''),
+    };
+  }
+
+  const mailfreeDomains = normalizeDomainListText(
+    config?.mailfree_mail_domains || config?.mail_email_domains || '',
+    config?.mailfree_mail_domain || config?.mail_email_domain || '',
+  );
+  return {
+    ...config,
+    mail_api_base: normalizeCpaBaseUrl(config?.mailfree_api_base || config?.mail_api_base || ''),
+    mail_username: String(config?.mailfree_username ?? config?.mail_username ?? ''),
+    mail_password: String(config?.mailfree_password ?? config?.mail_password ?? ''),
+    mail_email_domain: normalizeDomain(config?.mailfree_mail_domain || pickFirstDomain(mailfreeDomains)),
+    mail_email_domains: mailfreeDomains,
+  };
+}
+
 function readMailMeta(config = readConfig()) {
+  const mailfreeApiBase = normalizeCpaBaseUrl(config?.mailfree_api_base || config?.mail_api_base || '');
+  const mailfreeDomains = normalizeDomainListText(config?.mailfree_mail_domains || config?.mail_email_domains || '').split(',').map((item) => item.trim()).filter(Boolean);
   const inbucketApiBase = normalizeCpaBaseUrl(config?.inbucket_mail_api_base || config?.mail_api_base || '');
   const inbucketDomains = normalizeDomainListText(config?.inbucket_mail_domains || '').split(',').map((item) => item.trim()).filter(Boolean);
   const duckmailApiBase = normalizeCpaBaseUrl(config?.duckmail_api_base || 'https://api.duckmail.sbs');
@@ -114,6 +165,8 @@ function readMailMeta(config = readConfig()) {
       { value: 'inbucket', label: 'inbucket' },
       { value: 'duckmail', label: 'duckmail' },
     ],
+    mailfree_api_base: mailfreeApiBase,
+    mailfree_domains: mailfreeDomains,
     inbucket_api_base: inbucketApiBase,
     inbucket_domains: inbucketDomains,
     duckmail_api_base: duckmailApiBase,
@@ -131,11 +184,20 @@ function readConfig() {
     mail_username: '',
     mail_password: '',
     mail_email_domain: '',
-    mail_email_domains: '', // Added
+    mail_email_domains: '',
+    mailfree_api_base: '',
+    mailfree_username: '',
+    mailfree_password: '',
+    mailfree_mail_domain: '',
+    mailfree_mail_domains: '',
     inbucket_mail_api_base: '',
+    inbucket_mail_username: '',
+    inbucket_mail_password: '',
+    inbucket_mail_domain: '',
     inbucket_mail_domains: '',
     duckmail_api_base: 'https://api.duckmail.sbs',
     duckmail_api_key: '',
+    duckmail_mail_domain: '',
     duckmail_mail_domains: '',
     mail_randomize_from_list: true,
     codex_replenish_enabled: false, // Added
@@ -162,22 +224,34 @@ function readConfig() {
     }
     const normalizedTargetCount = resolveCodexReplenishTargetCount(parsed, 5);
     const normalizedMailEmailProvider = normalizeMailProvider(parsed.mail_email_provider || 'mailfree');
-    const normalizedMailEmailDomain = normalizeDomain(parsed.mail_email_domain || '');
-    const normalizedMailEmailDomains = normalizeDomainListText(parsed.mail_email_domains, normalizedMailEmailDomain);
+    const normalizedMailfreeDomain = normalizeDomain(parsed.mailfree_mail_domain || parsed.mail_email_domain || '');
+    const normalizedMailfreeDomains = normalizeDomainListText(
+      parsed.mailfree_mail_domains || parsed.mail_email_domains,
+      normalizedMailfreeDomain,
+    );
+    const normalizedInbucketDomain = normalizeDomain(parsed.inbucket_mail_domain || '');
     const normalizedInbucketMailApiBase = normalizeCpaBaseUrl(parsed.inbucket_mail_api_base || '');
-    const normalizedInbucketMailDomains = normalizeDomainListText(parsed.inbucket_mail_domains);
+    const normalizedInbucketMailDomains = normalizeDomainListText(parsed.inbucket_mail_domains, normalizedInbucketDomain);
+    const normalizedDuckmailDomain = normalizeDomain(parsed.duckmail_mail_domain || '');
     const normalizedDuckmailApiBase = normalizeCpaBaseUrl(parsed.duckmail_api_base || 'https://api.duckmail.sbs');
-    const normalizedDuckmailMailDomains = normalizeDomainListText(parsed.duckmail_mail_domains);
-    return {
+    const normalizedDuckmailMailDomains = normalizeDomainListText(parsed.duckmail_mail_domains, normalizedDuckmailDomain);
+    const normalizedConfig = {
       ...defaults,
       ...parsed,
       mail_email_provider: normalizedMailEmailProvider,
-      mail_email_domain: normalizedMailEmailDomain,
-      mail_email_domains: normalizedMailEmailDomains,
+      mailfree_api_base: normalizeCpaBaseUrl(parsed.mailfree_api_base || parsed.mail_api_base || ''),
+      mailfree_username: String(parsed.mailfree_username ?? parsed.mail_username ?? ''),
+      mailfree_password: String(parsed.mailfree_password ?? parsed.mail_password ?? ''),
+      mailfree_mail_domain: normalizedMailfreeDomain,
+      mailfree_mail_domains: normalizedMailfreeDomains,
       inbucket_mail_api_base: normalizedInbucketMailApiBase,
+      inbucket_mail_username: String(parsed.inbucket_mail_username ?? ''),
+      inbucket_mail_password: String(parsed.inbucket_mail_password ?? ''),
+      inbucket_mail_domain: normalizedInbucketDomain,
       inbucket_mail_domains: normalizedInbucketMailDomains,
       duckmail_api_base: normalizedDuckmailApiBase,
       duckmail_api_key: String(parsed.duckmail_api_key || ''),
+      duckmail_mail_domain: normalizedDuckmailDomain,
       duckmail_mail_domains: normalizedDuckmailMailDomains,
       mail_randomize_from_list: parseBoolSafe(parsed.mail_randomize_from_list, true),
       codex_replenish_enabled: parseBoolSafe(parsed.codex_replenish_enabled, false), // Added
@@ -189,6 +263,7 @@ function readConfig() {
       codex_replenish_use_proxy: parseBoolSafe(parsed.codex_replenish_use_proxy, false), // Added
       codex_replenish_proxy_pool: String(parsed.codex_replenish_proxy_pool || ''),
     };
+    return deriveActiveMailFields(normalizedConfig);
   } catch (e) {
     console.error('Failed to parse config.yaml', e);
     return defaults;
@@ -210,25 +285,80 @@ function writeConfig(data) {
   const normalizedBatchSize = normalizeCodexReplenishBatchSize(merged.codex_replenish_batch_size, 1);
   const normalizedWorkerCount = normalizeCodexReplenishWorkerCount(merged.codex_replenish_worker_count, 1);
   const normalizedMailEmailProvider = normalizeMailProvider(merged.mail_email_provider || 'mailfree');
-  const normalizedMailEmailDomain = normalizeDomain(merged.mail_email_domain || '');
-  const normalizedMailEmailDomains = normalizeDomainListText(merged.mail_email_domains, normalizedMailEmailDomain);
+  if (Object.prototype.hasOwnProperty.call(data, 'mail_api_base')) {
+    if (normalizedMailEmailProvider === 'inbucket') {
+      merged.inbucket_mail_api_base = data.mail_api_base;
+    } else if (normalizedMailEmailProvider === 'duckmail') {
+      merged.duckmail_api_base = data.mail_api_base;
+    } else {
+      merged.mailfree_api_base = data.mail_api_base;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'mail_username') && normalizedMailEmailProvider === 'mailfree') {
+    merged.mailfree_username = data.mail_username;
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'mail_username') && normalizedMailEmailProvider === 'inbucket') {
+    merged.inbucket_mail_username = data.mail_username;
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'mail_password') && normalizedMailEmailProvider === 'mailfree') {
+    merged.mailfree_password = data.mail_password;
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'mail_password') && normalizedMailEmailProvider === 'inbucket') {
+    merged.inbucket_mail_password = data.mail_password;
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'mail_email_domain')) {
+    if (normalizedMailEmailProvider === 'inbucket') {
+      merged.inbucket_mail_domain = data.mail_email_domain;
+    } else if (normalizedMailEmailProvider === 'duckmail') {
+      merged.duckmail_mail_domain = data.mail_email_domain;
+    } else {
+      merged.mailfree_mail_domain = data.mail_email_domain;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'mail_email_domains')) {
+    if (normalizedMailEmailProvider === 'inbucket') {
+      merged.inbucket_mail_domains = data.mail_email_domains;
+    } else if (normalizedMailEmailProvider === 'duckmail') {
+      merged.duckmail_mail_domains = data.mail_email_domains;
+    } else {
+      merged.mailfree_mail_domains = data.mail_email_domains;
+    }
+  }
+
+  const normalizedMailfreeDomain = normalizeDomain(merged.mailfree_mail_domain || merged.mail_email_domain || '');
+  const normalizedMailfreeDomains = normalizeDomainListText(merged.mailfree_mail_domains || merged.mail_email_domains, normalizedMailfreeDomain);
+  const normalizedInbucketDomain = normalizeDomain(merged.inbucket_mail_domain || '');
   const normalizedInbucketMailApiBase = normalizeCpaBaseUrl(merged.inbucket_mail_api_base || '');
-  const normalizedInbucketMailDomains = normalizeDomainListText(merged.inbucket_mail_domains);
+  const normalizedInbucketMailDomains = normalizeDomainListText(merged.inbucket_mail_domains, normalizedInbucketDomain);
+  const normalizedDuckmailDomain = normalizeDomain(merged.duckmail_mail_domain || '');
   const normalizedDuckmailApiBase = normalizeCpaBaseUrl(merged.duckmail_api_base || 'https://api.duckmail.sbs');
-  const normalizedDuckmailMailDomains = normalizeDomainListText(merged.duckmail_mail_domains);
+  const normalizedDuckmailMailDomains = normalizeDomainListText(merged.duckmail_mail_domains, normalizedDuckmailDomain);
   merged.codex_replenish_target_count = normalizedTargetCount;
   merged.codex_target_count = normalizedTargetCount;
   merged.codex_replenish_threshold = normalizedThreshold;
   merged.codex_replenish_batch_size = normalizedBatchSize;
   merged.codex_replenish_worker_count = normalizedWorkerCount;
   merged.mail_email_provider = normalizedMailEmailProvider;
-  merged.mail_email_domain = normalizedMailEmailDomain;
-  merged.mail_email_domains = normalizedMailEmailDomains;
+  merged.mailfree_api_base = normalizeCpaBaseUrl(merged.mailfree_api_base || merged.mail_api_base || '');
+  merged.mailfree_username = String(merged.mailfree_username ?? merged.mail_username ?? '');
+  merged.mailfree_password = String(merged.mailfree_password ?? merged.mail_password ?? '');
+  merged.mailfree_mail_domain = normalizedMailfreeDomain;
+  merged.mailfree_mail_domains = normalizedMailfreeDomains;
   merged.inbucket_mail_api_base = normalizedInbucketMailApiBase;
+  merged.inbucket_mail_username = String(merged.inbucket_mail_username ?? merged.mail_username ?? '');
+  merged.inbucket_mail_password = String(merged.inbucket_mail_password ?? merged.mail_password ?? '');
+  merged.inbucket_mail_domain = normalizedInbucketDomain;
   merged.inbucket_mail_domains = normalizedInbucketMailDomains;
   merged.duckmail_api_base = normalizedDuckmailApiBase;
   merged.duckmail_api_key = String(merged.duckmail_api_key || '');
+  merged.duckmail_mail_domain = normalizedDuckmailDomain;
   merged.duckmail_mail_domains = normalizedDuckmailMailDomains;
+  const derived = deriveActiveMailFields(merged);
+  merged.mail_api_base = derived.mail_api_base;
+  merged.mail_username = derived.mail_username;
+  merged.mail_password = derived.mail_password;
+  merged.mail_email_domain = derived.mail_email_domain;
+  merged.mail_email_domains = derived.mail_email_domains;
   const str = yaml.dump(merged);
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
   fs.writeFileSync(CONFIG_PATH, str, 'utf-8');
@@ -2278,15 +2408,24 @@ app.post('/api/config/update', (req, res) => {
         cpa_url: nextConfig.cpa_url !== undefined ? nextConfig.cpa_url : config.cpa_url,
         management_key: nextConfig.management_key !== undefined ? nextConfig.management_key : config.management_key,
         mail_email_provider: nextConfig.mail_email_provider !== undefined ? normalizeMailProvider(nextConfig.mail_email_provider) : config.mail_email_provider,
+        mailfree_api_base: nextConfig.mailfree_api_base !== undefined ? nextConfig.mailfree_api_base : config.mailfree_api_base,
+        mailfree_username: nextConfig.mailfree_username !== undefined ? nextConfig.mailfree_username : config.mailfree_username,
+        mailfree_password: nextConfig.mailfree_password !== undefined ? nextConfig.mailfree_password : config.mailfree_password,
+        mailfree_mail_domain: nextConfig.mailfree_mail_domain !== undefined ? nextConfig.mailfree_mail_domain : config.mailfree_mail_domain,
+        mailfree_mail_domains: nextConfig.mailfree_mail_domains !== undefined ? nextConfig.mailfree_mail_domains : config.mailfree_mail_domains,
         mail_api_base: nextConfig.mail_api_base !== undefined ? nextConfig.mail_api_base : config.mail_api_base,
         mail_username: nextConfig.mail_username !== undefined ? nextConfig.mail_username : config.mail_username,
         mail_password: nextConfig.mail_password !== undefined ? nextConfig.mail_password : config.mail_password,
         mail_email_domain: nextConfig.mail_email_domain !== undefined ? nextConfig.mail_email_domain : config.mail_email_domain,
         mail_email_domains: nextConfig.mail_email_domains !== undefined ? nextConfig.mail_email_domains : config.mail_email_domains,
         inbucket_mail_api_base: nextConfig.inbucket_mail_api_base !== undefined ? nextConfig.inbucket_mail_api_base : config.inbucket_mail_api_base,
+        inbucket_mail_username: nextConfig.inbucket_mail_username !== undefined ? nextConfig.inbucket_mail_username : config.inbucket_mail_username,
+        inbucket_mail_password: nextConfig.inbucket_mail_password !== undefined ? nextConfig.inbucket_mail_password : config.inbucket_mail_password,
+        inbucket_mail_domain: nextConfig.inbucket_mail_domain !== undefined ? nextConfig.inbucket_mail_domain : config.inbucket_mail_domain,
         inbucket_mail_domains: nextConfig.inbucket_mail_domains !== undefined ? nextConfig.inbucket_mail_domains : config.inbucket_mail_domains,
         duckmail_api_base: nextConfig.duckmail_api_base !== undefined ? nextConfig.duckmail_api_base : config.duckmail_api_base,
         duckmail_api_key: nextConfig.duckmail_api_key !== undefined ? nextConfig.duckmail_api_key : config.duckmail_api_key,
+        duckmail_mail_domain: nextConfig.duckmail_mail_domain !== undefined ? nextConfig.duckmail_mail_domain : config.duckmail_mail_domain,
         duckmail_mail_domains: nextConfig.duckmail_mail_domains !== undefined ? nextConfig.duckmail_mail_domains : config.duckmail_mail_domains,
         mail_randomize_from_list: nextConfig.mail_randomize_from_list !== undefined ? parseBoolSafe(nextConfig.mail_randomize_from_list, config.mail_randomize_from_list) : config.mail_randomize_from_list,
         codex_replenish_enabled: nextCodexReplenishEnabled,

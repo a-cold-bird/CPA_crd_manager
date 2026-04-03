@@ -905,7 +905,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
               </select>
               <p className="text-xs text-muted-foreground">
                 {mailEmailProvider === 'inbucket'
-                  ? text('Using the preconfigured Inbucket mail service and read-only domain list.', '当前使用预配置的 Inbucket 邮件服务和只读域名列表。')
+                  ? text('Using editable Inbucket API/credentials with configured domain list.', '当前使用可编辑的 Inbucket API/账号密码和域名列表。')
                   : mailEmailProvider === 'duckmail'
                     ? text('Using DuckMail API key based mailbox service.', '当前使用 DuckMail API Key 邮箱服务。')
                   : text('Using the editable mailfree configuration below.', '当前使用可编辑的 mailfree 配置。')}
@@ -913,17 +913,17 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Mail API Base', '邮件 API 地址')}</label>
-              <input type="url" value={mailApiBase} onChange={(e) => setMailApiBase(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="https://mail-api.example.com" disabled={mailEmailProvider !== 'mailfree'} />
-              {mailEmailProvider === 'inbucket' && inbucketApiBase && <p className="text-xs text-muted-foreground">{text('Loaded from Inbucket config', '读取自 Inbucket 配置')}: <code>{inbucketApiBase}</code></p>}
+              <input type="url" value={mailApiBase} onChange={(e) => setMailApiBase(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="https://mail-api.example.com" disabled={mailEmailProvider === 'duckmail'} />
+              {mailEmailProvider === 'inbucket' && inbucketApiBase && <p className="text-xs text-muted-foreground">{text('Current Inbucket default', '当前 Inbucket 默认值')}: <code>{inbucketApiBase}</code></p>}
               {mailEmailProvider === 'duckmail' && duckmailApiBase && <p className="text-xs text-muted-foreground">{text('Loaded from DuckMail config', '读取自 DuckMail 配置')}: <code>{duckmailApiBase}</code></p>}
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Mail Username', '邮箱用户名')}</label>
-              <input type="text" value={mailUsername} onChange={(e) => setMailUsername(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="admin" disabled={mailEmailProvider !== 'mailfree'} />
+              <input type="text" value={mailUsername} onChange={(e) => setMailUsername(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="admin" disabled={mailEmailProvider === 'duckmail'} />
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Mail Password', '邮箱密码')}</label>
-              <input type="password" value={mailPassword} onChange={(e) => setMailPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder={text('Mail service password', '邮箱服务密码')} disabled={mailEmailProvider !== 'mailfree'} />
+              <input type="password" value={mailPassword} onChange={(e) => setMailPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder={text('Mail service password', '邮箱服务密码')} disabled={mailEmailProvider === 'duckmail'} />
             </div>
             {mailEmailProvider === 'duckmail' && (
               <div className="grid gap-2">

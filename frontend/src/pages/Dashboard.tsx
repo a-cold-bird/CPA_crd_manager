@@ -79,14 +79,22 @@ export default function Dashboard() {
     const [cpaUrl, setCpaUrl] = useState('');
     const [newPassword, setNewPassword] = useState('');
     const [mailApiBase, setMailApiBase] = useState('');
+    const [mailfreeApiBase, setMailfreeApiBase] = useState('');
     const [inbucketApiBase, setInbucketApiBase] = useState('');
+    const [inbucketUsername, setInbucketUsername] = useState('');
+    const [inbucketPassword, setInbucketPassword] = useState('');
+    const [inbucketEmailDomain, setInbucketEmailDomain] = useState('');
     const [duckmailApiBase, setDuckmailApiBase] = useState('');
     const [duckmailApiKey, setDuckmailApiKey] = useState('');
     const [mailUsername, setMailUsername] = useState('');
+    const [mailfreeUsername, setMailfreeUsername] = useState('');
     const [mailPassword, setMailPassword] = useState('');
+    const [mailfreePassword, setMailfreePassword] = useState('');
     const [mailEmailProvider, setMailEmailProvider] = useState<'mailfree' | 'inbucket' | 'duckmail'>('mailfree');
     const [mailEmailDomain, setMailEmailDomain] = useState('');
+    const [mailfreeEmailDomain, setMailfreeEmailDomain] = useState('');
     const [mailEmailDomains, setMailEmailDomains] = useState('');
+    const [mailfreeEmailDomains, setMailfreeEmailDomains] = useState('');
     const [inbucketDomains, setInbucketDomains] = useState<string[]>([]);
     const [duckmailDomains, setDuckmailDomains] = useState<string[]>([]);
     const [mailRandomizeFromList, setMailRandomizeFromList] = useState(true);
@@ -105,6 +113,7 @@ export default function Dashboard() {
     const [settingsMessage, setSettingsMessage] = useState<SettingsMessage>({ type: '', text: '' });
     const autoProbeConfigLoadedRef = useRef(false);
     const autoProbeConfigSyncPrimedRef = useRef(false);
+    const previousMailProviderRef = useRef<'mailfree' | 'inbucket' | 'duckmail'>('mailfree');
 
     useEffect(() => {
         const key = localStorage.getItem('management_key');
@@ -134,13 +143,21 @@ export default function Dashboard() {
                         setMailEmailProvider(provider === 'inbucket' || provider === 'duckmail' ? provider : 'mailfree');
                     }
                     setMailApiBase(String(data.config.mail_api_base || ''));
+                    setMailfreeApiBase(String(data.config.mailfree_api_base || data.config.mail_api_base || ''));
                     setDuckmailApiBase(String(data.config.duckmail_api_base || data.mail_meta?.duckmail_api_base || ''));
                     setDuckmailApiKey(String(data.config.duckmail_api_key || ''));
                     setMailUsername(String(data.config.mail_username || ''));
+                    setMailfreeUsername(String(data.config.mailfree_username || data.config.mail_username || ''));
                     setMailPassword(String(data.config.mail_password || ''));
+                    setMailfreePassword(String(data.config.mailfree_password || data.config.mail_password || ''));
                     setMailEmailDomain(String(data.config.mail_email_domain || ''));
+                    setMailfreeEmailDomain(String(data.config.mailfree_mail_domain || data.config.mail_email_domain || ''));
                     setMailEmailDomains(String(data.config.mail_email_domains || ''));
+                    setMailfreeEmailDomains(String(data.config.mailfree_mail_domains || data.config.mail_email_domains || ''));
                     setInbucketApiBase(String(data.mail_meta?.inbucket_api_base || ''));
+                    setInbucketUsername(String(data.config.inbucket_mail_username || ''));
+                    setInbucketPassword(String(data.config.inbucket_mail_password || ''));
+                    setInbucketEmailDomain(String(data.config.inbucket_mail_domain || ''));
                     setInbucketDomains(Array.isArray(data.mail_meta?.inbucket_domains) ? data.mail_meta.inbucket_domains.map((item: unknown) => String(item || '').trim()).filter(Boolean) : []);
                     setDuckmailDomains(Array.isArray(data.mail_meta?.duckmail_domains) ? data.mail_meta.duckmail_domains.map((item: unknown) => String(item || '').trim()).filter(Boolean) : []);
                     setMailRandomizeFromList(parseConfigBoolean(data.config.mail_randomize_from_list, true));
@@ -182,13 +199,65 @@ export default function Dashboard() {
     }, [theme]);
 
     useEffect(() => {
-        if (mailEmailProvider === 'inbucket' && inbucketApiBase && mailApiBase !== inbucketApiBase) {
+        const previousProvider = previousMailProviderRef.current;
+        if (previousProvider === mailEmailProvider) return;
+
+        if (previousProvider === 'mailfree') {
+            setMailfreeApiBase(mailApiBase);
+            setMailfreeUsername(mailUsername);
+            setMailfreePassword(mailPassword);
+            setMailfreeEmailDomain(mailEmailDomain);
+            setMailfreeEmailDomains(mailEmailDomains);
+        } else if (previousProvider === 'inbucket') {
+            setInbucketApiBase(mailApiBase);
+            setInbucketUsername(mailUsername);
+            setInbucketPassword(mailPassword);
+            setInbucketEmailDomain(mailEmailDomain);
+        }
+
+        if (mailEmailProvider === 'mailfree') {
+            setMailApiBase(mailfreeApiBase);
+            setMailUsername(mailfreeUsername);
+            setMailPassword(mailfreePassword);
+            setMailEmailDomain(mailfreeEmailDomain);
+            setMailEmailDomains(mailfreeEmailDomains);
+        } else if (mailEmailProvider === 'inbucket') {
             setMailApiBase(inbucketApiBase);
-        }
-        if (mailEmailProvider === 'duckmail' && duckmailApiBase && mailApiBase !== duckmailApiBase) {
+            setMailUsername(inbucketUsername);
+            setMailPassword(inbucketPassword);
+            setMailEmailDomain(inbucketEmailDomain);
+            setMailEmailDomains(inbucketDomains.join(', '));
+        } else {
             setMailApiBase(duckmailApiBase);
+            setMailUsername('');
+            setMailPassword('');
+            if (duckmailDomains.length > 0) {
+                setMailEmailDomains(duckmailDomains.join(', '));
+                if (!duckmailDomains.includes(mailEmailDomain)) {
+                    setMailEmailDomain(duckmailDomains[0]);
+                }
+            }
         }
-    }, [duckmailApiBase, inbucketApiBase, mailApiBase, mailEmailProvider]);
+
+        previousMailProviderRef.current = mailEmailProvider;
+    }, [duckmailApiBase, duckmailDomains, inbucketApiBase, inbucketDomains, inbucketEmailDomain, inbucketPassword, inbucketUsername, mailApiBase, mailEmailDomain, mailEmailDomains, mailEmailProvider, mailPassword, mailUsername, mailfreeApiBase, mailfreeEmailDomain, mailfreeEmailDomains, mailfreePassword, mailfreeUsername]);
+
+    useEffect(() => {
+        if (mailEmailProvider !== 'mailfree') return;
+        setMailfreeApiBase(mailApiBase);
+        setMailfreeUsername(mailUsername);
+        setMailfreePassword(mailPassword);
+        setMailfreeEmailDomain(mailEmailDomain);
+        setMailfreeEmailDomains(mailEmailDomains);
+    }, [mailApiBase, mailEmailDomain, mailEmailDomains, mailEmailProvider, mailPassword, mailUsername]);
+
+    useEffect(() => {
+        if (mailEmailProvider !== 'inbucket') return;
+        setInbucketApiBase(mailApiBase);
+        setInbucketUsername(mailUsername);
+        setInbucketPassword(mailPassword);
+        setInbucketEmailDomain(mailEmailDomain);
+    }, [mailApiBase, mailEmailDomain, mailEmailProvider, mailPassword, mailUsername]);
 
     useEffect(() => {
         try {

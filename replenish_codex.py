@@ -65,12 +65,14 @@ def load_provider_domain_list(config: Dict[str, Any]) -> List[str]:
         if provider == "inbucket"
         else "duckmail_mail_domains"
         if provider == "duckmail"
-        else "mail_email_domains"
+        else "mailfree_mail_domains"
     )
     domain_source = config.get(domain_source_key, "")
     if provider == "inbucket" and not normalize_domain_list(domain_source):
         domain_source = config.get("mail_email_domains", "")
     if provider == "duckmail" and not normalize_domain_list(domain_source):
+        domain_source = config.get("mail_email_domains", "")
+    if provider == "mailfree" and not normalize_domain_list(domain_source):
         domain_source = config.get("mail_email_domains", "")
     configured_domains = normalize_domain_list(domain_source)
     default_domain = str(config.get("mail_email_domain", "") or "").strip().lower()
@@ -813,9 +815,24 @@ def get_local_backup_dir() -> str:
 
 def configure_internal_register_environment(config: Dict[str, Any]) -> None:
     configured_domains = load_provider_domain_list(config)
-    default_domain = str(config.get("mail_email_domain", "") or "").strip().lower()
     mail_provider = (
         str(config.get("mail_email_provider", "mailfree") or "mailfree").strip().lower()
+    )
+    provider_default_domain_key = (
+        "inbucket_mail_domain"
+        if mail_provider == "inbucket"
+        else "duckmail_mail_domain"
+        if mail_provider == "duckmail"
+        else "mailfree_mail_domain"
+    )
+    default_domain = (
+        str(
+            config.get(provider_default_domain_key, "")
+            or config.get("mail_email_domain", "")
+            or ""
+        )
+        .strip()
+        .lower()
     )
     if default_domain and default_domain not in configured_domains:
         configured_domains.insert(0, default_domain)
@@ -826,12 +843,27 @@ def configure_internal_register_environment(config: Dict[str, Any]) -> None:
             if mail_provider == "inbucket"
             else "duckmail_api_base"
             if mail_provider == "duckmail"
-            else "mail_api_base",
+            else "mailfree_api_base",
             "",
         )
         or config.get("mail_api_base", "")
         or ""
     ).strip()
+
+    provider_username = str(
+        config.get("mailfree_username", "")
+        if mail_provider == "mailfree"
+        else config.get("inbucket_mail_username", "")
+        if mail_provider == "inbucket"
+        else ""
+    ).strip()
+    provider_password = str(
+        config.get("mailfree_password", "")
+        if mail_provider == "mailfree"
+        else config.get("inbucket_mail_password", "")
+        if mail_provider == "inbucket"
+        else ""
+    )
 
     env_updates = {
         "MAIL_EMAIL_PROVIDER": mail_provider,
@@ -839,8 +871,8 @@ def configure_internal_register_environment(config: Dict[str, Any]) -> None:
         "DUCKMAIL_API_BASE": provider_api_base,
         "DUCKMAIL_BEARER": str(config.get("duckmail_api_key", "") or "").strip(),
         "DUCKMAIL_MAIL_DOMAINS": ",".join(configured_domains),
-        "MAIL_USERNAME": str(config.get("mail_username", "") or "").strip(),
-        "MAIL_PASSWORD": str(config.get("mail_password", "") or ""),
+        "MAIL_USERNAME": provider_username,
+        "MAIL_PASSWORD": provider_password,
         "MAIL_EMAIL_DOMAIN": default_domain,
         "EMAIL_DOMAINS": ",".join(configured_domains),
         "TOKEN_JSON_DIR": get_register_token_dir(),
