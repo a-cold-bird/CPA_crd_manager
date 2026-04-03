@@ -12,9 +12,10 @@ import json
 # 默认域名邮箱配置
 API_BASE = "REDACTED_BASE"
 USERNAME = ""
-PASSWORD = "REDACTED"
+PASSWORD = ""
 EMAIL_DOMAIN = "REDACTED_DOMAIN"
 EMAIL_DOMAINS = [EMAIL_DOMAIN]
+
 
 def _normalize_domain_list(value):
     if isinstance(value, (list, tuple, set)):
@@ -27,6 +28,7 @@ def _normalize_domain_list(value):
         if domain and domain not in domains:
             domains.append(domain)
     return domains
+
 
 def _load_mail_config():
     global API_BASE, USERNAME, PASSWORD, EMAIL_DOMAIN, EMAIL_DOMAINS, EMAIL_PROVIDERS
@@ -41,17 +43,28 @@ def _load_mail_config():
                 PASSWORD = c.get("mail_password", PASSWORD)
                 EMAIL_DOMAIN = c.get("mail_email_domain", EMAIL_DOMAIN)
                 configured_domains = _normalize_domain_list(c.get("mail_email_domains"))
-                EMAIL_DOMAINS = configured_domains or [str(EMAIL_DOMAIN or "").strip().lower()]
+                EMAIL_DOMAINS = configured_domains or [
+                    str(EMAIL_DOMAIN or "").strip().lower()
+                ]
         except Exception as e:
             print(f"Failed to load mail config from config.json: {e}")
+
 
 _load_mail_config()
 
 API_BASE = str(os.environ.get("MAIL_API_BASE", API_BASE) or API_BASE).strip()
 USERNAME = str(os.environ.get("MAIL_USERNAME", USERNAME) or USERNAME).strip()
 PASSWORD = str(os.environ.get("MAIL_PASSWORD", PASSWORD) or PASSWORD)
-EMAIL_DOMAIN = str(os.environ.get("MAIL_EMAIL_DOMAIN", EMAIL_DOMAIN) or EMAIL_DOMAIN).strip().lower()
-EMAIL_DOMAINS = _normalize_domain_list(os.environ.get("EMAIL_DOMAINS")) or EMAIL_DOMAINS or [EMAIL_DOMAIN]
+EMAIL_DOMAIN = (
+    str(os.environ.get("MAIL_EMAIL_DOMAIN", EMAIL_DOMAIN) or EMAIL_DOMAIN)
+    .strip()
+    .lower()
+)
+EMAIL_DOMAINS = (
+    _normalize_domain_list(os.environ.get("EMAIL_DOMAINS"))
+    or EMAIL_DOMAINS
+    or [EMAIL_DOMAIN]
+)
 if EMAIL_DOMAIN and EMAIL_DOMAIN not in EMAIL_DOMAINS:
     EMAIL_DOMAINS.insert(0, EMAIL_DOMAIN)
 DEFAULT_EMAIL_PROVIDER = "mailfree"
@@ -96,6 +109,7 @@ def _http_session():
     session.proxies.update(DIRECT_PROXIES)
     return session
 
+
 def _login():
     """登录获取 session cookie"""
     global _session_cookie
@@ -106,12 +120,9 @@ def _login():
         with _http_session() as session:
             res = session.post(
                 f"{API_BASE}/api/login",
-                json={
-                    "username": USERNAME,
-                    "password": PASSWORD
-                },
+                json={"username": USERNAME, "password": PASSWORD},
                 headers={"Content-Type": "application/json"},
-                verify=False
+                verify=False,
             )
         if res.status_code == 200:
             # 从响应中获取 cookie
@@ -159,7 +170,12 @@ def _coerce_timestamp(value):
     except ValueError:
         pass
 
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M",
+    ):
         try:
             # Mail API currently returns naive UTC strings like "2026-03-17 20:35:56".
             return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp()
@@ -184,8 +200,17 @@ def _build_email_content(detail):
         return ""
     return " ".join(
         str(detail.get(key) or "")
-        for key in ("subject", "verification_code", "text", "preview", "html", "html_content", "content")
+        for key in (
+            "subject",
+            "verification_code",
+            "text",
+            "preview",
+            "html",
+            "html_content",
+            "content",
+        )
     )
+
 
 def _to_base36(value):
     alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -198,17 +223,41 @@ def _to_base36(value):
         chars.append(alphabet[remainder])
     return "".join(reversed(chars))
 
+
 def generate_random_name():
     """生成随机邮箱名称 (格式: 首字母+姓氏+数字)"""
-    first_names = ['john', 'james', 'robert', 'michael', 'david', 'william', 'mary', 'patricia', 'jennifer', 'linda']
-    last_names = ['smith', 'johnson', 'williams', 'brown', 'jones', 'miller', 'davis', 'garcia', 'wilson', 'moore']
+    first_names = [
+        "john",
+        "james",
+        "robert",
+        "michael",
+        "david",
+        "william",
+        "mary",
+        "patricia",
+        "jennifer",
+        "linda",
+    ]
+    last_names = [
+        "smith",
+        "johnson",
+        "williams",
+        "brown",
+        "jones",
+        "miller",
+        "davis",
+        "garcia",
+        "wilson",
+        "moore",
+    ]
 
     first_name = random.choice(first_names)
     last_name = random.choice(last_names)[:4]
     time_part = _to_base36(int(time.time() * 1000))[-8:]
-    random_part = _to_base36(secrets.randbelow(36 ** 3)).zfill(3)
+    random_part = _to_base36(secrets.randbelow(36**3)).zfill(3)
 
     return f"{first_name[0]}{last_name}{time_part}{random_part}"
+
 
 def get_email_provider_options():
     return [
@@ -230,10 +279,18 @@ def create_test_email(provider=None, domain=None):
         provider_config = EMAIL_PROVIDERS.get(provider_id)
         if not provider_config:
             raise ValueError(f"Unsupported email provider: {provider}")
-        allowed_domains = {str(item).strip().lower() for item in provider_config.get("domains") or []}
-        domain_value = str(domain or provider_config.get("domains", [EMAIL_DOMAIN])[0]).strip().lower()
+        allowed_domains = {
+            str(item).strip().lower() for item in provider_config.get("domains") or []
+        }
+        domain_value = (
+            str(domain or provider_config.get("domains", [EMAIL_DOMAIN])[0])
+            .strip()
+            .lower()
+        )
         if domain_value not in allowed_domains:
-            raise ValueError(f"Unsupported email domain for {provider_id}: {domain_value}")
+            raise ValueError(
+                f"Unsupported email domain for {provider_id}: {domain_value}"
+            )
         random_name = generate_random_name()
         email = f"{random_name}@{domain_value}"
 
@@ -248,6 +305,7 @@ def create_test_email(provider=None, domain=None):
     except Exception as e:
         print(f"创建邮箱失败: {e}")
         return None, None
+
 
 def list_mailbox_emails(mailbox):
     """获取邮箱列表，用于 snapshot 和过滤旧 OTP。"""
@@ -358,11 +416,26 @@ def extract_verification_code(content):
 
 
 import urllib3
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def fetch_verification_code(mailbox, max_wait=60, interval=1, known_email_ids=None, exclude_codes=None, min_received_at=None, min_email_id=None, log_fn=None):
+
+def fetch_verification_code(
+    mailbox,
+    max_wait=60,
+    interval=1,
+    known_email_ids=None,
+    exclude_codes=None,
+    min_received_at=None,
+    min_email_id=None,
+    log_fn=None,
+):
     """轮询邮箱获取验证码，只接受本次登录之后的新邮件。"""
-    tracked_ids = known_email_ids if isinstance(known_email_ids, set) else set(known_email_ids or [])
+    tracked_ids = (
+        known_email_ids
+        if isinstance(known_email_ids, set)
+        else set(known_email_ids or [])
+    )
     excluded_codes = set(exclude_codes or [])
     deadline = time.time() + max_wait
     baseline_email_id = _coerce_email_id(min_email_id)
@@ -380,9 +453,15 @@ def fetch_verification_code(mailbox, max_wait=60, interval=1, known_email_ids=No
             if not email_id or email_id in tracked_ids:
                 continue
             numeric_email_id = _coerce_email_id(email_id)
-            if baseline_email_id is not None and numeric_email_id is not None and numeric_email_id <= baseline_email_id:
+            if (
+                baseline_email_id is not None
+                and numeric_email_id is not None
+                and numeric_email_id <= baseline_email_id
+            ):
                 tracked_ids.add(email_id)
-                emit(f"[OTP] 跳过旧邮件 {email_id} baseline_email_id={baseline_email_id}")
+                emit(
+                    f"[OTP] 跳过旧邮件 {email_id} baseline_email_id={baseline_email_id}"
+                )
                 continue
 
             detail = fetch_email_detail(email_id)
@@ -397,8 +476,7 @@ def fetch_verification_code(mailbox, max_wait=60, interval=1, known_email_ids=No
             if (
                 not tracked_ids
                 and baseline_email_id is None
-                and
-                min_received_at is not None
+                and min_received_at is not None
                 and received_at is not None
                 and received_at < (float(min_received_at) - OTP_PRESTART_GRACE_SECONDS)
             ):
@@ -408,7 +486,9 @@ def fetch_verification_code(mailbox, max_wait=60, interval=1, known_email_ids=No
 
             code = extract_verification_code(_build_email_content(payload))
             if not code:
-                emit(f"[OTP] 新邮件 {email_id} 详情已就绪，但尚未解析到验证码，继续重试")
+                emit(
+                    f"[OTP] 新邮件 {email_id} 详情已就绪，但尚未解析到验证码，继续重试"
+                )
                 continue
             tracked_ids.add(email_id)
             if code in excluded_codes:

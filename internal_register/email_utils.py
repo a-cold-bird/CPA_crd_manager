@@ -13,7 +13,7 @@ import json
 # 默认域名邮箱配置
 API_BASE = "REDACTED_BASE"
 USERNAME = ""
-PASSWORD = "REDACTED"
+PASSWORD = ""
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 DUCKMAIL_BEARER = ""
 DUCKMAIL_DOMAINS = ["duckmail.sbs"]
