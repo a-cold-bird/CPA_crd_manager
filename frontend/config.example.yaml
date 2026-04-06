@@ -1,5 +1,6 @@
 ﻿cpa_url: http://127.0.0.1:8317
-management_key: sk-39c5bb
+management_key: CHANGE_ME
+# mailfree | inbucket | inbucket_ice | duckmail
 mail_email_provider: mailfree
 mail_api_base: https://mailfree.example.workers.dev
 mail_username: admin
@@ -16,6 +17,21 @@ inbucket_mail_username: admin
 inbucket_mail_password: CHANGE_ME
 inbucket_mail_domain: example.inbucket.local
 inbucket_mail_domains: "example.inbucket.local,*.mail.example.inbucket.local"
+inbucket_mail_disabled_domains: ""
+
+# Optional second inbucket profile (ICE/fixed interface)
+# NOTE: inbucket_ice interface fields are fixed by backend and should not be edited via UI.
+inbucket_ice_mail_api_base: https://mailapizv.uton.me
+inbucket_ice_mail_username: ""
+inbucket_ice_mail_password: linuxdo
+inbucket_ice_mail_domain: example-v1.inbucket.local
+inbucket_ice_mail_domains: "example-v1.inbucket.local,*.mail-v1.example.inbucket.local"
+
+# Example custom inbucket with BasicAuth and full mailbox naming
+# inbucket_mail_api_base: http://mail.39c5bb.me
+# inbucket_mail_username: inbucket
+# inbucket_mail_password: admin
+# inbucket_mail_domains: "tokawa-sakiko.xyz,*.cbmu.tokawa-sakiko.xyz,quvpa.com,*.cbmu.quvpa.com"
 duckmail_api_base: https://api.duckmail.sbs
 duckmail_api_key: dk_xxx_replace_me
 duckmail_mail_domain: duckmail.sbs

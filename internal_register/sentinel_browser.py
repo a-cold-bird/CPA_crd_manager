@@ -65,6 +65,7 @@ def prepare_sentinel_browser_runtime(headless=True):
 def get_sentinel_token_via_browser(
     flow="username_password_create",
     user_agent=None,
+    accept_language=None,
     proxy=None,
     timeout_ms=45000,
     frame_url=None,
@@ -86,6 +87,8 @@ def get_sentinel_token_via_browser(
         or "https://sentinel.openai.com/backend-api/sentinel/frame.html"
     )
     proxy_value = str(proxy or "").strip()
+    accept_language_value = str(accept_language or "en-US,en;q=0.9").strip()
+    locale = accept_language_value.split(",", 1)[0].split(";", 1)[0].strip() or "en-US"
     sdk_timeout_ms = max(10_000, min(int(timeout_ms) - 5_000, 30_000))
 
     context = None
@@ -94,13 +97,14 @@ def get_sentinel_token_via_browser(
         context_kwargs = {
             "viewport": {"width": 1920, "height": 1080},
             "user_agent": ua,
-            "locale": "en-US",
+            "locale": locale,
             "ignore_https_errors": True,
         }
         if proxy_value:
             context_kwargs["proxy"] = {"server": proxy_value}
 
         context = runtime["browser"].new_context(**context_kwargs)
+        context.set_extra_http_headers({"Accept-Language": accept_language_value})
         page = context.new_page()
         page.goto(target_frame_url, wait_until="domcontentloaded", timeout=timeout_ms)
         page.wait_for_function(

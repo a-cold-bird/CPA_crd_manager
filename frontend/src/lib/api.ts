@@ -432,7 +432,7 @@ export const runRemotePushTest = async (payload?: {
 };
 
 export const runMailDomainTest = async (payload: {
-  mail_email_provider?: 'mailfree' | 'inbucket' | 'duckmail';
+  mail_email_provider?: 'mailfree' | 'inbucket' | 'inbucket_ice' | 'duckmail';
   domain: string;
   mail_api_base?: string;
   mail_username?: string;

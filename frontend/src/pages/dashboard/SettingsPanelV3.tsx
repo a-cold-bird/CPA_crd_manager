@@ -39,8 +39,8 @@ interface SettingsPanelProps {
   setMailUsername: Dispatch<SetStateAction<string>>;
   mailPassword: string;
   setMailPassword: Dispatch<SetStateAction<string>>;
-  mailEmailProvider: 'mailfree' | 'inbucket' | 'duckmail';
-  setMailEmailProvider: Dispatch<SetStateAction<'mailfree' | 'inbucket' | 'duckmail'>>;
+  mailEmailProvider: 'mailfree' | 'inbucket' | 'inbucket_ice' | 'duckmail';
+  setMailEmailProvider: Dispatch<SetStateAction<'mailfree' | 'inbucket' | 'inbucket_ice' | 'duckmail'>>;
   inbucketApiBase: string;
   duckmailApiBase: string;
   duckmailApiKey: string;
@@ -50,6 +50,10 @@ interface SettingsPanelProps {
   mailEmailDomains: string;
   setMailEmailDomains: Dispatch<SetStateAction<string>>;
   inbucketDomains: string[];
+  inbucketIceDomains: string[];
+  setInbucketDomains: Dispatch<SetStateAction<string[]>>;
+  inbucketDisabledDomains: string[];
+  setInbucketDisabledDomains: Dispatch<SetStateAction<string[]>>;
   duckmailDomains: string[];
   mailRandomizeFromList: boolean;
   setMailRandomizeFromList: Dispatch<SetStateAction<boolean>>;
@@ -74,9 +78,16 @@ interface SettingsPanelProps {
 }
 
 const DOMAIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+const WILDCARD_DOMAIN_PATTERN = /^\*\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
 
 function normalizeDomain(input: string): string {
   return input.trim().toLowerCase().replace(/^@+/, '');
+}
+
+function isValidDomainInput(input: string): boolean {
+  const normalized = normalizeDomain(input);
+  if (!normalized) return false;
+  return DOMAIN_PATTERN.test(normalized) || WILDCARD_DOMAIN_PATTERN.test(normalized);
 }
 
 function parseDomainList(input: string): string[] {
@@ -535,6 +546,10 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
     mailEmailDomains,
     setMailEmailDomains,
     inbucketDomains,
+    inbucketIceDomains,
+    setInbucketDomains,
+    inbucketDisabledDomains,
+    setInbucketDisabledDomains,
     duckmailApiBase,
     duckmailApiKey,
     setDuckmailApiKey,
@@ -577,11 +592,21 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
   const [stoppingReplenishment, setStoppingReplenishment] = useState(false);
 
   const inbucketDomainOptions = useMemo(() => {
-    const parsed = Array.from(new Set((inbucketDomains || []).map((item) => normalizeDomain(String(item || ''))).filter(Boolean)));
+    const sourceDomains = mailEmailProvider === 'inbucket'
+      ? parseDomainList(mailEmailDomains)
+      : mailEmailProvider === 'inbucket_ice'
+        ? inbucketIceDomains
+        : inbucketDomains;
+    const parsed = Array.from(new Set((sourceDomains || []).map((item) => normalizeDomain(String(item || ''))).filter(Boolean)));
     const current = normalizeDomain(mailEmailDomain);
-    if (mailEmailProvider === 'inbucket' && current && !parsed.includes(current)) parsed.unshift(current);
+    if ((mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice') && current && !parsed.includes(current)) parsed.unshift(current);
     return parsed;
-  }, [inbucketDomains, mailEmailDomain, mailEmailProvider]);
+  }, [inbucketDomains, inbucketIceDomains, mailEmailDomain, mailEmailDomains, mailEmailProvider]);
+
+  const inbucketDisabledSet = useMemo(
+    () => new Set((inbucketDisabledDomains || []).map((item) => normalizeDomain(String(item || ''))).filter(Boolean)),
+    [inbucketDisabledDomains],
+  );
 
   const duckmailDomainOptions = useMemo(() => {
     const parsed = Array.from(new Set((duckmailDomains || []).map((item) => normalizeDomain(String(item || ''))).filter(Boolean)));
@@ -597,11 +622,16 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
     return parsed;
   }, [mailEmailDomain, mailEmailDomains, mailEmailProvider]);
 
-  const emailDomainOptions = mailEmailProvider === 'inbucket'
+  const emailDomainOptions = (mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice')
     ? inbucketDomainOptions
     : mailEmailProvider === 'duckmail'
       ? duckmailDomainOptions
       : mailfreeDomainOptions;
+
+  const selectableDomainOptions = useMemo(
+    () => (mailEmailProvider === 'inbucket' ? emailDomainOptions.filter((domain) => !inbucketDisabledSet.has(domain)) : emailDomainOptions),
+    [emailDomainOptions, inbucketDisabledSet, mailEmailProvider],
+  );
 
   const effectiveTargetCount = normalizeNonNegativeInteger(codexReplenishTargetCount, 0);
   const effectiveThreshold = normalizeReplenishThreshold(codexReplenishThreshold, effectiveTargetCount, 0);
@@ -642,11 +672,11 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
 
   useEffect(() => {
     const normalized = normalizeDomain(mailEmailDomain);
-    if (emailDomainOptions.length === 0) return;
-    if (!normalized || !emailDomainOptions.includes(normalized)) {
-      setMailEmailDomain(emailDomainOptions[0] || '');
+    if (selectableDomainOptions.length === 0) return;
+    if (!normalized || !selectableDomainOptions.includes(normalized)) {
+      setMailEmailDomain(selectableDomainOptions[0] || '');
     }
-  }, [emailDomainOptions, mailEmailDomain, setMailEmailDomain]);
+  }, [mailEmailDomain, selectableDomainOptions, setMailEmailDomain]);
 
   const loadRuntimeStatus = async (silent = false) => {
     if (!silent) setRuntimeStatusLoading(true);
@@ -676,6 +706,10 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
   const commitDomains = (domains: string[]) => {
     const nextDomains = parseDomainList(stringifyDomainList(domains));
     setMailEmailDomains(stringifyDomainList(nextDomains));
+    if (mailEmailProvider === 'inbucket') {
+      setInbucketDomains(nextDomains);
+      setInbucketDisabledDomains((prev) => prev.filter((domain) => nextDomains.includes(normalizeDomain(domain))));
+    }
     if (mailEmailDomain && !nextDomains.includes(normalizeDomain(mailEmailDomain))) {
       setMailEmailDomain(nextDomains[0] || '');
     }
@@ -694,7 +728,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
       setDomainEditorError(text('Please enter a domain first.', '请先输入域名。'));
       return;
     }
-    if (!DOMAIN_PATTERN.test(normalized)) {
+    if (!isValidDomainInput(normalized)) {
       setDomainEditorError(text(`Invalid domain: ${normalized}`, `域名格式无效: ${normalized}`));
       return;
     }
@@ -711,6 +745,20 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
   const handleRemoveDomain = (domain: string) => {
     commitDomains(emailDomainOptions.filter((item) => item !== domain));
     setDomainEditorError('');
+  };
+
+  const handleToggleDomainDisabled = (domain: string) => {
+    if (mailEmailProvider !== 'inbucket') return;
+    const normalized = normalizeDomain(domain);
+    const nextDisabled = inbucketDisabledSet.has(normalized)
+      ? inbucketDisabledDomains.filter((item) => normalizeDomain(item) !== normalized)
+      : [...inbucketDisabledDomains, normalized];
+    const deduped = Array.from(new Set(nextDisabled.map((item) => normalizeDomain(item)).filter(Boolean)));
+    setInbucketDisabledDomains(deduped);
+    if (normalizeDomain(mailEmailDomain) === normalized) {
+      const fallback = emailDomainOptions.find((item) => normalizeDomain(item) !== normalized && !deduped.includes(normalizeDomain(item))) || '';
+      setMailEmailDomain(fallback);
+    }
   };
 
   const handleMailDomainTest = async (domain: string) => {
@@ -825,6 +873,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
           duckmail_mail_domains: duckmailDomains.join(', '),
           mail_email_domain: mailEmailDomain,
           mail_email_domains: mailEmailDomains,
+          inbucket_mail_disabled_domains: inbucketDisabledDomains.join(', '),
           mail_randomize_from_list: mailRandomizeFromList,
           codex_replenish_enabled: codexReplenishEnabled,
           codex_replenish_target_count: effectiveTargetCount,
@@ -895,17 +944,20 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
                 value={mailEmailProvider}
                 onChange={(e) => {
                   const value = String(e.target.value || '').trim().toLowerCase();
-                  setMailEmailProvider(value === 'inbucket' || value === 'duckmail' ? value : 'mailfree');
+                  setMailEmailProvider(value === 'inbucket' || value === 'inbucket_ice' || value === 'duckmail' ? value : 'mailfree');
                 }}
                 className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm"
               >
                 <option value="mailfree">mailfree</option>
                 <option value="inbucket">inbucket</option>
+                <option value="inbucket_ice">inbucket_ice</option>
                 <option value="duckmail">duckmail</option>
               </select>
               <p className="text-xs text-muted-foreground">
-                {mailEmailProvider === 'inbucket'
-                  ? text('Using editable Inbucket API/credentials with configured domain list.', '当前使用可编辑的 Inbucket API/账号密码和域名列表。')
+                {mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice'
+                  ? mailEmailProvider === 'inbucket_ice'
+                    ? text('Using fixed inbucket_ice API/credentials (locked), only domain list is editable.', '当前使用固定的 inbucket_ice 接口与凭据（已锁定），仅域名列表可编辑。')
+                    : text('Using editable Inbucket API/credentials with configured domain list.', '当前使用可编辑的 Inbucket API/账号密码和域名列表。')
                   : mailEmailProvider === 'duckmail'
                     ? text('Using DuckMail API key based mailbox service.', '当前使用 DuckMail API Key 邮箱服务。')
                   : text('Using the editable mailfree configuration below.', '当前使用可编辑的 mailfree 配置。')}
@@ -913,17 +965,18 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Mail API Base', '邮件 API 地址')}</label>
-              <input type="url" value={mailApiBase} onChange={(e) => setMailApiBase(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="https://mail-api.example.com" disabled={mailEmailProvider === 'duckmail'} />
-              {mailEmailProvider === 'inbucket' && inbucketApiBase && <p className="text-xs text-muted-foreground">{text('Current Inbucket default', '当前 Inbucket 默认值')}: <code>{inbucketApiBase}</code></p>}
+              <input type="url" value={mailApiBase} onChange={(e) => setMailApiBase(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="https://mail-api.example.com" disabled={mailEmailProvider === 'duckmail' || mailEmailProvider === 'inbucket_ice'} />
+              {(mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice') && inbucketApiBase && <p className="text-xs text-muted-foreground">{text('Current Inbucket default', '当前 Inbucket 默认值')}: <code>{inbucketApiBase}</code></p>}
+              {mailEmailProvider === 'inbucket_ice' && <p className="text-xs text-muted-foreground">{text('inbucket_ice API endpoint is fixed and cannot be changed in UI.', 'inbucket_ice 接口地址为固定值，不能在界面中修改。')}</p>}
               {mailEmailProvider === 'duckmail' && duckmailApiBase && <p className="text-xs text-muted-foreground">{text('Loaded from DuckMail config', '读取自 DuckMail 配置')}: <code>{duckmailApiBase}</code></p>}
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Mail Username', '邮箱用户名')}</label>
-              <input type="text" value={mailUsername} onChange={(e) => setMailUsername(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="admin" disabled={mailEmailProvider === 'duckmail'} />
+              <input type="text" value={mailUsername} onChange={(e) => setMailUsername(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="admin" disabled={mailEmailProvider === 'duckmail' || mailEmailProvider === 'inbucket_ice'} />
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium">{text('Mail Password', '邮箱密码')}</label>
-              <input type="password" value={mailPassword} onChange={(e) => setMailPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder={text('Mail service password', '邮箱服务密码')} disabled={mailEmailProvider === 'duckmail'} />
+              <input type="password" value={mailPassword} onChange={(e) => setMailPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder={text('Mail service password', '邮箱服务密码')} disabled={mailEmailProvider === 'duckmail' || mailEmailProvider === 'inbucket_ice'} />
             </div>
             {mailEmailProvider === 'duckmail' && (
               <div className="grid gap-2">
@@ -938,14 +991,16 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
           <div className="space-y-1">
             <h3 className="text-base font-semibold">{text('Mail Domains', '邮箱域名')}</h3>
             <p className="text-xs text-muted-foreground">
-              {mailEmailProvider === 'inbucket'
-                ? text('Read-only domains loaded from the configured Inbucket source.', '只读展示当前 Inbucket 配置源里的域名列表。')
+                {(mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice')
+                  ? mailEmailProvider === 'inbucket'
+                    ? text('Manage inbucket domains: add, remove, and disable domains.', '可管理 inbucket 域名：支持新增、移除和禁用。')
+                    : text('Read-only domains loaded from the configured Inbucket source.', '只读展示当前 Inbucket 配置源里的域名列表。')
                 : mailEmailProvider === 'duckmail'
                   ? text('Read-only domains loaded from the configured DuckMail source.', '只读展示当前 DuckMail 配置源里的域名列表。')
                 : text('Maintain the allowed email domain list for registration.', '维护注册时可用的邮箱域名列表。')}
             </p>
           </div>
-          {mailEmailProvider === 'mailfree' && (
+          {(mailEmailProvider === 'mailfree' || mailEmailProvider === 'inbucket') && (
             <div className="flex flex-col gap-3 md:flex-row">
               <input type="text" value={domainDraft} onChange={(e) => setDomainDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleAddDomain(); } }} className="flex h-10 flex-1 rounded-md border border-input bg-background/50 px-3 py-2 text-sm" placeholder="example.com" />
               <button type="button" onClick={handleAddDomain} className="inline-flex h-10 items-center justify-center rounded-md border border-border bg-background px-4 py-2 text-sm font-medium hover:bg-muted">{text('Add Domain', '添加域名')}</button>
@@ -968,6 +1023,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-medium">{domain}</span>
                         {domain === normalizeDomain(mailEmailDomain) && <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">{text('Default', '默认')}</span>}
+                        {mailEmailProvider === 'inbucket' && inbucketDisabledSet.has(domain) && <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-700 dark:text-amber-300">{text('Disabled', '已禁用')}</span>}
                         <span className="rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-[11px] text-sky-700 dark:text-sky-300">
                           {text('Total', '总次数')}: {stat?.total ?? 0}
                         </span>
@@ -982,12 +1038,13 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
                         </span>
                       </div>
                       {testState?.message && <p className={`text-xs ${testState.status === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}>{testState.message}</p>}
-                      {(mailEmailProvider === 'inbucket' || mailEmailProvider === 'duckmail') && <p className="text-xs text-muted-foreground">{text('Example mailbox', '示例邮箱')}: <code>{toSampleMailbox(domain)}</code></p>}
+                      {(mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice' || mailEmailProvider === 'duckmail') && <p className="text-xs text-muted-foreground">{text('Example mailbox', '示例邮箱')}: <code>{toSampleMailbox(domain)}</code></p>}
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      <button type="button" onClick={() => setMailEmailDomain(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted">{text('Use as Default', '设为默认')}</button>
+                      <button type="button" onClick={() => setMailEmailDomain(domain)} disabled={mailEmailProvider === 'inbucket' && inbucketDisabledSet.has(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted disabled:opacity-50">{text('Use as Default', '设为默认')}</button>
                       <button type="button" onClick={() => { void handleMailDomainTest(domain); }} disabled={isTesting} className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted disabled:opacity-50">{isTesting ? text('Testing...', '测试中...') : text('Test Domain', '测试域名')}</button>
-                      {mailEmailProvider === 'mailfree' && <button type="button" onClick={() => handleRemoveDomain(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-destructive/40 bg-destructive/5 px-3 text-sm font-medium text-destructive hover:bg-destructive/10">{text('Remove', '移除')}</button>}
+                      {mailEmailProvider === 'inbucket' && <button type="button" onClick={() => handleToggleDomainDisabled(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-amber-500/40 bg-amber-500/5 px-3 text-sm font-medium text-amber-700 hover:bg-amber-500/10 dark:text-amber-300">{inbucketDisabledSet.has(domain) ? text('Enable', '启用') : text('Disable', '禁用')}</button>}
+                      {(mailEmailProvider === 'mailfree' || mailEmailProvider === 'inbucket') && <button type="button" onClick={() => handleRemoveDomain(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-destructive/40 bg-destructive/5 px-3 text-sm font-medium text-destructive hover:bg-destructive/10">{text('Remove', '移除')}</button>}
                     </div>
                   </div>
                 </div>
@@ -996,9 +1053,9 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
           </div>
           <div className="grid gap-2">
             <label className="text-sm font-medium">{text('Default Mail Domain', '默认邮箱域名')}</label>
-            <select value={mailEmailDomain} onChange={(e) => setMailEmailDomain(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" disabled={emailDomainOptions.length === 0}>
+            <select value={mailEmailDomain} onChange={(e) => setMailEmailDomain(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" disabled={selectableDomainOptions.length === 0}>
               <option value="">{text('Select configured domain', '选择已配置域名')}</option>
-              {emailDomainOptions.map((domain) => <option key={domain} value={domain}>{domain}</option>)}
+              {selectableDomainOptions.map((domain) => <option key={domain} value={domain}>{domain}</option>)}
             </select>
           </div>
           <label className="flex items-center gap-2 text-sm font-medium">

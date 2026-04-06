@@ -224,6 +224,12 @@ PREFER_STABLE_PROXY = _as_bool(_CONFIG.get("prefer_stable_proxy", True))
 DEFAULT_OUTPUT_FILE = _CONFIG["output_file"]
 ENABLE_OAUTH = _as_bool(_CONFIG.get("enable_oauth", True))
 OAUTH_REQUIRED = _as_bool(_CONFIG.get("oauth_required", True))
+OTP_WAIT_SLICE_SECONDS = max(5, int(_CONFIG.get("otp_wait_slice_seconds", 20)))
+OTP_EMPTY_RESEND_INTERVAL_SECONDS = max(
+    10, int(_CONFIG.get("otp_empty_resend_interval_seconds", 30))
+)
+OTP_MAX_RESENDS = max(0, int(_CONFIG.get("otp_max_resends", 2)))
+OTP_EMPTY_ABORT_ROUNDS = max(1, int(_CONFIG.get("otp_empty_abort_rounds", 4)))
 OAUTH_ISSUER = _CONFIG["oauth_issuer"].rstrip("/")
 OAUTH_CLIENT_ID = _CONFIG["oauth_client_id"]
 OAUTH_REDIRECT_URI = _CONFIG["oauth_redirect_uri"]
@@ -633,6 +639,15 @@ async def _random_delay(low=0.3, high=1.0):
     await asyncio.sleep(random.uniform(low, high))
 
 
+def _is_retryable_tls_error(message: str) -> bool:
+    text = str(message or "").lower()
+    return (
+        "curl: (35)" in text
+        and "tls connect error" in text
+        and "openssl_internal:invalid library" in text
+    )
+
+
 def _make_trace_headers():
     trace_id = random.randint(10**17, 10**18 - 1)
     parent_id = random.randint(10**17, 10**18 - 1)
@@ -792,6 +807,7 @@ async def fetch_sentinel_challenge(
     device_id,
     flow="authorize_continue",
     user_agent=None,
+    accept_language=None,
     sec_ch_ua=None,
     impersonate=None,
     error_sink=None,
@@ -817,6 +833,7 @@ async def fetch_sentinel_challenge(
         "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
         "Origin": "https://sentinel.openai.com",
         "User-Agent": user_agent or "Mozilla/5.0",
+        "Accept-Language": accept_language or "en-US,en;q=0.9",
         "sec-ch-ua": sec_ch_ua
         or '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
         "sec-ch-ua-mobile": "?0",
@@ -886,6 +903,7 @@ async def build_sentinel_token(
     device_id,
     flow="authorize_continue",
     user_agent=None,
+    accept_language=None,
     sec_ch_ua=None,
     impersonate=None,
     browser_proxy=None,
@@ -899,6 +917,7 @@ async def build_sentinel_token(
         browser_token = await _build_sentinel_token_via_browser(
             flow=flow,
             user_agent=user_agent,
+            accept_language=accept_language,
             browser_proxy=browser_proxy,
             session=session,
             sec_ch_ua=sec_ch_ua,
@@ -921,6 +940,7 @@ async def build_sentinel_token(
         device_id,
         flow=flow,
         user_agent=user_agent,
+        accept_language=accept_language,
         sec_ch_ua=sec_ch_ua,
         impersonate=impersonate,
         error_sink=error_sink,
@@ -1001,6 +1021,7 @@ def _normalize_browser_proxy_value(browser_proxy):
 async def _build_sentinel_token_via_browser(
     flow,
     user_agent,
+    accept_language,
     browser_proxy,
     session,
     sec_ch_ua,
@@ -1049,6 +1070,7 @@ async def _build_sentinel_token_via_browser(
             lambda: get_sentinel_token_via_browser(
                 flow=flow,
                 user_agent=user_agent,
+                accept_language=accept_language,
                 proxy=normalized_proxy,
                 timeout_ms=timeout_ms,
                 frame_url=frame_url,
@@ -1471,6 +1493,7 @@ class ChatGPTRegister:
             self.ua,
             self.sec_ch_ua,
         ) = _random_chrome_version()
+        self.accept_language = "en-US,en;q=0.9"
 
         self.session: CurlAsyncSession | None = None
 
@@ -1536,21 +1559,15 @@ class ChatGPTRegister:
         """创建并配置 AsyncSession。"""
         session = CurlAsyncSession(impersonate=self.impersonate)
         if self.proxy:
-            # curl_cffi AsyncSession 接受字符串代理
-            session.proxies = self.proxy  # type: ignore[assignment]
+            normalized = _normalize_proxy(self.proxy)
+            if normalized:
+                session.proxies = {"http": normalized, "https": normalized}
         # else: 不设置 proxy，走直连或环境变量
         session.verify = True
         session.headers.update(
             {
                 "User-Agent": self.ua,
-                "Accept-Language": random.choice(
-                    [
-                        "en-US,en;q=0.9",
-                        "en-US,en;q=0.9,zh-CN;q=0.8",
-                        "en,en-US;q=0.9",
-                        "en-US,en;q=0.8",
-                    ]
-                ),
+                "Accept-Language": self.accept_language,
                 "sec-ch-ua": self.sec_ch_ua,
                 "sec-ch-ua-mobile": "?0",
                 "sec-ch-ua-platform": '"Windows"',
@@ -1683,15 +1700,35 @@ class ChatGPTRegister:
         return authorize_url
 
     async def authorize(self, url: str) -> str:
-        r = await self.session.get(
-            url,
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": f"{self.BASE}/",
-                "Upgrade-Insecure-Requests": "1",
-            },
-            allow_redirects=True,
-        )
+        r = None
+        last_tls_error = ""
+        for attempt in range(1, 4):
+            try:
+                r = await self.session.get(
+                    url,
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Referer": f"{self.BASE}/",
+                        "Upgrade-Insecure-Requests": "1",
+                    },
+                    allow_redirects=True,
+                )
+                break
+            except Exception as exc:
+                if _is_retryable_tls_error(str(exc)) and attempt < 3:
+                    last_tls_error = str(exc)
+                    await self._print(
+                        f"[Auth] TLS handshake retry {attempt}/3 before authorize"
+                    )
+                    await _random_delay(0.4, 1.0)
+                    continue
+                raise
+
+        if r is None:
+            raise Exception(
+                "Authorize failed due to repeated TLS handshake errors"
+                + (f": {last_tls_error}" if last_tls_error else "")
+            )
         final_url = str(r.url)
         response_excerpt = clean_display_text((r.text or "")[:500]).strip()
         response_headers = {
@@ -1756,6 +1793,7 @@ class ChatGPTRegister:
             self.device_id,
             flow="username_password_create",
             user_agent=self.ua,
+            accept_language=self.accept_language,
             sec_ch_ua=self.sec_ch_ua,
             impersonate=self.impersonate,
             browser_proxy=self.proxy,
@@ -1936,15 +1974,47 @@ class ChatGPTRegister:
         if need_otp:
             otp_deadline = time.time() + 120
             status, data = 0, {}
+            otp_empty_rounds = 0
+            otp_resend_count = 0
+            otp_last_resend_at = time.time()
             while time.time() < otp_deadline:
+                remaining = max(1, int(otp_deadline - time.time()))
+                wait_slice = max(1, min(OTP_WAIT_SLICE_SECONDS, remaining))
                 otp_code = await self.wait_for_verification_email(
                     mail_token,
-                    timeout=max(1, int(otp_deadline - time.time())),
+                    timeout=wait_slice,
                     otp_context=otp_context,
                     exclude_codes=(otp_context or {}).get("tried_codes"),
                 )
                 if not otp_code:
-                    break
+                    otp_empty_rounds += 1
+                    await self._print(
+                        f"[OTP] mailbox still empty after {wait_slice}s poll "
+                        f"(round={otp_empty_rounds}, remaining={remaining}s)"
+                    )
+                    now = time.time()
+                    should_resend = (
+                        otp_resend_count < OTP_MAX_RESENDS
+                        and now - otp_last_resend_at
+                        >= OTP_EMPTY_RESEND_INTERVAL_SECONDS
+                    )
+                    if should_resend:
+                        otp_resend_count += 1
+                        otp_last_resend_at = now
+                        await self._print(
+                            f"[OTP] no mail yet; re-sending OTP ({otp_resend_count}/{OTP_MAX_RESENDS})"
+                        )
+                        await self.send_otp()
+                        await _random_delay(0.8, 1.6)
+                    if (
+                        otp_empty_rounds >= OTP_EMPTY_ABORT_ROUNDS
+                        and otp_resend_count >= OTP_MAX_RESENDS
+                    ):
+                        await self._print(
+                            "[OTP] mailbox empty for multiple rounds; abort current account early"
+                        )
+                        break
+                    continue
 
                 if otp_context is not None:
                     otp_context.setdefault("tried_codes", set()).add(otp_code)
@@ -2206,6 +2276,11 @@ class ChatGPTRegister:
         except Exception:
             await self._print("[OAuth] workspace/select returned non-JSON response")
             return None
+        if not isinstance(ws_data, dict):
+            await self._print(
+                f"[OAuth] workspace/select returned non-object JSON: {type(ws_data).__name__}"
+            )
+            return None
 
         ws_next = ws_data.get("continue_url", "")
         orgs = ws_data.get("data", {}).get("orgs", [])
@@ -2266,6 +2341,11 @@ class ChatGPTRegister:
                 except Exception:
                     await self._print(
                         "[OAuth] organization/select returned non-JSON response"
+                    )
+                    return None
+                if not isinstance(org_data, dict):
+                    await self._print(
+                        f"[OAuth] organization/select returned non-object JSON: {type(org_data).__name__}"
                     )
                     return None
 
@@ -2508,6 +2588,7 @@ class ChatGPTRegister:
                 self.device_id,
                 flow="authorize_continue",
                 user_agent=self.ua,
+                accept_language=self.accept_language,
                 sec_ch_ua=self.sec_ch_ua,
                 impersonate=self.impersonate,
                 error_sink=sentinel_error,
@@ -2633,6 +2714,18 @@ class ChatGPTRegister:
                 response_excerpt=_response_excerpt(resp_continue),
             )
             return None
+        if not isinstance(continue_data, dict):
+            await self._print(
+                f"[OAuth] authorize/continue returned non-object JSON: {type(continue_data).__name__}"
+            )
+            _remember_protocol_error(
+                "authorize_continue",
+                code="authorize_continue_invalid_payload",
+                message=f"authorize_continue returned non-object JSON: {type(continue_data).__name__}",
+                status_code=resp_continue.status_code,
+                response_excerpt=_response_excerpt(resp_continue),
+            )
+            return None
 
         continue_url = continue_data.get("continue_url", "")
         page_type = (continue_data.get("page") or {}).get("type", "")
@@ -2647,6 +2740,7 @@ class ChatGPTRegister:
             self.device_id,
             flow="password_verify",
             user_agent=self.ua,
+            accept_language=self.accept_language,
             sec_ch_ua=self.sec_ch_ua,
             impersonate=self.impersonate,
             error_sink=sentinel_pwd_error,
@@ -2715,6 +2809,18 @@ class ChatGPTRegister:
                 response_excerpt=_response_excerpt(resp_verify),
             )
             return None
+        if not isinstance(verify_data, dict):
+            await self._print(
+                f"[OAuth] password/verify returned non-object JSON: {type(verify_data).__name__}"
+            )
+            _remember_protocol_error(
+                "password_verify",
+                code="password_verify_invalid_payload",
+                message=f"password_verify returned non-object JSON: {type(verify_data).__name__}",
+                status_code=resp_verify.status_code,
+                response_excerpt=_response_excerpt(resp_verify),
+            )
+            return None
 
         continue_url = verify_data.get("continue_url", "") or continue_url
         page_type = (verify_data.get("page") or {}).get("type", "") or page_type
@@ -2745,16 +2851,59 @@ class ChatGPTRegister:
             tried_codes = set()
             otp_success = False
             otp_deadline = time.time() + 120
+            otp_empty_rounds = 0
+            otp_resend_count = 0
+            otp_last_resend_at = time.time()
 
             while time.time() < otp_deadline and not otp_success:
+                remaining = max(1, int(otp_deadline - time.time()))
+                wait_slice = max(1, min(OTP_WAIT_SLICE_SECONDS, remaining))
                 code = await self.wait_for_verification_email(
                     mail_token,
-                    timeout=max(1, int(otp_deadline - time.time())),
+                    timeout=wait_slice,
                     otp_context=otp_context,
                     exclude_codes=tried_codes,
                 )
                 if not code:
-                    break
+                    otp_empty_rounds += 1
+                    await self._print(
+                        f"[OAuth] OTP mailbox still empty after {wait_slice}s poll "
+                        f"(round={otp_empty_rounds}, remaining={remaining}s)"
+                    )
+                    now = time.time()
+                    should_resend = (
+                        otp_resend_count < OTP_MAX_RESENDS
+                        and now - otp_last_resend_at
+                        >= OTP_EMPTY_RESEND_INTERVAL_SECONDS
+                    )
+                    if should_resend:
+                        otp_resend_count += 1
+                        otp_last_resend_at = now
+                        await self._print(
+                            f"[OAuth] no OTP mail yet; re-sending OTP ({otp_resend_count}/{OTP_MAX_RESENDS})"
+                        )
+                        await self.session.get(
+                            f"{OAUTH_ISSUER}/api/accounts/email-otp/send",
+                            headers={
+                                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                "Referer": f"{OAUTH_ISSUER}/email-verification",
+                                "Upgrade-Insecure-Requests": "1",
+                                "User-Agent": self.ua,
+                            },
+                            allow_redirects=True,
+                            timeout=30,
+                            impersonate=self.impersonate,
+                        )
+                        await _random_delay(0.8, 1.6)
+                    if (
+                        otp_empty_rounds >= OTP_EMPTY_ABORT_ROUNDS
+                        and otp_resend_count >= OTP_MAX_RESENDS
+                    ):
+                        await self._print(
+                            "[OAuth] OTP mailbox empty for multiple rounds; abort OAuth OTP flow early"
+                        )
+                        break
+                    continue
 
                 tried_codes.add(code)
                 if otp_context is not None:
@@ -2834,6 +2983,19 @@ class ChatGPTRegister:
                         "email_otp_validate",
                         code="email_otp_parse_failed",
                         message="email_otp validation response could not be parsed as JSON",
+                        status_code=resp_otp.status_code,
+                        response_excerpt=_response_excerpt(resp_otp),
+                    )
+                    await asyncio.sleep(2)
+                    continue
+                if not isinstance(otp_data, dict):
+                    await self._print(
+                        f"[OAuth] email-otp/validate returned non-object JSON: {type(otp_data).__name__}"
+                    )
+                    _remember_protocol_error(
+                        "email_otp_validate",
+                        code="email_otp_invalid_payload",
+                        message=f"email_otp validation returned non-object JSON: {type(otp_data).__name__}",
                         status_code=resp_otp.status_code,
                         response_excerpt=_response_excerpt(resp_otp),
                     )
@@ -2969,6 +3131,18 @@ class ChatGPTRegister:
                 "oauth_token",
                 code="oauth_token_parse_failed",
                 message="OAuth token response could not be parsed as JSON",
+                status_code=token_resp.status_code,
+                response_excerpt=_response_excerpt(token_resp),
+            )
+            return None
+        if not isinstance(data, dict):
+            await self._print(
+                f"[OAuth] token response returned non-object JSON: {type(data).__name__}"
+            )
+            _remember_protocol_error(
+                "oauth_token",
+                code="oauth_token_invalid_payload",
+                message=f"OAuth token response returned non-object JSON: {type(data).__name__}",
                 status_code=token_resp.status_code,
                 response_excerpt=_response_excerpt(token_resp),
             )

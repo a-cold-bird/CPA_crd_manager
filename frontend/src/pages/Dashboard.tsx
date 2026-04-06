@@ -84,18 +84,24 @@ export default function Dashboard() {
     const [inbucketUsername, setInbucketUsername] = useState('');
     const [inbucketPassword, setInbucketPassword] = useState('');
     const [inbucketEmailDomain, setInbucketEmailDomain] = useState('');
+    const [inbucketIceApiBase, setInbucketIceApiBase] = useState('');
+    const [inbucketIceUsername, setInbucketIceUsername] = useState('');
+    const [inbucketIcePassword, setInbucketIcePassword] = useState('');
+    const [inbucketIceEmailDomain, setInbucketIceEmailDomain] = useState('');
+    const [inbucketIceDomains, setInbucketIceDomains] = useState<string[]>([]);
     const [duckmailApiBase, setDuckmailApiBase] = useState('');
     const [duckmailApiKey, setDuckmailApiKey] = useState('');
     const [mailUsername, setMailUsername] = useState('');
     const [mailfreeUsername, setMailfreeUsername] = useState('');
     const [mailPassword, setMailPassword] = useState('');
     const [mailfreePassword, setMailfreePassword] = useState('');
-    const [mailEmailProvider, setMailEmailProvider] = useState<'mailfree' | 'inbucket' | 'duckmail'>('mailfree');
+    const [mailEmailProvider, setMailEmailProvider] = useState<'mailfree' | 'inbucket' | 'inbucket_ice' | 'duckmail'>('mailfree');
     const [mailEmailDomain, setMailEmailDomain] = useState('');
     const [mailfreeEmailDomain, setMailfreeEmailDomain] = useState('');
     const [mailEmailDomains, setMailEmailDomains] = useState('');
     const [mailfreeEmailDomains, setMailfreeEmailDomains] = useState('');
     const [inbucketDomains, setInbucketDomains] = useState<string[]>([]);
+    const [inbucketDisabledDomains, setInbucketDisabledDomains] = useState<string[]>([]);
     const [duckmailDomains, setDuckmailDomains] = useState<string[]>([]);
     const [mailRandomizeFromList, setMailRandomizeFromList] = useState(true);
     const [codexReplenishEnabled, setCodexReplenishEnabled] = useState(false);
@@ -113,7 +119,7 @@ export default function Dashboard() {
     const [settingsMessage, setSettingsMessage] = useState<SettingsMessage>({ type: '', text: '' });
     const autoProbeConfigLoadedRef = useRef(false);
     const autoProbeConfigSyncPrimedRef = useRef(false);
-    const previousMailProviderRef = useRef<'mailfree' | 'inbucket' | 'duckmail'>('mailfree');
+    const previousMailProviderRef = useRef<'mailfree' | 'inbucket' | 'inbucket_ice' | 'duckmail'>('mailfree');
 
     useEffect(() => {
         const key = localStorage.getItem('management_key');
@@ -140,7 +146,7 @@ export default function Dashboard() {
                     setCpaUrl(resolvedUrl);
                     {
                         const provider = String(data.config.mail_email_provider || 'mailfree').trim().toLowerCase();
-                        setMailEmailProvider(provider === 'inbucket' || provider === 'duckmail' ? provider : 'mailfree');
+                        setMailEmailProvider(provider === 'inbucket' || provider === 'inbucket_ice' || provider === 'duckmail' ? provider : 'mailfree');
                     }
                     setMailApiBase(String(data.config.mail_api_base || ''));
                     setMailfreeApiBase(String(data.config.mailfree_api_base || data.config.mail_api_base || ''));
@@ -159,6 +165,23 @@ export default function Dashboard() {
                     setInbucketPassword(String(data.config.inbucket_mail_password || ''));
                     setInbucketEmailDomain(String(data.config.inbucket_mail_domain || ''));
                     setInbucketDomains(Array.isArray(data.mail_meta?.inbucket_domains) ? data.mail_meta.inbucket_domains.map((item: unknown) => String(item || '').trim()).filter(Boolean) : []);
+                    setInbucketDisabledDomains(
+                        String(data.config.inbucket_mail_disabled_domains || '')
+                            .split(',')
+                            .map((item: string) => item.trim().toLowerCase())
+                            .filter(Boolean),
+                    );
+                    setInbucketIceApiBase(String(data.config.inbucket_ice_mail_api_base || data.config.inbucket_v1_mail_api_base || ''));
+                    setInbucketIceUsername(String(data.config.inbucket_ice_mail_username || data.config.inbucket_v1_mail_username || ''));
+                    setInbucketIcePassword(String(data.config.inbucket_ice_mail_password || data.config.inbucket_v1_mail_password || ''));
+                    setInbucketIceEmailDomain(String(data.config.inbucket_ice_mail_domain || data.config.inbucket_v1_mail_domain || ''));
+                    {
+                        const parsed = String(data.config.inbucket_ice_mail_domains || data.config.inbucket_v1_mail_domains || '')
+                            .split(',')
+                            .map((item: string) => item.trim())
+                            .filter(Boolean);
+                        setInbucketIceDomains(parsed);
+                    }
                     setDuckmailDomains(Array.isArray(data.mail_meta?.duckmail_domains) ? data.mail_meta.duckmail_domains.map((item: unknown) => String(item || '').trim()).filter(Boolean) : []);
                     setMailRandomizeFromList(parseConfigBoolean(data.config.mail_randomize_from_list, true));
                     setCodexReplenishEnabled(parseConfigBoolean(data.config.codex_replenish_enabled, false));
@@ -208,11 +231,24 @@ export default function Dashboard() {
             setMailfreePassword(mailPassword);
             setMailfreeEmailDomain(mailEmailDomain);
             setMailfreeEmailDomains(mailEmailDomains);
-        } else if (previousProvider === 'inbucket') {
-            setInbucketApiBase(mailApiBase);
-            setInbucketUsername(mailUsername);
-            setInbucketPassword(mailPassword);
-            setInbucketEmailDomain(mailEmailDomain);
+        } else if (previousProvider === 'inbucket' || previousProvider === 'inbucket_ice') {
+            if (previousProvider === 'inbucket') {
+                setInbucketApiBase(mailApiBase);
+                setInbucketUsername(mailUsername);
+                setInbucketPassword(mailPassword);
+                setInbucketEmailDomain(mailEmailDomain);
+                setInbucketDomains(
+                    String(mailEmailDomains || '')
+                        .split(',')
+                        .map((item) => String(item || '').trim())
+                        .filter(Boolean),
+                );
+            } else {
+                setInbucketIceApiBase(mailApiBase);
+                setInbucketIceUsername(mailUsername);
+                setInbucketIcePassword(mailPassword);
+                setInbucketIceEmailDomain(mailEmailDomain);
+            }
         }
 
         if (mailEmailProvider === 'mailfree') {
@@ -221,12 +257,20 @@ export default function Dashboard() {
             setMailPassword(mailfreePassword);
             setMailEmailDomain(mailfreeEmailDomain);
             setMailEmailDomains(mailfreeEmailDomains);
-        } else if (mailEmailProvider === 'inbucket') {
-            setMailApiBase(inbucketApiBase);
-            setMailUsername(inbucketUsername);
-            setMailPassword(inbucketPassword);
-            setMailEmailDomain(inbucketEmailDomain);
-            setMailEmailDomains(inbucketDomains.join(', '));
+        } else if (mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice') {
+            if (mailEmailProvider === 'inbucket') {
+                setMailApiBase(inbucketApiBase);
+                setMailUsername(inbucketUsername);
+                setMailPassword(inbucketPassword);
+                setMailEmailDomain(inbucketEmailDomain);
+                setMailEmailDomains(inbucketDomains.join(', '));
+            } else {
+                setMailApiBase(inbucketIceApiBase);
+                setMailUsername(inbucketIceUsername);
+                setMailPassword(inbucketIcePassword);
+                setMailEmailDomain(inbucketIceEmailDomain);
+                setMailEmailDomains(inbucketIceDomains.join(', '));
+            }
         } else {
             setMailApiBase(duckmailApiBase);
             setMailUsername('');
@@ -240,7 +284,7 @@ export default function Dashboard() {
         }
 
         previousMailProviderRef.current = mailEmailProvider;
-    }, [duckmailApiBase, duckmailDomains, inbucketApiBase, inbucketDomains, inbucketEmailDomain, inbucketPassword, inbucketUsername, mailApiBase, mailEmailDomain, mailEmailDomains, mailEmailProvider, mailPassword, mailUsername, mailfreeApiBase, mailfreeEmailDomain, mailfreeEmailDomains, mailfreePassword, mailfreeUsername]);
+    }, [duckmailApiBase, duckmailDomains, inbucketApiBase, inbucketDomains, inbucketEmailDomain, inbucketPassword, inbucketUsername, inbucketIceApiBase, inbucketIceDomains, inbucketIceEmailDomain, inbucketIcePassword, inbucketIceUsername, mailApiBase, mailEmailDomain, mailEmailDomains, mailEmailProvider, mailPassword, mailUsername, mailfreeApiBase, mailfreeEmailDomain, mailfreeEmailDomains, mailfreePassword, mailfreeUsername]);
 
     useEffect(() => {
         if (mailEmailProvider !== 'mailfree') return;
@@ -252,11 +296,19 @@ export default function Dashboard() {
     }, [mailApiBase, mailEmailDomain, mailEmailDomains, mailEmailProvider, mailPassword, mailUsername]);
 
     useEffect(() => {
-        if (mailEmailProvider !== 'inbucket') return;
-        setInbucketApiBase(mailApiBase);
-        setInbucketUsername(mailUsername);
-        setInbucketPassword(mailPassword);
-        setInbucketEmailDomain(mailEmailDomain);
+        if (mailEmailProvider === 'inbucket') {
+            setInbucketApiBase(mailApiBase);
+            setInbucketUsername(mailUsername);
+            setInbucketPassword(mailPassword);
+            setInbucketEmailDomain(mailEmailDomain);
+            return;
+        }
+        if (mailEmailProvider === 'inbucket_ice') {
+            setInbucketIceApiBase(mailApiBase);
+            setInbucketIceUsername(mailUsername);
+            setInbucketIcePassword(mailPassword);
+            setInbucketIceEmailDomain(mailEmailDomain);
+        }
     }, [mailApiBase, mailEmailDomain, mailEmailProvider, mailPassword, mailUsername]);
 
     useEffect(() => {
@@ -421,6 +473,10 @@ export default function Dashboard() {
                                 mailEmailDomains={mailEmailDomains}
                                 setMailEmailDomains={setMailEmailDomains}
                                 inbucketDomains={inbucketDomains}
+                                inbucketIceDomains={inbucketIceDomains}
+                                setInbucketDomains={setInbucketDomains}
+                                inbucketDisabledDomains={inbucketDisabledDomains}
+                                setInbucketDisabledDomains={setInbucketDisabledDomains}
                                 duckmailDomains={duckmailDomains}
                                 mailRandomizeFromList={mailRandomizeFromList}
                                 setMailRandomizeFromList={setMailRandomizeFromList}

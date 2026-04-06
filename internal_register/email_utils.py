@@ -2,11 +2,14 @@ import re
 import time
 import os
 import asyncio
+import inspect
 import secrets
+import base64
 from datetime import datetime, timezone
 
 import random
 import httpx
+from urllib.parse import quote
 
 import json
 
@@ -17,9 +20,46 @@ PASSWORD = ""
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 DUCKMAIL_BEARER = ""
 DUCKMAIL_DOMAINS = ["duckmail.sbs"]
+MAIL_HOST_HEADER = ""
 EMAIL_DOMAIN = "example.com"
 EMAIL_DOMAINS = [EMAIL_DOMAIN]
 EMAIL_PROVIDERS = {}
+
+
+def _basic_auth_headers() -> dict:
+    user = str(USERNAME or "").strip()
+    pwd = str(PASSWORD or "")
+    if not user:
+        return {}
+    token = base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
+
+
+def _normalize_host_header(value: str) -> str:
+    host = str(value or "").strip()
+    if not host:
+        return ""
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/", 1)[0].strip()
+    return host
+
+
+def _mail_headers(
+    *, include_auth: bool = False, include_content_type: bool = False
+) -> dict:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+    if include_content_type:
+        headers["Content-Type"] = "application/json"
+    if include_auth:
+        headers.update(_basic_auth_headers())
+    host = _normalize_host_header(MAIL_HOST_HEADER)
+    if host:
+        headers["Host"] = host
+    return headers
 
 
 def _normalize_domain_list(value):
@@ -65,6 +105,7 @@ def _load_mail_config():
         API_BASE, \
         USERNAME, \
         PASSWORD, \
+        MAIL_HOST_HEADER, \
         DUCKMAIL_API_BASE, \
         DUCKMAIL_BEARER, \
         DUCKMAIL_DOMAINS, \
@@ -80,6 +121,7 @@ def _load_mail_config():
                 API_BASE = c.get("mail_api_base", API_BASE)
                 USERNAME = c.get("mail_username", USERNAME)
                 PASSWORD = c.get("mail_password", PASSWORD)
+                MAIL_HOST_HEADER = c.get("mail_host_header", MAIL_HOST_HEADER)
                 DUCKMAIL_API_BASE = c.get("duckmail_api_base", DUCKMAIL_API_BASE)
                 DUCKMAIL_BEARER = c.get("duckmail_api_key", DUCKMAIL_BEARER)
                 DUCKMAIL_DOMAINS = (
@@ -110,6 +152,9 @@ _load_mail_config()
 API_BASE = str(os.environ.get("MAIL_API_BASE", API_BASE) or API_BASE).strip()
 USERNAME = str(os.environ.get("MAIL_USERNAME", USERNAME) or USERNAME).strip()
 PASSWORD = str(os.environ.get("MAIL_PASSWORD", PASSWORD) or PASSWORD)
+MAIL_HOST_HEADER = str(
+    os.environ.get("MAIL_HOST_HEADER", MAIL_HOST_HEADER) or MAIL_HOST_HEADER
+).strip()
 DUCKMAIL_API_BASE = str(
     os.environ.get("DUCKMAIL_API_BASE", DUCKMAIL_API_BASE) or DUCKMAIL_API_BASE
 ).strip()
@@ -145,6 +190,13 @@ EMAIL_PROVIDERS["inbucket"] = {
     "domains": EMAIL_DOMAINS,
     "mode": "inbucket",
 }
+EMAIL_PROVIDERS["inbucket_ice"] = {
+    "id": "inbucket_ice",
+    "label": "Inbucket Mailbox (ICE)",
+    "api_base": API_BASE,
+    "domains": EMAIL_DOMAINS,
+    "mode": "inbucket",
+}
 EMAIL_PROVIDERS["duckmail"] = {
     "id": "duckmail",
     "label": "DuckMail",
@@ -159,6 +211,7 @@ _session_cookie: dict = {}
 _login_lock = asyncio.Lock()
 # 模块级持久 httpx 客户端（连接复用）
 _http_client: httpx.AsyncClient | None = None
+_inbucket_http_client: httpx.AsyncClient | None = None
 _duckmail_tokens: dict[str, str] = {}
 
 DIRECT_PROXIES = {"http": "", "https": ""}
@@ -198,12 +251,41 @@ def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
+def _get_inbucket_http_client() -> httpx.AsyncClient:
+    """Inbucket 专用客户端：禁用环境代理、禁用重定向。"""
+    global _inbucket_http_client
+    if _inbucket_http_client is None or _inbucket_http_client.is_closed:
+        _inbucket_http_client = httpx.AsyncClient(
+            verify=False,
+            timeout=20.0,
+            follow_redirects=False,
+            trust_env=False,
+        )
+    return _inbucket_http_client
+
+
+def _parse_json_response(resp: httpx.Response, tag: str):
+    try:
+        return resp.json()
+    except Exception:
+        location = resp.headers.get("location", "")
+        content_type = resp.headers.get("content-type", "")
+        preview = (resp.text or "")[:200].replace("\n", " ")
+        print(
+            f"[{tag}] Non-JSON response status={resp.status_code} content-type={content_type} location={location} preview={preview}"
+        )
+        return None
+
+
 async def close_http_client():
     """关闭模块级客户端，在程序退出前调用。"""
-    global _http_client
+    global _http_client, _inbucket_http_client
     if _http_client is not None and not _http_client.is_closed:
         await _http_client.aclose()
         _http_client = None
+    if _inbucket_http_client is not None and not _inbucket_http_client.is_closed:
+        await _inbucket_http_client.aclose()
+        _inbucket_http_client = None
 
 
 async def _login() -> bool:
@@ -222,7 +304,7 @@ async def _login() -> bool:
             res = await client.post(
                 f"{API_BASE}/api/login",
                 json={"username": USERNAME, "password": PASSWORD},
-                headers={"Content-Type": "application/json"},
+                headers=_mail_headers(include_content_type=True),
             )
             if res.status_code == 200:
                 _session_cookie = dict(res.cookies)
@@ -375,6 +457,8 @@ async def create_test_email(provider=None, domain=None):
     try:
         global API_BASE, _session_cookie
         provider_id = str(provider or DEFAULT_EMAIL_PROVIDER).strip().lower()
+        if provider_id == "inbucket_v1":
+            provider_id = "inbucket_ice"
         provider_config = EMAIL_PROVIDERS.get(provider_id)
         if not provider_config:
             raise ValueError(f"Unsupported email provider: {provider}")
@@ -464,6 +548,7 @@ async def list_mailbox_emails(mailbox) -> list:
     try:
         mailbox_key = str(mailbox or "").strip()
         client = _get_http_client()
+        inbucket_client = _get_inbucket_http_client()
         duckmail_token = _duckmail_tokens.get(mailbox_key)
         if duckmail_token:
             resp = await client.get(
@@ -479,21 +564,34 @@ async def list_mailbox_emails(mailbox) -> list:
             items = data.get("hydra:member") if isinstance(data, dict) else []
             return items if isinstance(items, list) else []
 
-        if "mailapizv.uton.me" in API_BASE or "/api/v1" in API_BASE:
-            res = await client.get(
-                f"{API_BASE.rstrip('/')}/api/v1/mailbox/{mailbox}",
-                headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
-            )
-        else:
-            if not await _ensure_mail_session():
-                return []
+        mailbox_path = quote(mailbox_key, safe="")
+        api_v1_res = await inbucket_client.get(
+            f"{API_BASE.rstrip('/')}/api/v1/mailbox/{mailbox_path}",
+            headers=_mail_headers(include_auth=True),
+        )
+        if api_v1_res.status_code == 200:
+            data = _parse_json_response(api_v1_res, "inbucket-list")
+            return data if isinstance(data, list) else []
 
-            res = await client.get(
-                f"{API_BASE}/api/emails",
-                params={"mailbox": mailbox},
-                cookies=_session_cookie,
-                headers={"Content-Type": "application/json"},
+        if api_v1_res.status_code in {301, 302, 303, 307, 308}:
+            location = api_v1_res.headers.get("location", "")
+            print(
+                f"[inbucket-list] Redirect blocked status={api_v1_res.status_code} location={location}"
             )
+            return []
+
+        if api_v1_res.status_code not in {404}:
+            return []
+
+        if not await _ensure_mail_session():
+            return []
+
+        res = await client.get(
+            f"{API_BASE}/api/emails",
+            params={"mailbox": mailbox},
+            cookies=_session_cookie,
+            headers=_mail_headers(include_content_type=True),
+        )
 
         if res.status_code != 200:
             return []
@@ -534,6 +632,7 @@ async def fetch_email_detail(email_id):
             mailbox, message_id = None, email_id
 
         client = _get_http_client()
+        inbucket_client = _get_inbucket_http_client()
         mailbox_key = str(mailbox or "").strip()
         duckmail_token = _duckmail_tokens.get(mailbox_key)
         if duckmail_token:
@@ -549,22 +648,33 @@ async def fetch_email_detail(email_id):
             detail = detail_res.json()
             return detail if isinstance(detail, dict) else None
 
-        if "mailapizv.uton.me" in API_BASE or "/api/v1" in API_BASE:
-            if not mailbox:
-                return None
-            detail_res = await client.get(
-                f"{API_BASE.rstrip('/')}/api/v1/mailbox/{mailbox}/{message_id}",
-                headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+        if mailbox:
+            mailbox_path = quote(str(mailbox).strip(), safe="")
+            message_path = quote(str(message_id).strip(), safe="")
+            detail_v1_res = await inbucket_client.get(
+                f"{API_BASE.rstrip('/')}/api/v1/mailbox/{mailbox_path}/{message_path}",
+                headers=_mail_headers(include_auth=True),
             )
-        else:
-            if not await _ensure_mail_session():
+            if detail_v1_res.status_code == 200:
+                detail = _parse_json_response(detail_v1_res, "inbucket-detail")
+                return detail if isinstance(detail, dict) else None
+            if detail_v1_res.status_code in {301, 302, 303, 307, 308}:
+                location = detail_v1_res.headers.get("location", "")
+                print(
+                    f"[inbucket-detail] Redirect blocked status={detail_v1_res.status_code} location={location}"
+                )
+                return None
+            if detail_v1_res.status_code not in {404}:
                 return None
 
-            detail_res = await client.get(
-                f"{API_BASE}/api/email/{message_id}",
-                cookies=_session_cookie,
-                headers={"Content-Type": "application/json"},
-            )
+        if not await _ensure_mail_session():
+            return None
+
+        detail_res = await client.get(
+            f"{API_BASE}/api/email/{message_id}",
+            cookies=_session_cookie,
+            headers=_mail_headers(include_content_type=True),
+        )
 
         if detail_res.status_code != 200:
             return None
@@ -640,10 +750,12 @@ async def fetch_verification_code(
     deadline = time.time() + max_wait
     baseline_email_id = _coerce_email_id(min_email_id)
 
-    def emit(message):
+    async def emit(message):
         if callable(log_fn):
             try:
-                log_fn(message)
+                result = log_fn(message)
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
                 pass
 
@@ -659,7 +771,7 @@ async def fetch_verification_code(
                 and numeric_email_id <= baseline_email_id
             ):
                 tracked_ids.add(email_id)
-                emit(
+                await emit(
                     f"[OTP] 跳过旧邮件 {email_id} baseline_email_id={baseline_email_id}"
                 )
                 continue
@@ -667,7 +779,7 @@ async def fetch_verification_code(
             detail = await fetch_email_detail((mailbox, email_id))
             payload = detail if isinstance(detail, dict) else message
             if not isinstance(payload, dict):
-                emit(f"[OTP] 新邮件 {email_id} 数据尚未就绪，继续重试")
+                await emit(f"[OTP] 新邮件 {email_id} 数据尚未就绪，继续重试")
                 continue
 
             received_at = _extract_message_timestamp(payload)
@@ -681,20 +793,20 @@ async def fetch_verification_code(
                 and received_at < (float(min_received_at) - OTP_PRESTART_GRACE_SECONDS)
             ):
                 tracked_ids.add(email_id)
-                emit(f"[OTP] 跳过旧邮件 {email_id} received_at={received_at}")
+                await emit(f"[OTP] 跳过旧邮件 {email_id} received_at={received_at}")
                 continue
 
             code = extract_verification_code(_build_email_content(payload))
             if not code:
-                emit(
+                await emit(
                     f"[OTP] 新邮件 {email_id} 详情已就绪，但尚未解析到验证码，继续重试"
                 )
                 continue
             tracked_ids.add(email_id)
             if code in excluded_codes:
-                emit(f"[OTP] 跳过已尝试验证码 {code} (email_id={email_id})")
+                await emit(f"[OTP] 跳过已尝试验证码 {code} (email_id={email_id})")
                 continue
-            emit(f"[OTP] 命中新验证码 {code} (email_id={email_id})")
+            await emit(f"[OTP] 命中新验证码 {code} (email_id={email_id})")
             return code
 
         await asyncio.sleep(interval)

@@ -60,24 +60,32 @@ def load_provider_domain_list(config: Dict[str, Any]) -> List[str]:
     provider = (
         str(config.get("mail_email_provider", "mailfree") or "mailfree").strip().lower()
     )
+    if provider == "inbucket_v1":
+        provider = "inbucket_ice"
     domain_source_key = (
         "inbucket_mail_domains"
         if provider == "inbucket"
+        else "inbucket_ice_mail_domains"
+        if provider == "inbucket_ice"
         else "duckmail_mail_domains"
         if provider == "duckmail"
         else "mailfree_mail_domains"
     )
     domain_source = config.get(domain_source_key, "")
-    if provider == "inbucket" and not normalize_domain_list(domain_source):
-        domain_source = config.get("mail_email_domains", "")
-    if provider == "duckmail" and not normalize_domain_list(domain_source):
-        domain_source = config.get("mail_email_domains", "")
-    if provider == "mailfree" and not normalize_domain_list(domain_source):
-        domain_source = config.get("mail_email_domains", "")
     configured_domains = normalize_domain_list(domain_source)
+    disabled_source = (
+        config.get("inbucket_mail_disabled_domains", "")
+        if provider == "inbucket"
+        else ""
+    )
+    disabled_domains = set(normalize_domain_list(disabled_source))
+    if disabled_domains:
+        configured_domains = [
+            domain for domain in configured_domains if domain not in disabled_domains
+        ]
     default_domain = str(config.get("mail_email_domain", "") or "").strip().lower()
 
-    if default_domain:
+    if default_domain and default_domain not in disabled_domains:
         configured_domains = [
             item for item in configured_domains if item != default_domain
         ]
@@ -818,9 +826,13 @@ def configure_internal_register_environment(config: Dict[str, Any]) -> None:
     mail_provider = (
         str(config.get("mail_email_provider", "mailfree") or "mailfree").strip().lower()
     )
+    if mail_provider == "inbucket_v1":
+        mail_provider = "inbucket_ice"
     provider_default_domain_key = (
         "inbucket_mail_domain"
         if mail_provider == "inbucket"
+        else "inbucket_ice_mail_domain"
+        if mail_provider == "inbucket_ice"
         else "duckmail_mail_domain"
         if mail_provider == "duckmail"
         else "mailfree_mail_domain"
@@ -841,6 +853,8 @@ def configure_internal_register_environment(config: Dict[str, Any]) -> None:
         config.get(
             "inbucket_mail_api_base"
             if mail_provider == "inbucket"
+            else "inbucket_ice_mail_api_base"
+            if mail_provider == "inbucket_ice"
             else "duckmail_api_base"
             if mail_provider == "duckmail"
             else "mailfree_api_base",
@@ -850,11 +864,26 @@ def configure_internal_register_environment(config: Dict[str, Any]) -> None:
         or ""
     ).strip()
 
+    provider_host_header = str(
+        config.get(
+            "inbucket_mail_host"
+            if mail_provider == "inbucket"
+            else "inbucket_ice_mail_host"
+            if mail_provider == "inbucket_ice"
+            else "mail_host_header",
+            "",
+        )
+        or config.get("mail_host_header", "")
+        or ""
+    ).strip()
+
     provider_username = str(
         config.get("mailfree_username", "")
         if mail_provider == "mailfree"
         else config.get("inbucket_mail_username", "")
         if mail_provider == "inbucket"
+        else config.get("inbucket_ice_mail_username", "")
+        if mail_provider == "inbucket_ice"
         else ""
     ).strip()
     provider_password = str(
@@ -862,6 +891,8 @@ def configure_internal_register_environment(config: Dict[str, Any]) -> None:
         if mail_provider == "mailfree"
         else config.get("inbucket_mail_password", "")
         if mail_provider == "inbucket"
+        else config.get("inbucket_ice_mail_password", "")
+        if mail_provider == "inbucket_ice"
         else ""
     )
 
@@ -873,6 +904,7 @@ def configure_internal_register_environment(config: Dict[str, Any]) -> None:
         "DUCKMAIL_MAIL_DOMAINS": ",".join(configured_domains),
         "MAIL_USERNAME": provider_username,
         "MAIL_PASSWORD": provider_password,
+        "MAIL_HOST_HEADER": provider_host_header,
         "MAIL_EMAIL_DOMAIN": default_domain,
         "EMAIL_DOMAINS": ",".join(configured_domains),
         "TOKEN_JSON_DIR": get_register_token_dir(),
