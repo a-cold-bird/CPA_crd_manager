@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { cpaApi, configApi } from '../lib/api';
+import { clearAuthFilesCache, cpaApi, configApi } from '../lib/api';
 import { Settings, LogOut, ShieldCheck, Layers, Moon, Sun, Globe, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import SettingsPanel from './dashboard/SettingsPanelV3';
@@ -29,7 +29,7 @@ function getInitialTheme(): 'light' | 'dark' {
             return cached;
         }
     } catch {
-        // ignore localStorage errors
+        // Ignore localStorage errors.
     }
     return document.documentElement.classList.contains('dark') ? 'dark' : 'light';
 }
@@ -65,52 +65,13 @@ function parseConfigBoolean(value: unknown, fallback = false): boolean {
     return fallback;
 }
 
-function parseIntSafe(value: unknown, fallback: number): number {
-    const numeric = Number.parseInt(String(value ?? ''), 10);
-    return Number.isFinite(numeric) ? numeric : fallback;
-}
-
 export default function Dashboard() {
     const navigate = useNavigate();
     const { t, i18n } = useTranslation();
     const [activeTab, setActiveTab] = useState<'credentials' | 'archive' | 'settings'>('credentials');
     const [theme, setTheme] = useState<'light' | 'dark'>(getInitialTheme);
-
     const [cpaUrl, setCpaUrl] = useState('');
     const [newPassword, setNewPassword] = useState('');
-    const [mailApiBase, setMailApiBase] = useState('');
-    const [mailfreeApiBase, setMailfreeApiBase] = useState('');
-    const [inbucketApiBase, setInbucketApiBase] = useState('');
-    const [inbucketUsername, setInbucketUsername] = useState('');
-    const [inbucketPassword, setInbucketPassword] = useState('');
-    const [inbucketEmailDomain, setInbucketEmailDomain] = useState('');
-    const [inbucketIceApiBase, setInbucketIceApiBase] = useState('');
-    const [inbucketIceUsername, setInbucketIceUsername] = useState('');
-    const [inbucketIcePassword, setInbucketIcePassword] = useState('');
-    const [inbucketIceEmailDomain, setInbucketIceEmailDomain] = useState('');
-    const [inbucketIceDomains, setInbucketIceDomains] = useState<string[]>([]);
-    const [duckmailApiBase, setDuckmailApiBase] = useState('');
-    const [duckmailApiKey, setDuckmailApiKey] = useState('');
-    const [mailUsername, setMailUsername] = useState('');
-    const [mailfreeUsername, setMailfreeUsername] = useState('');
-    const [mailPassword, setMailPassword] = useState('');
-    const [mailfreePassword, setMailfreePassword] = useState('');
-    const [mailEmailProvider, setMailEmailProvider] = useState<'mailfree' | 'inbucket' | 'inbucket_ice' | 'duckmail'>('mailfree');
-    const [mailEmailDomain, setMailEmailDomain] = useState('');
-    const [mailfreeEmailDomain, setMailfreeEmailDomain] = useState('');
-    const [mailEmailDomains, setMailEmailDomains] = useState('');
-    const [mailfreeEmailDomains, setMailfreeEmailDomains] = useState('');
-    const [inbucketDomains, setInbucketDomains] = useState<string[]>([]);
-    const [inbucketDisabledDomains, setInbucketDisabledDomains] = useState<string[]>([]);
-    const [duckmailDomains, setDuckmailDomains] = useState<string[]>([]);
-    const [mailRandomizeFromList, setMailRandomizeFromList] = useState(true);
-    const [codexReplenishEnabled, setCodexReplenishEnabled] = useState(false);
-    const [codexReplenishTargetCount, setCodexReplenishTargetCount] = useState(5);
-    const [codexReplenishThreshold, setCodexReplenishThreshold] = useState(2);
-    const [codexReplenishBatchSize, setCodexReplenishBatchSize] = useState(1);
-    const [codexReplenishWorkerCount, setCodexReplenishWorkerCount] = useState(1);
-    const [codexReplenishUseProxy, setCodexReplenishUseProxy] = useState(true);
-    const [codexReplenishProxyPool, setCodexReplenishProxyPool] = useState('');
     const [autoProbeEnabled, setAutoProbeEnabled] = useState<boolean>(getInitialAutoProbeEnabled);
     const [autoProbeIntervalMinutes, setAutoProbeIntervalMinutes] = useState<number>(() => clampAutoProbeIntervalMinutes(localStorage.getItem('probe_auto_interval_minutes') || 60));
     const [codexQuotaDisableRemainingPercent, setCodexQuotaDisableRemainingPercent] = useState<number>(() => clampQuotaDisableRemainingPercent(localStorage.getItem('codex_quota_disable_remaining_percent') || 10));
@@ -119,7 +80,6 @@ export default function Dashboard() {
     const [settingsMessage, setSettingsMessage] = useState<SettingsMessage>({ type: '', text: '' });
     const autoProbeConfigLoadedRef = useRef(false);
     const autoProbeConfigSyncPrimedRef = useRef(false);
-    const previousMailProviderRef = useRef<'mailfree' | 'inbucket' | 'inbucket_ice' | 'duckmail'>('mailfree');
 
     useEffect(() => {
         const key = localStorage.getItem('management_key');
@@ -131,72 +91,27 @@ export default function Dashboard() {
         const initConfig = async () => {
             try {
                 const { data } = await configApi.post('/config', { password: key });
-                if (data.ok) {
-                    const resolvedUrl = String(data.config.cpa_url || '').trim();
-                    const resolvedAutoProbeEnabled = parseConfigBoolean(data.config.auto_probe_enabled, getInitialAutoProbeEnabled());
-                    const resolvedAutoProbeInterval = clampAutoProbeIntervalMinutes(
-                        data.config.auto_probe_interval_minutes,
-                        clampAutoProbeIntervalMinutes(localStorage.getItem('probe_auto_interval_minutes') || 60),
-                    );
-                    const resolvedQuotaDisableRemainingPercent = clampQuotaDisableRemainingPercent(
-                        data.config.codex_quota_disable_remaining_percent,
-                        clampQuotaDisableRemainingPercent(localStorage.getItem('codex_quota_disable_remaining_percent') || 10),
-                    );
-                    cpaApi.defaults.baseURL = '/api/cpa';
-                    setCpaUrl(resolvedUrl);
-                    {
-                        const provider = String(data.config.mail_email_provider || 'mailfree').trim().toLowerCase();
-                        setMailEmailProvider(provider === 'inbucket' || provider === 'inbucket_ice' || provider === 'duckmail' ? provider : 'mailfree');
-                    }
-                    setMailApiBase(String(data.config.mail_api_base || ''));
-                    setMailfreeApiBase(String(data.config.mailfree_api_base || data.config.mail_api_base || ''));
-                    setDuckmailApiBase(String(data.config.duckmail_api_base || data.mail_meta?.duckmail_api_base || ''));
-                    setDuckmailApiKey(String(data.config.duckmail_api_key || ''));
-                    setMailUsername(String(data.config.mail_username || ''));
-                    setMailfreeUsername(String(data.config.mailfree_username || data.config.mail_username || ''));
-                    setMailPassword(String(data.config.mail_password || ''));
-                    setMailfreePassword(String(data.config.mailfree_password || data.config.mail_password || ''));
-                    setMailEmailDomain(String(data.config.mail_email_domain || ''));
-                    setMailfreeEmailDomain(String(data.config.mailfree_mail_domain || data.config.mail_email_domain || ''));
-                    setMailEmailDomains(String(data.config.mail_email_domains || ''));
-                    setMailfreeEmailDomains(String(data.config.mailfree_mail_domains || data.config.mail_email_domains || ''));
-                    setInbucketApiBase(String(data.mail_meta?.inbucket_api_base || ''));
-                    setInbucketUsername(String(data.config.inbucket_mail_username || ''));
-                    setInbucketPassword(String(data.config.inbucket_mail_password || ''));
-                    setInbucketEmailDomain(String(data.config.inbucket_mail_domain || ''));
-                    setInbucketDomains(Array.isArray(data.mail_meta?.inbucket_domains) ? data.mail_meta.inbucket_domains.map((item: unknown) => String(item || '').trim()).filter(Boolean) : []);
-                    setInbucketDisabledDomains(
-                        String(data.config.inbucket_mail_disabled_domains || '')
-                            .split(',')
-                            .map((item: string) => item.trim().toLowerCase())
-                            .filter(Boolean),
-                    );
-                    setInbucketIceApiBase(String(data.config.inbucket_ice_mail_api_base || data.config.inbucket_v1_mail_api_base || ''));
-                    setInbucketIceUsername(String(data.config.inbucket_ice_mail_username || data.config.inbucket_v1_mail_username || ''));
-                    setInbucketIcePassword(String(data.config.inbucket_ice_mail_password || data.config.inbucket_v1_mail_password || ''));
-                    setInbucketIceEmailDomain(String(data.config.inbucket_ice_mail_domain || data.config.inbucket_v1_mail_domain || ''));
-                    {
-                        const parsed = String(data.config.inbucket_ice_mail_domains || data.config.inbucket_v1_mail_domains || '')
-                            .split(',')
-                            .map((item: string) => item.trim())
-                            .filter(Boolean);
-                        setInbucketIceDomains(parsed);
-                    }
-                    setDuckmailDomains(Array.isArray(data.mail_meta?.duckmail_domains) ? data.mail_meta.duckmail_domains.map((item: unknown) => String(item || '').trim()).filter(Boolean) : []);
-                    setMailRandomizeFromList(parseConfigBoolean(data.config.mail_randomize_from_list, true));
-                    setCodexReplenishEnabled(parseConfigBoolean(data.config.codex_replenish_enabled, false));
-                    setCodexReplenishTargetCount(parseIntSafe(data.config.codex_replenish_target_count, 5));
-                    setCodexReplenishThreshold(parseIntSafe(data.config.codex_replenish_threshold, 2));
-                    setCodexReplenishBatchSize(parseIntSafe(data.config.codex_replenish_batch_size, 1));
-                    setCodexReplenishWorkerCount(parseIntSafe(data.config.codex_replenish_worker_count, 1));
-                    setCodexReplenishUseProxy(parseConfigBoolean(data.config.codex_replenish_use_proxy, true));
-                    setCodexReplenishProxyPool(String(data.config.codex_replenish_proxy_pool || ''));
-                    setAutoProbeEnabled(resolvedAutoProbeEnabled);
-                    setAutoProbeIntervalMinutes(resolvedAutoProbeInterval);
-                    setCodexQuotaDisableRemainingPercent(resolvedQuotaDisableRemainingPercent);
-                    setAutoProbeConfigStatus('loaded');
-                    autoProbeConfigLoadedRef.current = true;
-                }
+                if (!data.ok) return;
+
+                const resolvedUrl = String(data.config.cpa_url || '').trim();
+                const resolvedAutoProbeEnabled = parseConfigBoolean(data.config.auto_probe_enabled, getInitialAutoProbeEnabled());
+                const resolvedAutoProbeInterval = clampAutoProbeIntervalMinutes(
+                    data.config.auto_probe_interval_minutes,
+                    clampAutoProbeIntervalMinutes(localStorage.getItem('probe_auto_interval_minutes') || 60),
+                );
+                const resolvedQuotaDisableRemainingPercent = clampQuotaDisableRemainingPercent(
+                    data.config.codex_quota_disable_remaining_percent,
+                    clampQuotaDisableRemainingPercent(localStorage.getItem('codex_quota_disable_remaining_percent') || 10),
+                );
+
+                cpaApi.defaults.baseURL = '/api/cpa';
+                clearAuthFilesCache();
+                setCpaUrl(resolvedUrl);
+                setAutoProbeEnabled(resolvedAutoProbeEnabled);
+                setAutoProbeIntervalMinutes(resolvedAutoProbeInterval);
+                setCodexQuotaDisableRemainingPercent(resolvedQuotaDisableRemainingPercent);
+                setAutoProbeConfigStatus('loaded');
+                autoProbeConfigLoadedRef.current = true;
             } catch {
                 localStorage.removeItem('management_key');
                 navigate('/login');
@@ -217,99 +132,9 @@ export default function Dashboard() {
         try {
             localStorage.setItem('theme', theme);
         } catch {
-            // ignore localStorage errors
+            // Ignore localStorage errors.
         }
     }, [theme]);
-
-    useEffect(() => {
-        const previousProvider = previousMailProviderRef.current;
-        if (previousProvider === mailEmailProvider) return;
-
-        if (previousProvider === 'mailfree') {
-            setMailfreeApiBase(mailApiBase);
-            setMailfreeUsername(mailUsername);
-            setMailfreePassword(mailPassword);
-            setMailfreeEmailDomain(mailEmailDomain);
-            setMailfreeEmailDomains(mailEmailDomains);
-        } else if (previousProvider === 'inbucket' || previousProvider === 'inbucket_ice') {
-            if (previousProvider === 'inbucket') {
-                setInbucketApiBase(mailApiBase);
-                setInbucketUsername(mailUsername);
-                setInbucketPassword(mailPassword);
-                setInbucketEmailDomain(mailEmailDomain);
-                setInbucketDomains(
-                    String(mailEmailDomains || '')
-                        .split(',')
-                        .map((item) => String(item || '').trim())
-                        .filter(Boolean),
-                );
-            } else {
-                setInbucketIceApiBase(mailApiBase);
-                setInbucketIceUsername(mailUsername);
-                setInbucketIcePassword(mailPassword);
-                setInbucketIceEmailDomain(mailEmailDomain);
-            }
-        }
-
-        if (mailEmailProvider === 'mailfree') {
-            setMailApiBase(mailfreeApiBase);
-            setMailUsername(mailfreeUsername);
-            setMailPassword(mailfreePassword);
-            setMailEmailDomain(mailfreeEmailDomain);
-            setMailEmailDomains(mailfreeEmailDomains);
-        } else if (mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice') {
-            if (mailEmailProvider === 'inbucket') {
-                setMailApiBase(inbucketApiBase);
-                setMailUsername(inbucketUsername);
-                setMailPassword(inbucketPassword);
-                setMailEmailDomain(inbucketEmailDomain);
-                setMailEmailDomains(inbucketDomains.join(', '));
-            } else {
-                setMailApiBase(inbucketIceApiBase);
-                setMailUsername(inbucketIceUsername);
-                setMailPassword(inbucketIcePassword);
-                setMailEmailDomain(inbucketIceEmailDomain);
-                setMailEmailDomains(inbucketIceDomains.join(', '));
-            }
-        } else {
-            setMailApiBase(duckmailApiBase);
-            setMailUsername('');
-            setMailPassword('');
-            if (duckmailDomains.length > 0) {
-                setMailEmailDomains(duckmailDomains.join(', '));
-                if (!duckmailDomains.includes(mailEmailDomain)) {
-                    setMailEmailDomain(duckmailDomains[0]);
-                }
-            }
-        }
-
-        previousMailProviderRef.current = mailEmailProvider;
-    }, [duckmailApiBase, duckmailDomains, inbucketApiBase, inbucketDomains, inbucketEmailDomain, inbucketPassword, inbucketUsername, inbucketIceApiBase, inbucketIceDomains, inbucketIceEmailDomain, inbucketIcePassword, inbucketIceUsername, mailApiBase, mailEmailDomain, mailEmailDomains, mailEmailProvider, mailPassword, mailUsername, mailfreeApiBase, mailfreeEmailDomain, mailfreeEmailDomains, mailfreePassword, mailfreeUsername]);
-
-    useEffect(() => {
-        if (mailEmailProvider !== 'mailfree') return;
-        setMailfreeApiBase(mailApiBase);
-        setMailfreeUsername(mailUsername);
-        setMailfreePassword(mailPassword);
-        setMailfreeEmailDomain(mailEmailDomain);
-        setMailfreeEmailDomains(mailEmailDomains);
-    }, [mailApiBase, mailEmailDomain, mailEmailDomains, mailEmailProvider, mailPassword, mailUsername]);
-
-    useEffect(() => {
-        if (mailEmailProvider === 'inbucket') {
-            setInbucketApiBase(mailApiBase);
-            setInbucketUsername(mailUsername);
-            setInbucketPassword(mailPassword);
-            setInbucketEmailDomain(mailEmailDomain);
-            return;
-        }
-        if (mailEmailProvider === 'inbucket_ice') {
-            setInbucketIceApiBase(mailApiBase);
-            setInbucketIceUsername(mailUsername);
-            setInbucketIcePassword(mailPassword);
-            setInbucketIceEmailDomain(mailEmailDomain);
-        }
-    }, [mailApiBase, mailEmailDomain, mailEmailProvider, mailPassword, mailUsername]);
 
     useEffect(() => {
         try {
@@ -317,52 +142,38 @@ export default function Dashboard() {
             localStorage.setItem('probe_auto_interval_minutes', String(autoProbeIntervalMinutes));
             localStorage.setItem('codex_quota_disable_remaining_percent', String(codexQuotaDisableRemainingPercent));
         } catch {
-            // ignore localStorage errors
+            // Ignore localStorage errors.
         }
     }, [autoProbeEnabled, autoProbeIntervalMinutes, codexQuotaDisableRemainingPercent]);
 
     useEffect(() => {
         if (!autoProbeConfigLoadedRef.current) return;
+        if (savingSettings) return;
         if (!autoProbeConfigSyncPrimedRef.current) {
             autoProbeConfigSyncPrimedRef.current = true;
             return;
         }
 
         let cancelled = false;
-        const password = String(localStorage.getItem('management_key') || '').trim();
-        if (!password) return;
 
         const timer = window.setTimeout(() => {
+            const password = String(localStorage.getItem('management_key') || '').trim();
+            if (!password) {
+                setAutoProbeConfigStatus('error');
+                return;
+            }
             setAutoProbeConfigStatus('saving');
             void configApi.post('/config/update', {
                 old_password: password,
                 new_config: {
-                    mail_api_base: mailApiBase,
-                    mail_username: mailUsername,
-                    mail_password: mailPassword,
-                    mail_email_provider: mailEmailProvider,
-                    mail_email_domain: mailEmailDomain,
-                    mail_email_domains: mailEmailDomains,
                     auto_probe_enabled: autoProbeEnabled,
                     auto_probe_interval_minutes: autoProbeIntervalMinutes,
                     codex_quota_disable_remaining_percent: codexQuotaDisableRemainingPercent,
-                    mail_randomize_from_list: mailRandomizeFromList,
-                    codex_replenish_enabled: codexReplenishEnabled,
-                    codex_replenish_target_count: codexReplenishTargetCount,
-                    codex_replenish_threshold: codexReplenishThreshold,
-                    codex_replenish_batch_size: codexReplenishBatchSize,
-                    codex_replenish_worker_count: codexReplenishWorkerCount,
-                    codex_replenish_use_proxy: codexReplenishUseProxy,
-                    codex_replenish_proxy_pool: codexReplenishProxyPool,
                 },
             }).then(() => {
-                if (!cancelled) {
-                    setAutoProbeConfigStatus('saved');
-                }
+                if (!cancelled) setAutoProbeConfigStatus('saved');
             }).catch(() => {
-                if (!cancelled) {
-                    setAutoProbeConfigStatus('error');
-                }
+                if (!cancelled) setAutoProbeConfigStatus('error');
             });
         }, 300);
 
@@ -370,27 +181,9 @@ export default function Dashboard() {
             cancelled = true;
             window.clearTimeout(timer);
         };
-    }, [
-        mailApiBase,
-        mailUsername,
-        mailPassword,
-        mailEmailProvider,
-        mailEmailDomain,
-        mailEmailDomains,
-        autoProbeEnabled,
-        autoProbeIntervalMinutes,
-        codexQuotaDisableRemainingPercent,
-        mailRandomizeFromList,
-        codexReplenishEnabled,
-        codexReplenishTargetCount,
-        codexReplenishThreshold,
-        codexReplenishBatchSize,
-        codexReplenishWorkerCount,
-        codexReplenishUseProxy,
-        codexReplenishProxyPool,
-    ]);
+    }, [autoProbeEnabled, autoProbeIntervalMinutes, codexQuotaDisableRemainingPercent, savingSettings]);
 
-    const toggleTheme = () => setTheme((prev) => prev === 'light' ? 'dark' : 'light');
+    const toggleTheme = () => setTheme((previous) => previous === 'light' ? 'dark' : 'light');
     const toggleLanguage = () => i18n.changeLanguage(i18n.language === 'zh' ? 'en' : 'zh');
 
     return (
@@ -412,7 +205,7 @@ export default function Dashboard() {
             <div className="flex flex-1 flex-col min-w-0">
                 <header className="flex h-14 items-center gap-4 border-b border-border bg-card px-6 lg:px-8">
                     <div className="flex-1 flex items-center">
-                        <span className="text-sm font-medium text-muted-foreground">{t('URL')}: {cpaUrl || t('Not Connected')}</span>
+                        <span className="truncate text-sm font-medium text-muted-foreground">{t('URL')}: {cpaUrl || t('Not Connected')}</span>
                     </div>
                     <div className="flex flex-row items-center gap-4">
                         <button onClick={toggleLanguage} className="p-2 rounded-md hover:bg-muted text-muted-foreground transition-colors" title={t('Toggle Language')}>
@@ -422,17 +215,44 @@ export default function Dashboard() {
                             {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
                         </button>
                         <div className="hidden md:flex items-center gap-2 border-l border-border pl-4">
-                            <div className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse"></div>
+                            <div className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
                             <span className="text-sm text-emerald-600 dark:text-emerald-500 font-medium">{t('Connected')}</span>
                         </div>
                         <button
-                            onClick={() => { localStorage.removeItem('management_key'); navigate('/login'); }}
+                            onClick={() => {
+                                localStorage.removeItem('management_key');
+                                navigate('/login');
+                            }}
                             className="text-sm font-medium text-muted-foreground hover:text-foreground inline-flex items-center gap-1.5 transition-colors pl-4 border-l border-border"
                         >
                             <LogOut className="h-4 w-4" /> {t('Sign out')}
                         </button>
                     </div>
                 </header>
+
+                <nav className="grid grid-cols-3 border-b border-border bg-card p-2 md:hidden">
+                    <button
+                        type="button"
+                        onClick={() => setActiveTab('credentials')}
+                        className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-2 text-xs font-medium ${activeTab === 'credentials' ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}
+                    >
+                        <ShieldCheck className="h-4 w-4" /> {t('Auth Files')}
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setActiveTab('archive')}
+                        className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-2 text-xs font-medium ${activeTab === 'archive' ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}
+                    >
+                        <Trash2 className="h-4 w-4" /> {t('Archive')}
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setActiveTab('settings')}
+                        className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-2 text-xs font-medium ${activeTab === 'settings' ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}
+                    >
+                        <Settings className="h-4 w-4" /> {t('Config')}
+                    </button>
+                </nav>
 
                 <main className="flex-1 p-4 lg:p-6 overflow-y-auto">
                     <div className="mx-auto w-full max-w-[1900px] space-y-6">
@@ -456,44 +276,6 @@ export default function Dashboard() {
                                 setCpaUrl={setCpaUrl}
                                 newPassword={newPassword}
                                 setNewPassword={setNewPassword}
-                                mailApiBase={mailApiBase}
-                                setMailApiBase={setMailApiBase}
-                                mailUsername={mailUsername}
-                                setMailUsername={setMailUsername}
-                                mailPassword={mailPassword}
-                                setMailPassword={setMailPassword}
-                                mailEmailProvider={mailEmailProvider}
-                                setMailEmailProvider={setMailEmailProvider}
-                                inbucketApiBase={inbucketApiBase}
-                                duckmailApiBase={duckmailApiBase}
-                                duckmailApiKey={duckmailApiKey}
-                                setDuckmailApiKey={setDuckmailApiKey}
-                                mailEmailDomain={mailEmailDomain}
-                                setMailEmailDomain={setMailEmailDomain}
-                                mailEmailDomains={mailEmailDomains}
-                                setMailEmailDomains={setMailEmailDomains}
-                                inbucketDomains={inbucketDomains}
-                                inbucketIceDomains={inbucketIceDomains}
-                                setInbucketDomains={setInbucketDomains}
-                                inbucketDisabledDomains={inbucketDisabledDomains}
-                                setInbucketDisabledDomains={setInbucketDisabledDomains}
-                                duckmailDomains={duckmailDomains}
-                                mailRandomizeFromList={mailRandomizeFromList}
-                                setMailRandomizeFromList={setMailRandomizeFromList}
-                                codexReplenishEnabled={codexReplenishEnabled}
-                                setCodexReplenishEnabled={setCodexReplenishEnabled}
-                                codexReplenishTargetCount={codexReplenishTargetCount}
-                                setCodexReplenishTargetCount={setCodexReplenishTargetCount}
-                            codexReplenishThreshold={codexReplenishThreshold}
-                            setCodexReplenishThreshold={setCodexReplenishThreshold}
-                            codexReplenishBatchSize={codexReplenishBatchSize}
-                            setCodexReplenishBatchSize={setCodexReplenishBatchSize}
-                            codexReplenishWorkerCount={codexReplenishWorkerCount}
-                            setCodexReplenishWorkerCount={setCodexReplenishWorkerCount}
-                            codexReplenishUseProxy={codexReplenishUseProxy}
-                                setCodexReplenishUseProxy={setCodexReplenishUseProxy}
-                                codexReplenishProxyPool={codexReplenishProxyPool}
-                                setCodexReplenishProxyPool={setCodexReplenishProxyPool}
                                 savingSettings={savingSettings}
                                 setSavingSettings={setSavingSettings}
                                 message={settingsMessage}
@@ -513,7 +295,7 @@ const SidebarButton = ({ active, onClick, icon, label }: SidebarButtonProps) => 
         className={`flex items-center justify-start gap-3 rounded-md px-3 py-2.5 text-sm font-medium transition-all ${active
             ? 'bg-primary/10 text-primary'
             : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground'
-            }`}
+        }`}
     >
         {icon}
         {label}

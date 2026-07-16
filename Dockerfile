@@ -1,45 +1,47 @@
-FROM node:20-bookworm-slim AS frontend-build
+# syntax=docker/dockerfile:1.7
+
+FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS frontend-build
 
 WORKDIR /app/frontend
 
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci
 
-COPY frontend/ ./
+COPY frontend/index.html frontend/vite.config.ts frontend/tsconfig.json frontend/tsconfig.app.json frontend/tsconfig.node.json ./
+COPY frontend/postcss.config.js frontend/tailwind.config.js ./
+COPY frontend/public ./public
+COPY frontend/src ./src
 RUN npm run build
 
 
-FROM node:20-bookworm-slim AS runtime
+FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS runtime
 
 WORKDIR /app
 
-ENV NODE_ENV=production
-ENV PORT=8333
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH="/opt/venv/bin:${PATH}"
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
-    && ln -sf /usr/bin/python3 /usr/local/bin/python \
-    && python3 -m venv /opt/venv \
-    && rm -rf /var/lib/apt/lists/*
+ENV NODE_ENV=production \
+    PORT=8333
 
 COPY frontend/package.json frontend/package-lock.json /app/frontend/
-RUN cd /app/frontend && npm ci --omit=dev
+RUN --mount=type=cache,target=/root/.npm \
+    cd /app/frontend \
+    && npm ci --omit=dev
 
-COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
-COPY . /app
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir . \
-    && python -m playwright install --with-deps chromium
-RUN if [ ! -f /app/frontend/config.yaml ] && [ -f /app/frontend/config.example.yaml ]; then \
-      cp /app/frontend/config.example.yaml /app/frontend/config.yaml; \
-    fi \
-    && mkdir -p /app/runtime
+COPY --from=frontend-build --chown=node:node /app/frontend/dist /app/frontend/dist
+COPY --chown=node:node frontend/server.js frontend/runtimeProbePlanner.js /app/frontend/
+COPY --chown=node:node frontend/serializedJsonStore.js frontend/keyedOperationQueue.js /app/frontend/
+COPY --chown=node:node frontend/asyncRequestCache.js frontend/asyncConcurrency.js /app/frontend/
+COPY --chown=node:node frontend/credentialStatusTransaction.js frontend/managementAuth.js frontend/config.example.yaml /app/frontend/
+COPY --chown=node:node frontend/src/shared/providerRuntimeStrategies.js /app/frontend/src/shared/
 
+RUN mkdir -p /app/config /app/runtime \
+    && chown -R node:node /app/config /app/runtime /app/frontend
+
+USER node
 WORKDIR /app/frontend
 
 EXPOSE 8333
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 8333) + '/api/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
 
 CMD ["node", "server.js"]

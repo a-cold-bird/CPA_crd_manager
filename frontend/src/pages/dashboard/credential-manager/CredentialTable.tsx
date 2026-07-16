@@ -78,7 +78,7 @@ function getDisabledBadgeMeta(status: ProbeUiStatus | undefined, hasQuotaResume:
             detail: i18nLanguage === 'zh' ? '等待自动恢复' : 'Auto Enable Scheduled',
         };
     }
-    if (status === 'invalidated' || status === 'unauthorized' || status === 'deactivated' || status === 'expired_by_time' || status === 'error') {
+    if (status === 'invalidated' || status === 'unauthorized' || status === 'deactivated' || status === 'workspace_deactivated' || status === 'expired_by_time' || status === 'error') {
         return {
             label: i18nLanguage === 'zh' ? '自动禁用(状态)' : 'Auto Disabled (Status)',
             detail: i18nLanguage === 'zh' ? '封禁/失效自动禁用' : 'Auto-disabled by status',
@@ -298,7 +298,7 @@ export default function CredentialTable({
                                                     <div className="flex items-center gap-2">
                                                         {st?.status === 'active' ? (
                                                             <span className="flex items-center text-emerald-500"><CheckCircle2 className="w-4 h-4 mr-1.5" /> {t('Active')}</span>
-                                                        ) : st?.status === 'invalidated' || st?.status === 'unauthorized' || st?.status === 'deactivated' || st?.status === 'expired_by_time' || st?.status === 'quota_exhausted' || st?.status === 'quota_low_remaining' || st?.status === 'rate_limited' || st?.status === 'error' ? (
+                                                        ) : st?.status === 'invalidated' || st?.status === 'unauthorized' || st?.status === 'deactivated' || st?.status === 'workspace_deactivated' || st?.status === 'expired_by_time' || st?.status === 'quota_exhausted' || st?.status === 'quota_low_remaining' || st?.status === 'rate_limited' || st?.status === 'error' ? (
                                                             <span className="flex items-center text-destructive" title={st.reason}>
                                                                 <AlertTriangle className="w-4 h-4 mr-1.5" />
                                                                 {st.status === 'quota_low_remaining'

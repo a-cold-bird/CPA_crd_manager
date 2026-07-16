@@ -34,4 +34,5 @@ export function classifyProviderProbe(provider: string, response: ProbeResponse,
 export function canProbeCredential(cred: Credential): boolean;
 export function shouldAutoDisable(status: string): boolean;
 export function shouldAutoArchive(status: string): boolean;
+export function resolveRuntimeNextProbeAtMs(status: string, quota: CodexQuotaInfo | null | undefined, normalIntervalMs: number, nowMs?: number): number;
 export function toProbeErrorResponse(error: unknown): ProbeResponse;

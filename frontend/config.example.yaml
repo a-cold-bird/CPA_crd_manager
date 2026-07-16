@@ -1,49 +1,6 @@
-﻿cpa_url: http://127.0.0.1:8317
-management_key: CHANGE_ME
-# mailfree | inbucket | inbucket_ice | duckmail
-mail_email_provider: mailfree
-mail_api_base: https://mailfree.example.workers.dev
-mail_username: admin
-mail_password: CHANGE_ME
-mail_email_domain: example.com
-mail_email_domains: "example.com,example.net"
-mailfree_api_base: https://mailfree.example.workers.dev
-mailfree_username: admin
-mailfree_password: CHANGE_ME
-mailfree_mail_domain: example.com
-mailfree_mail_domains: "example.com,example.net"
-inbucket_mail_api_base: https://mail.example.inbucket.local
-inbucket_mail_username: admin
-inbucket_mail_password: CHANGE_ME
-inbucket_mail_domain: example.inbucket.local
-inbucket_mail_domains: "example.inbucket.local,*.mail.example.inbucket.local"
-inbucket_mail_disabled_domains: ""
-
-# Optional second inbucket profile (ICE/fixed interface)
-# NOTE: inbucket_ice interface fields are fixed by backend and should not be edited via UI.
-inbucket_ice_mail_api_base: https://mailapizv.uton.me
-inbucket_ice_mail_username: ""
-inbucket_ice_mail_password: linuxdo
-inbucket_ice_mail_domain: example-v1.inbucket.local
-inbucket_ice_mail_domains: "example-v1.inbucket.local,*.mail-v1.example.inbucket.local"
-
-# Example custom inbucket with BasicAuth and full mailbox naming
-# inbucket_mail_api_base: http://mail.39c5bb.me
-# inbucket_mail_username: inbucket
-# inbucket_mail_password: admin
-# inbucket_mail_domains: "tokawa-sakiko.xyz,*.cbmu.tokawa-sakiko.xyz,quvpa.com,*.cbmu.quvpa.com"
-duckmail_api_base: https://api.duckmail.sbs
-duckmail_api_key: dk_xxx_replace_me
-duckmail_mail_domain: duckmail.sbs
-duckmail_mail_domains: "duckmail.sbs"
-mail_randomize_from_list: true
+﻿cpa_url: http://host.docker.internal:8317
+management_key: CHANGE_ME_TO_A_STRONG_SECRET
 auto_probe_enabled: false
 auto_probe_interval_minutes: 60
+auto_probe_batch_size: 5
 codex_quota_disable_remaining_percent: 10
-codex_replenish_enabled: false
-codex_replenish_target_count: 5
-codex_replenish_threshold: 2
-codex_replenish_batch_size: 1
-codex_replenish_worker_count: 1
-codex_replenish_use_proxy: false
-codex_replenish_proxy_pool: ""

@@ -9,6 +9,7 @@ import {
   runCredentialArchiveRemove,
   updateCredentialStatus,
 } from '../../lib/api';
+import { batchWithLimit } from '../../lib/concurrency';
 import type { Credential } from '../../lib/api';
 import { useGlobalModal } from '../../components/global-modal/useGlobalModal';
 
@@ -69,6 +70,10 @@ export default function ArchivedCredentialsPanelV2({ cpaReady, cpaUrl }: Archive
   const archivedCredentials = useMemo(
     () => credentials.filter((cred: Credential) => archivedNameSet.has(cred.name)),
     [credentials, archivedNameSet],
+  );
+  const credentialByName = useMemo(
+    () => new Map(archivedCredentials.map((credential) => [credential.name, credential])),
+    [archivedCredentials],
   );
 
   const filteredArchivedCredentials = useMemo(() => {
@@ -132,10 +137,15 @@ export default function ArchivedCredentialsPanelV2({ cpaReady, cpaUrl }: Archive
       const enabledNames: string[] = [];
       const failed: string[] = [];
 
-      for (const name of targets) {
+      await batchWithLimit(targets, async (name) => {
         setRunningEnableNames((prev) => new Set(prev).add(name));
         try {
-          await updateCredentialStatus(name, false);
+          const credential = credentialByName.get(name);
+          if (!credential?.auth_index) throw new Error('Credential identity is unavailable');
+          await updateCredentialStatus(name, false, {
+            cpaUrl,
+            expectedAuthIndex: String(credential.auth_index),
+          });
           enabledNames.push(name);
         } catch {
           failed.push(name);
@@ -146,7 +156,7 @@ export default function ArchivedCredentialsPanelV2({ cpaReady, cpaUrl }: Archive
             return next;
           });
         }
-      }
+      }, 5);
 
       if (enabledNames.length) {
         const result = await runCredentialArchiveRemove({ cpa_url: cpaUrl, names: enabledNames });

@@ -6,56 +6,67 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   classifyProviderProbe,
+  resolveRuntimeNextProbeAtMs,
   shouldAutoArchive,
   shouldAutoDisable,
   toProbeErrorResponse,
 } from './src/shared/providerRuntimeStrategies.js';
+import {
+  canProbeCredentialInRuntime,
+  hasRuntimeOwnershipForCredential,
+  selectCredentialsForProbe,
+} from './runtimeProbePlanner.js';
+import { createSerializedJsonStore } from './serializedJsonStore.js';
+import { createKeyedInFlightDeduper, createKeyedOperationQueue } from './keyedOperationQueue.js';
+import { createKeyedAsyncRequestCache } from './asyncRequestCache.js';
+import { mapWithConcurrency } from './asyncConcurrency.js';
+import { isAuthorizedManagementKey } from './managementAuth.js';
+import {
+  canCommitRuntimeArchive,
+  evaluateCredentialStatusTransitionPrecondition,
+  executeCredentialStatusTransaction,
+  isSameCredentialIdentity,
+} from './credentialStatusTransaction.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const ARCHIVE_STORE_PATH = path.join(PROJECT_ROOT, 'runtime', 'credential_archive.json');
 const RUNTIME_STATE_PATH = path.join(PROJECT_ROOT, 'runtime', 'credential_runtime_state.json');
-const REPLENISHMENT_STATUS_PATH = path.join(PROJECT_ROOT, 'runtime', 'replenishment_status.json');
-const REPLENISHMENT_LOCK_PATH = path.join(PROJECT_ROOT, 'runtime', 'replenishment.lock');
 const BACKEND_SERVER_LOCK_PATH = path.join(PROJECT_ROOT, 'runtime', 'frontend_server.lock');
 
 const app = express();
-const PORT = Number(process.env.CPA_BACKEND_PORT || process.env.API_PORT || 8333);
+const PORT = Number(process.env.CPA_BACKEND_PORT || process.env.API_PORT || process.env.PORT || 8333);
 const DEFAULT_CONFIG_PATH = path.join(process.cwd(), 'config.yaml');
 const CONFIG_PATH = path.resolve(process.env.CPA_CONFIG_FILE || DEFAULT_CONFIG_PATH);
 const CONFIG_FALLBACK_PATH = path.join(process.cwd(), 'config.example.yaml');
 const RUNTIME_WAKE_INTERVAL_MS = 30_000;
+const AUTOMATION_RETRY_DELAY_MS = 30_000;
 const CPA_REQUEST_TIMEOUT_MS = 20_000;
-const MAIL_REQUEST_TIMEOUT_MS = 15_000;
-const RATE_LIMIT_RETRY_MS = 30 * 60_000;
-const RUNTIME_RECHECK_FLOOR_MS = 30_000;
-const AUTO_REPLENISH_RESTART_GUARD_MS = 5 * 60_000;
-const REPLENISHMENT_STALL_TIMEOUT_MS = Number(process.env.REPLENISHMENT_STALL_TIMEOUT_MS || 180_000);
-const INBUCKET_ICE_FIXED = {
-  apiBase: 'https://mailapizv.uton.me',
-  username: '',
-  password: 'linuxdo',
-  host: '',
-};
+const CPA_AUTH_FILES_REQUEST_TIMEOUT_MS = 8_000;
+const CPA_AUTH_FILES_RETRY_DELAY_MS = 500;
+const CPA_AUTH_FILES_CACHE_TTL_MS = 1_000;
+const AUTO_PROBE_MAX_CONCURRENCY = 5;
+const AUTO_PROBE_BATCH_SIZE_DEFAULT = 5;
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true });
+});
 
 const runtimeScheduler = {
   started: false,
-  startedAt: Date.now(),
   timer: null,
   cycleInProgress: false,
-  replenishmentInProgress: false,
-  replenishmentChild: null,
-  replenishmentPid: null,
-  replenishmentStopRequested: false,
-  replenishmentLastOutputAt: null,
-  replenishmentWatchdogInProgress: false,
 };
 
 let backendServerLockHeld = false;
+const cpaAuthFilesCache = createKeyedAsyncRequestCache({
+  ttlMs: CPA_AUTH_FILES_CACHE_TTL_MS,
+  clone: (files) => files.map((item) => ({ ...item })),
+});
+const runKeyedCredentialProbe = createKeyedInFlightDeduper();
 
 
 function resolveReadableConfigPath() {
@@ -77,251 +88,53 @@ function resolveReadableConfigPath() {
   return '';
 }
 
-function resolveReadableFilePath(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) {
-    return '';
-  }
-  try {
-    const stat = fs.statSync(filePath);
-    if (stat.isFile()) {
-      return filePath;
-    }
-    console.error(`Path exists but is not a file: ${filePath}`);
-  } catch (error) {
-    console.error(`Failed to stat path ${filePath}`, error);
-  }
-  return '';
-}
+const CONFIG_DEFAULTS = {
+  cpa_url: '',
+  management_key: '',
+  auto_probe_enabled: false,
+  auto_probe_interval_minutes: 60,
+  auto_probe_batch_size: AUTO_PROBE_BATCH_SIZE_DEFAULT,
+  codex_quota_disable_remaining_percent: 10,
+};
 
-function ensureWritableFilePath(filePath) {
-  if (fs.existsSync(filePath)) {
-    const stat = fs.statSync(filePath);
-    if (!stat.isFile()) {
-      throw new Error(`Path must be a file, but received: ${filePath}`);
-    }
-  }
-}
-
-function normalizeMailProvider(value) {
-  const provider = String(value || '').trim().toLowerCase();
-  if (provider === 'inbucket') return 'inbucket';
-  if (provider === 'inbucket_v1' || provider === 'inbucket_ice') return 'inbucket_ice';
-  if (provider === 'duckmail') return 'duckmail';
-  return 'mailfree';
-}
-
-function deriveActiveMailFields(config) {
-  const provider = normalizeMailProvider(config?.mail_email_provider || 'mailfree');
-  const pickFirstDomain = (domainsText, fallbackDomain = '') => {
-    const list = normalizeDomainListText(domainsText, fallbackDomain)
-      .split(',')
-      .map((item) => item.trim())
-      .filter(Boolean);
-    return list[0] || normalizeDomain(fallbackDomain);
-  };
-
-  if (provider === 'inbucket') {
-    const domainsText = normalizeDomainListText(config?.inbucket_mail_domains || '', config?.inbucket_mail_domain || '');
-    return {
-      ...config,
-      mail_api_base: normalizeCpaBaseUrl(config?.inbucket_mail_api_base || config?.mail_api_base || ''),
-      mail_username: String(config?.inbucket_mail_username ?? config?.mail_username ?? ''),
-      mail_password: String(config?.inbucket_mail_password ?? config?.mail_password ?? ''),
-      mail_host_header: normalizeHostHeader(config?.inbucket_mail_host || config?.mail_host_header || ''),
-      mail_email_domain: normalizeDomain(config?.inbucket_mail_domain || pickFirstDomain(domainsText)),
-      mail_email_domains: domainsText,
-    };
-  }
-
-  if (provider === 'inbucket_ice') {
-    const domainsText = normalizeDomainListText(config?.inbucket_ice_mail_domains || '', config?.inbucket_ice_mail_domain || '');
-    return {
-      ...config,
-      // inbucket_ice interface is fixed and should not be modified from UI.
-      mail_api_base: normalizeCpaBaseUrl(INBUCKET_ICE_FIXED.apiBase),
-      mail_username: String(INBUCKET_ICE_FIXED.username),
-      mail_password: String(INBUCKET_ICE_FIXED.password),
-      mail_host_header: normalizeHostHeader(INBUCKET_ICE_FIXED.host),
-      mail_email_domain: normalizeDomain(config?.inbucket_ice_mail_domain || pickFirstDomain(domainsText)),
-      mail_email_domains: domainsText,
-    };
-  }
-
-  if (provider === 'duckmail') {
-    const domainsText = normalizeDomainListText(config?.duckmail_mail_domains || '', config?.duckmail_mail_domain || '');
-    return {
-      ...config,
-      mail_api_base: normalizeCpaBaseUrl(config?.duckmail_api_base || config?.mail_api_base || 'https://api.duckmail.sbs'),
-      mail_username: '',
-      mail_password: '',
-      mail_host_header: '',
-      mail_email_domain: normalizeDomain(config?.duckmail_mail_domain || pickFirstDomain(domainsText)),
-      mail_email_domains: domainsText,
-      duckmail_api_key: String(config?.duckmail_api_key || ''),
-    };
-  }
-
-  const mailfreeDomains = normalizeDomainListText(
-    config?.mailfree_mail_domains || '',
-    config?.mailfree_mail_domain || '',
-  );
+function normalizeConfig(source = {}) {
   return {
-    ...config,
-    mail_api_base: normalizeCpaBaseUrl(config?.mailfree_api_base || config?.mail_api_base || ''),
-    mail_username: String(config?.mailfree_username ?? config?.mail_username ?? ''),
-    mail_password: String(config?.mailfree_password ?? config?.mail_password ?? ''),
-    mail_host_header: normalizeHostHeader(config?.mail_host_header || ''),
-    mail_email_domain: normalizeDomain(config?.mailfree_mail_domain || pickFirstDomain(mailfreeDomains)),
-    mail_email_domains: mailfreeDomains,
+    cpa_url: normalizeCpaBaseUrl(source.cpa_url),
+    management_key: String(source.management_key || '').trim(),
+    auto_probe_enabled: parseBoolSafe(source.auto_probe_enabled, CONFIG_DEFAULTS.auto_probe_enabled),
+    auto_probe_interval_minutes: Math.max(1, Math.min(1440, parseIntSafe(
+      source.auto_probe_interval_minutes,
+      CONFIG_DEFAULTS.auto_probe_interval_minutes,
+    ))),
+    auto_probe_batch_size: Math.max(1, Math.min(100, parseIntSafe(
+      source.auto_probe_batch_size,
+      CONFIG_DEFAULTS.auto_probe_batch_size,
+    ))),
+    codex_quota_disable_remaining_percent: Math.max(0, Math.min(100, parseIntSafe(
+      source.codex_quota_disable_remaining_percent,
+      CONFIG_DEFAULTS.codex_quota_disable_remaining_percent,
+    ))),
   };
 }
 
-function readMailMeta(config = readConfig()) {
-  const mailfreeApiBase = normalizeCpaBaseUrl(config?.mailfree_api_base || config?.mail_api_base || '');
-  const mailfreeDomains = normalizeDomainListText(config?.mailfree_mail_domains || '').split(',').map((item) => item.trim()).filter(Boolean);
-  const inbucketApiBase = normalizeCpaBaseUrl(config?.inbucket_mail_api_base || config?.mail_api_base || '');
-  const inbucketDomains = normalizeDomainListText(config?.inbucket_mail_domains || '').split(',').map((item) => item.trim()).filter(Boolean);
-  const inbucketDisabledDomains = normalizeDomainListText(config?.inbucket_mail_disabled_domains || '').split(',').map((item) => item.trim()).filter(Boolean);
-  const duckmailApiBase = normalizeCpaBaseUrl(config?.duckmail_api_base || 'https://api.duckmail.sbs');
-  const duckmailDomains = normalizeDomainListText(config?.duckmail_mail_domains || '').split(',').map((item) => item.trim()).filter(Boolean);
-  return {
-    provider_options: [
-      { value: 'mailfree', label: 'mailfree' },
-      { value: 'inbucket', label: 'inbucket' },
-      { value: 'inbucket_ice', label: 'inbucket_ice' },
-      { value: 'duckmail', label: 'duckmail' },
-    ],
-    mailfree_api_base: mailfreeApiBase,
-    mailfree_domains: mailfreeDomains,
-    inbucket_api_base: inbucketApiBase,
-    inbucket_domains: inbucketDomains,
-    inbucket_disabled_domains: inbucketDisabledDomains,
-    duckmail_api_base: duckmailApiBase,
-    duckmail_domains: duckmailDomains,
-  };
-}
-
-// Helper to read config
 function readConfig() {
-  const defaults = {
-    cpa_url: '',
-    management_key: '',
-    mail_email_provider: 'mailfree',
-    mail_api_base: '',
-    mail_username: '',
-    mail_password: '',
-    mail_host_header: '',
-    mail_email_domain: '',
-    mail_email_domains: '',
-    mailfree_api_base: '',
-    mailfree_username: '',
-    mailfree_password: '',
-    mailfree_mail_domain: '',
-    mailfree_mail_domains: '',
-    inbucket_mail_api_base: '',
-    inbucket_mail_username: '',
-    inbucket_mail_password: '',
-    inbucket_mail_host: '',
-    inbucket_mail_domain: '',
-    inbucket_mail_domains: '',
-    inbucket_mail_disabled_domains: '',
-    inbucket_ice_mail_api_base: INBUCKET_ICE_FIXED.apiBase,
-    inbucket_ice_mail_username: INBUCKET_ICE_FIXED.username,
-    inbucket_ice_mail_password: INBUCKET_ICE_FIXED.password,
-    inbucket_ice_mail_host: INBUCKET_ICE_FIXED.host,
-    inbucket_ice_mail_domain: '',
-    inbucket_ice_mail_domains: '',
-    duckmail_api_base: 'https://api.duckmail.sbs',
-    duckmail_api_key: '',
-    duckmail_mail_domain: '',
-    duckmail_mail_domains: '',
-    mail_randomize_from_list: true,
-    codex_replenish_enabled: false, // Added
-    codex_target_count: 5,
-    codex_replenish_target_count: 5, // Added
-    codex_replenish_threshold: 2, // Added
-    codex_replenish_batch_size: 1,
-    codex_replenish_worker_count: 1,
-    codex_replenish_use_proxy: false, // Added
-    codex_replenish_proxy_pool: '',
-    auto_probe_enabled: false,
-    auto_probe_interval_minutes: 60,
-    codex_quota_disable_remaining_percent: 10,
-  };
   const configPathToRead = resolveReadableConfigPath();
   if (!configPathToRead) {
-    return defaults;
+    return { ...CONFIG_DEFAULTS };
   }
   try {
     const file = fs.readFileSync(configPathToRead, 'utf8');
     const parsed = yaml.load(file);
-    if (!parsed || typeof parsed !== 'object') {
-      return defaults;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ...CONFIG_DEFAULTS };
     }
-    const normalizedTargetCount = resolveCodexReplenishTargetCount(parsed, 5);
-    const normalizedMailEmailProvider = normalizeMailProvider(parsed.mail_email_provider || 'mailfree');
-    const normalizedMailfreeDomain = normalizeDomain(parsed.mailfree_mail_domain || '');
-    const normalizedMailfreeDomains = normalizeDomainListText(
-      parsed.mailfree_mail_domains,
-      normalizedMailfreeDomain,
-    );
-    const normalizedInbucketDomain = normalizeDomain(parsed.inbucket_mail_domain || '');
-    const normalizedInbucketMailApiBase = normalizeCpaBaseUrl(parsed.inbucket_mail_api_base || '');
-    const normalizedInbucketMailHost = normalizeHostHeader(parsed.inbucket_mail_host || '');
-    const normalizedInbucketMailDomains = normalizeDomainListText(parsed.inbucket_mail_domains, normalizedInbucketDomain);
-    const normalizedInbucketDisabledDomains = normalizeDomainListText(parsed.inbucket_mail_disabled_domains || '');
-    const normalizedDuckmailDomain = normalizeDomain(parsed.duckmail_mail_domain || '');
-    const normalizedDuckmailApiBase = normalizeCpaBaseUrl(parsed.duckmail_api_base || 'https://api.duckmail.sbs');
-    const normalizedDuckmailMailDomains = normalizeDomainListText(parsed.duckmail_mail_domains, normalizedDuckmailDomain);
-    const normalizedInbucketIceDomain = normalizeDomain(parsed.inbucket_ice_mail_domain || parsed.inbucket_v1_mail_domain || '');
-    const normalizedInbucketIceApiBase = normalizeCpaBaseUrl(parsed.inbucket_ice_mail_api_base || parsed.inbucket_v1_mail_api_base || INBUCKET_ICE_FIXED.apiBase);
-    const normalizedInbucketIceHost = normalizeHostHeader(parsed.inbucket_ice_mail_host || parsed.inbucket_v1_mail_host || INBUCKET_ICE_FIXED.host);
-    const normalizedInbucketIceDomains = normalizeDomainListText(parsed.inbucket_ice_mail_domains || parsed.inbucket_v1_mail_domains, normalizedInbucketIceDomain);
-    const normalizedConfig = {
-      ...defaults,
-      ...parsed,
-      mail_email_provider: normalizedMailEmailProvider,
-      mailfree_api_base: normalizeCpaBaseUrl(parsed.mailfree_api_base || parsed.mail_api_base || ''),
-      mailfree_username: String(parsed.mailfree_username ?? parsed.mail_username ?? ''),
-      mailfree_password: String(parsed.mailfree_password ?? parsed.mail_password ?? ''),
-      mailfree_mail_domain: normalizedMailfreeDomain,
-      mailfree_mail_domains: normalizedMailfreeDomains,
-      inbucket_mail_api_base: normalizedInbucketMailApiBase,
-      inbucket_mail_username: String(parsed.inbucket_mail_username ?? ''),
-      inbucket_mail_password: String(parsed.inbucket_mail_password ?? ''),
-      inbucket_mail_host: normalizedInbucketMailHost,
-      inbucket_mail_domain: normalizedInbucketDomain,
-      inbucket_mail_domains: normalizedInbucketMailDomains,
-      inbucket_mail_disabled_domains: normalizedInbucketDisabledDomains,
-      // keep inbucket_ice interface fixed while still allowing domain list updates.
-      inbucket_ice_mail_api_base: normalizedInbucketIceApiBase || INBUCKET_ICE_FIXED.apiBase,
-      inbucket_ice_mail_username: String(parsed.inbucket_ice_mail_username ?? parsed.inbucket_v1_mail_username ?? INBUCKET_ICE_FIXED.username),
-      inbucket_ice_mail_password: String(parsed.inbucket_ice_mail_password ?? parsed.inbucket_v1_mail_password ?? INBUCKET_ICE_FIXED.password),
-      inbucket_ice_mail_host: normalizedInbucketIceHost,
-      inbucket_ice_mail_domain: normalizedInbucketIceDomain,
-      inbucket_ice_mail_domains: normalizedInbucketIceDomains,
-      duckmail_api_base: normalizedDuckmailApiBase,
-      duckmail_api_key: String(parsed.duckmail_api_key || ''),
-      duckmail_mail_domain: normalizedDuckmailDomain,
-      duckmail_mail_domains: normalizedDuckmailMailDomains,
-      mail_randomize_from_list: parseBoolSafe(parsed.mail_randomize_from_list, true),
-      codex_replenish_enabled: parseBoolSafe(parsed.codex_replenish_enabled, false), // Added
-      codex_replenish_target_count: normalizedTargetCount,
-      codex_target_count: normalizedTargetCount,
-      codex_replenish_threshold: normalizeCodexReplenishThreshold(parsed.codex_replenish_threshold, normalizedTargetCount, 2), // Added
-      codex_replenish_batch_size: normalizeCodexReplenishBatchSize(parsed.codex_replenish_batch_size, 1),
-      codex_replenish_worker_count: normalizeCodexReplenishWorkerCount(parsed.codex_replenish_worker_count, 1),
-      codex_replenish_use_proxy: parseBoolSafe(parsed.codex_replenish_use_proxy, false), // Added
-      codex_replenish_proxy_pool: String(parsed.codex_replenish_proxy_pool || ''),
-    };
-    return deriveActiveMailFields(normalizedConfig);
-  } catch (e) {
-    console.error('Failed to parse config.yaml', e);
-    return defaults;
+    return normalizeConfig({ ...CONFIG_DEFAULTS, ...parsed });
+  } catch (error) {
+    console.error('Failed to parse config.yaml', error);
+    return { ...CONFIG_DEFAULTS };
   }
 }
 
-// Helper to write config
 function writeConfig(data) {
   if (fs.existsSync(CONFIG_PATH)) {
     const stat = fs.statSync(CONFIG_PATH);
@@ -329,134 +142,42 @@ function writeConfig(data) {
       throw new Error(`CONFIG_PATH must be a file, but received: ${CONFIG_PATH}`);
     }
   }
-  const current = readConfig();
-  const merged = { ...current, ...data };
-  const normalizedTargetCount = resolveCodexReplenishTargetCount(merged, 5);
-  const normalizedThreshold = normalizeCodexReplenishThreshold(merged.codex_replenish_threshold, normalizedTargetCount, 2);
-  const normalizedBatchSize = normalizeCodexReplenishBatchSize(merged.codex_replenish_batch_size, 1);
-  const normalizedWorkerCount = normalizeCodexReplenishWorkerCount(merged.codex_replenish_worker_count, 1);
-  const normalizedMailEmailProvider = normalizeMailProvider(merged.mail_email_provider || 'mailfree');
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_api_base')) {
-    if (normalizedMailEmailProvider === 'inbucket') {
-      merged.inbucket_mail_api_base = data.mail_api_base;
-    } else if (normalizedMailEmailProvider === 'inbucket_ice') {
-      // inbucket_ice interface is fixed: ignore user-supplied mail_api_base.
-      merged.inbucket_ice_mail_api_base = INBUCKET_ICE_FIXED.apiBase;
-    } else if (normalizedMailEmailProvider === 'duckmail') {
-      merged.duckmail_api_base = data.mail_api_base;
-    } else {
-      merged.mailfree_api_base = data.mail_api_base;
-    }
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_username') && normalizedMailEmailProvider === 'mailfree') {
-    merged.mailfree_username = data.mail_username;
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_username') && normalizedMailEmailProvider === 'inbucket') {
-    merged.inbucket_mail_username = data.mail_username;
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_username') && normalizedMailEmailProvider === 'inbucket_ice') {
-    merged.inbucket_ice_mail_username = INBUCKET_ICE_FIXED.username;
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_password') && normalizedMailEmailProvider === 'mailfree') {
-    merged.mailfree_password = data.mail_password;
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_password') && normalizedMailEmailProvider === 'inbucket') {
-    merged.inbucket_mail_password = data.mail_password;
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_password') && normalizedMailEmailProvider === 'inbucket_ice') {
-    merged.inbucket_ice_mail_password = INBUCKET_ICE_FIXED.password;
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_host_header') && normalizedMailEmailProvider === 'inbucket') {
-    merged.inbucket_mail_host = data.mail_host_header;
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_host_header') && normalizedMailEmailProvider === 'inbucket_ice') {
-    merged.inbucket_ice_mail_host = INBUCKET_ICE_FIXED.host;
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_host_header') && normalizedMailEmailProvider === 'mailfree') {
-    merged.mail_host_header = data.mail_host_header;
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_email_domain')) {
-    if (normalizedMailEmailProvider === 'inbucket') {
-      merged.inbucket_mail_domain = data.mail_email_domain;
-    } else if (normalizedMailEmailProvider === 'inbucket_ice') {
-      merged.inbucket_ice_mail_domain = data.mail_email_domain;
-    } else if (normalizedMailEmailProvider === 'duckmail') {
-      merged.duckmail_mail_domain = data.mail_email_domain;
-    } else {
-      merged.mailfree_mail_domain = data.mail_email_domain;
-    }
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'mail_email_domains')) {
-    if (normalizedMailEmailProvider === 'inbucket') {
-      merged.inbucket_mail_domains = data.mail_email_domains;
-    } else if (normalizedMailEmailProvider === 'inbucket_ice') {
-      merged.inbucket_ice_mail_domains = data.mail_email_domains;
-    } else if (normalizedMailEmailProvider === 'duckmail') {
-      merged.duckmail_mail_domains = data.mail_email_domains;
-    } else {
-      merged.mailfree_mail_domains = data.mail_email_domains;
-    }
-  }
-  if (Object.prototype.hasOwnProperty.call(data, 'inbucket_mail_disabled_domains')) {
-    merged.inbucket_mail_disabled_domains = data.inbucket_mail_disabled_domains;
-  }
-
-  const normalizedMailfreeDomain = normalizeDomain(merged.mailfree_mail_domain || '');
-  const normalizedMailfreeDomains = normalizeDomainListText(merged.mailfree_mail_domains, normalizedMailfreeDomain);
-  const normalizedInbucketDomain = normalizeDomain(merged.inbucket_mail_domain || '');
-  const normalizedInbucketMailApiBase = normalizeCpaBaseUrl(merged.inbucket_mail_api_base || '');
-  const normalizedInbucketMailHost = normalizeHostHeader(merged.inbucket_mail_host || '');
-  const normalizedInbucketMailDomains = normalizeDomainListText(merged.inbucket_mail_domains, normalizedInbucketDomain);
-  const normalizedInbucketDisabledDomains = normalizeDomainListText(merged.inbucket_mail_disabled_domains || '');
-  const normalizedDuckmailDomain = normalizeDomain(merged.duckmail_mail_domain || '');
-  const normalizedDuckmailApiBase = normalizeCpaBaseUrl(merged.duckmail_api_base || 'https://api.duckmail.sbs');
-  const normalizedDuckmailMailDomains = normalizeDomainListText(merged.duckmail_mail_domains, normalizedDuckmailDomain);
-  const normalizedInbucketIceDomain = normalizeDomain(merged.inbucket_ice_mail_domain || merged.inbucket_v1_mail_domain || '');
-  const normalizedInbucketIceApiBase = normalizeCpaBaseUrl(merged.inbucket_ice_mail_api_base || merged.inbucket_v1_mail_api_base || INBUCKET_ICE_FIXED.apiBase);
-  const normalizedInbucketIceHost = normalizeHostHeader(merged.inbucket_ice_mail_host || merged.inbucket_v1_mail_host || INBUCKET_ICE_FIXED.host);
-  const normalizedInbucketIceDomains = normalizeDomainListText(merged.inbucket_ice_mail_domains || merged.inbucket_v1_mail_domains, normalizedInbucketIceDomain);
-  merged.codex_replenish_target_count = normalizedTargetCount;
-  merged.codex_target_count = normalizedTargetCount;
-  merged.codex_replenish_threshold = normalizedThreshold;
-  merged.codex_replenish_batch_size = normalizedBatchSize;
-  merged.codex_replenish_worker_count = normalizedWorkerCount;
-  merged.mail_email_provider = normalizedMailEmailProvider;
-  merged.mailfree_api_base = normalizeCpaBaseUrl(merged.mailfree_api_base || merged.mail_api_base || '');
-  merged.mailfree_username = String(merged.mailfree_username ?? merged.mail_username ?? '');
-  merged.mailfree_password = String(merged.mailfree_password ?? merged.mail_password ?? '');
-  merged.mailfree_mail_domain = normalizedMailfreeDomain;
-  merged.mailfree_mail_domains = normalizedMailfreeDomains;
-  merged.inbucket_mail_api_base = normalizedInbucketMailApiBase;
-  merged.inbucket_mail_username = String(merged.inbucket_mail_username ?? merged.mail_username ?? '');
-  merged.inbucket_mail_password = String(merged.inbucket_mail_password ?? merged.mail_password ?? '');
-  merged.inbucket_mail_host = normalizedInbucketMailHost;
-  merged.inbucket_mail_domain = normalizedInbucketDomain;
-  merged.inbucket_mail_domains = normalizedInbucketMailDomains;
-  merged.inbucket_mail_disabled_domains = normalizedInbucketDisabledDomains;
-  // Enforce fixed inbucket_ice interface fields.
-  merged.inbucket_ice_mail_api_base = INBUCKET_ICE_FIXED.apiBase;
-  merged.inbucket_ice_mail_username = INBUCKET_ICE_FIXED.username;
-  merged.inbucket_ice_mail_password = INBUCKET_ICE_FIXED.password;
-  merged.inbucket_ice_mail_host = INBUCKET_ICE_FIXED.host;
-  merged.inbucket_ice_mail_domain = normalizedInbucketIceDomain;
-  merged.inbucket_ice_mail_domains = normalizedInbucketIceDomains;
-  merged.duckmail_api_base = normalizedDuckmailApiBase;
-  merged.duckmail_api_key = String(merged.duckmail_api_key || '');
-  merged.duckmail_mail_domain = normalizedDuckmailDomain;
-  merged.duckmail_mail_domains = normalizedDuckmailMailDomains;
-  const derived = deriveActiveMailFields(merged);
-  merged.mail_api_base = derived.mail_api_base;
-  merged.mail_username = derived.mail_username;
-  merged.mail_password = derived.mail_password;
-  merged.mail_email_domain = derived.mail_email_domain;
-  merged.mail_email_domains = derived.mail_email_domains;
-  const str = yaml.dump(merged);
+  const normalized = normalizeConfig({ ...readConfig(), ...data });
+  const str = yaml.dump(normalized);
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, str, 'utf-8');
+  const temporaryPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(temporaryPath, 'w', 0o600);
+    fs.writeFileSync(descriptor, str, 'utf8');
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(temporaryPath, CONFIG_PATH);
+    try {
+      fs.chmodSync(CONFIG_PATH, 0o600);
+    } catch {
+      // Some mounted filesystems do not support POSIX permissions.
+    }
+  } catch (error) {
+    if (descriptor !== null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // Preserve the original write error.
+      }
+    }
+    try {
+      fs.rmSync(temporaryPath, { force: true });
+    } catch {
+      // Preserve the original write error.
+    }
+    throw error;
+  }
 }
 
 function isAuthorized(password, config) {
-  return typeof password === 'string' && password === String(config.management_key || '');
+  return isAuthorizedManagementKey(password, config?.management_key);
 }
 
 function parseIntSafe(value, defaultValue) {
@@ -472,38 +193,6 @@ function parseBoolSafe(value, defaultValue = false) {
     if (lower === 'false' || lower === '0' || lower === 'no') return false;
   }
   return defaultValue;
-}
-
-function normalizeDomain(value) {
-  return String(value || '').trim().toLowerCase().replace(/^@+/, '');
-}
-
-function normalizeHostHeader(value) {
-  let host = String(value || '').trim();
-  if (!host) return '';
-  host = host.replace(/^https?:\/\//i, '');
-  host = host.split('/')[0].trim();
-  return host;
-}
-
-function normalizeDomainListText(value, fallbackDomain = '') {
-  const items = typeof value === 'string'
-    ? value.replace(/\r/g, '\n').split(/[\n,]+/)
-    : Array.isArray(value)
-      ? value
-      : [];
-  const domains = [];
-  items.forEach((item) => {
-    const normalized = normalizeDomain(item);
-    if (normalized && !domains.includes(normalized)) {
-      domains.push(normalized);
-    }
-  });
-  const fallback = normalizeDomain(fallbackDomain);
-  if (fallback && !domains.includes(fallback)) {
-    domains.unshift(fallback);
-  }
-  return domains.join(', ');
 }
 
 function ensureRuntimeDir() {
@@ -606,71 +295,30 @@ function installBackendServerExitHandlers() {
   });
 }
 
-function normalizeNonNegativeInteger(value, fallback = 0) {
-  return Math.max(0, parseIntSafe(value, fallback));
-}
-
-function resolveCodexReplenishTargetCount(source, fallback = 5) {
-  if (!source || typeof source !== 'object') {
-    return fallback;
-  }
-  if (source.codex_replenish_target_count !== undefined) {
-    return normalizeNonNegativeInteger(source.codex_replenish_target_count, fallback);
-  }
-  if (source.codex_target_count !== undefined) {
-    return normalizeNonNegativeInteger(source.codex_target_count, fallback);
-  }
-  return normalizeNonNegativeInteger(fallback, 5);
-}
-
-function normalizeCodexReplenishThreshold(value, targetCount, fallback = 0) {
-  return Math.min(normalizeNonNegativeInteger(value, fallback), Math.max(0, targetCount));
-}
-
-function normalizeCodexReplenishBatchSize(value, fallback = 1) {
-  return Math.max(1, Math.min(200, normalizeNonNegativeInteger(value, fallback)));
-}
-
-function normalizeCodexReplenishWorkerCount(value, fallback = 1) {
-  return Math.max(1, Math.min(200, normalizeNonNegativeInteger(value, fallback)));
-}
-
-function readArchiveStore() {
-  const storePath = resolveReadableFilePath(ARCHIVE_STORE_PATH);
-  if (!storePath) {
-    return { by_cpa_url: {} };
-  }
-  try {
-    const raw = fs.readFileSync(storePath, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') {
-      return { by_cpa_url: {} };
-    }
-    if (!parsed.by_cpa_url || typeof parsed.by_cpa_url !== 'object') {
-      return { by_cpa_url: {} };
-    }
-    const normalizedStore = { by_cpa_url: {} };
-    Object.entries(parsed.by_cpa_url).forEach(([rawKey, value]) => {
-      const normalizedKey = normalizeCpaUrlForArchive(rawKey);
-      const existing = Array.isArray(normalizedStore.by_cpa_url[normalizedKey]) ? normalizedStore.by_cpa_url[normalizedKey] : [];
-      const incoming = Array.isArray(value) ? value : [];
-      normalizedStore.by_cpa_url[normalizedKey] = normalizeArchiveEntries([...existing, ...incoming]);
-    });
-    return normalizedStore;
-  } catch {
-    return { by_cpa_url: {} };
-  }
-}
-
-function writeArchiveStore(store) {
-  ensureWritableFilePath(ARCHIVE_STORE_PATH);
+function normalizeArchiveStore(store) {
   const normalizedStore = { by_cpa_url: {} };
   const source = store?.by_cpa_url && typeof store.by_cpa_url === 'object' ? store.by_cpa_url : {};
   Object.entries(source).forEach(([rawKey, value]) => {
-    normalizedStore.by_cpa_url[normalizeCpaUrlForArchive(rawKey)] = normalizeArchiveEntries(value);
+    const normalizedKey = normalizeCpaUrlForArchive(rawKey);
+    const existing = Array.isArray(normalizedStore.by_cpa_url[normalizedKey]) ? normalizedStore.by_cpa_url[normalizedKey] : [];
+    const incoming = Array.isArray(value) ? value : [];
+    normalizedStore.by_cpa_url[normalizedKey] = normalizeArchiveEntries([...existing, ...incoming]);
   });
-  fs.mkdirSync(path.dirname(ARCHIVE_STORE_PATH), { recursive: true });
-  fs.writeFileSync(ARCHIVE_STORE_PATH, `${JSON.stringify(normalizedStore, null, 2)}\n`, 'utf8');
+  return normalizedStore;
+}
+
+const archiveStore = createSerializedJsonStore({
+  filePath: ARCHIVE_STORE_PATH,
+  createDefault: () => ({ by_cpa_url: {} }),
+  normalize: normalizeArchiveStore,
+});
+
+function readArchiveStore() {
+  return archiveStore.read();
+}
+
+function mutateArchiveStore(mutator) {
+  return archiveStore.mutate(mutator);
 }
 
 function createEmptyRuntimeState() {
@@ -681,6 +329,8 @@ function createEmptyRuntimeState() {
       last_cycle_started_at: null,
       last_cycle_finished_at: null,
       last_error: '',
+      probe_cursor_name: '',
+      last_probe_count: 0,
     },
   };
 }
@@ -690,6 +340,7 @@ function normalizeStringOrEmpty(value) {
 }
 
 function normalizeNumberOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
 }
@@ -697,270 +348,6 @@ function normalizeNumberOrNull(value) {
 function normalizeBoolean(value, fallback = false) {
   if (typeof value === 'boolean') return value;
   return fallback;
-}
-
-function normalizeBatchAccountStatus(value) {
-  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-  return {
-    idx: normalizeNumberOrNull(source.idx),
-    total: normalizeNumberOrNull(source.total),
-    email: normalizeStringOrEmpty(source.email),
-    proxy: normalizeStringOrEmpty(source.proxy),
-    status: normalizeStringOrEmpty(source.status),
-    register_ok: normalizeBoolean(source.register_ok, false),
-    codex_ok: normalizeBoolean(source.codex_ok, false),
-    upload_ok: normalizeBoolean(source.upload_ok, false),
-    error: normalizeStringOrEmpty(source.error),
-    updated_at: normalizeNumberOrNull(source.updated_at),
-  };
-}
-
-function normalizeBatchStatus(value) {
-  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-  return {
-    attempt: normalizeNumberOrNull(source.attempt),
-    requested: normalizeNumberOrNull(source.requested),
-    workers: normalizeNumberOrNull(source.workers),
-    selected_domain: normalizeStringOrEmpty(source.selected_domain),
-    email_selection_mode: normalizeStringOrEmpty(source.email_selection_mode),
-    status: normalizeStringOrEmpty(source.status),
-    register_succeeded: normalizeNumberOrNull(source.register_succeeded) ?? 0,
-    register_failed: normalizeNumberOrNull(source.register_failed) ?? 0,
-    codex_succeeded: normalizeNumberOrNull(source.codex_succeeded) ?? 0,
-    codex_failed: normalizeNumberOrNull(source.codex_failed) ?? 0,
-    upload_succeeded: normalizeNumberOrNull(source.upload_succeeded) ?? 0,
-    upload_failed: normalizeNumberOrNull(source.upload_failed) ?? 0,
-    current_proxy: normalizeStringOrEmpty(source.current_proxy),
-    current_email: normalizeStringOrEmpty(source.current_email),
-    last_error: normalizeStringOrEmpty(source.last_error),
-    started_at: normalizeNumberOrNull(source.started_at),
-    finished_at: normalizeNumberOrNull(source.finished_at),
-    events: Array.isArray(source.events)
-      ? source.events.map((item) => normalizeStringOrEmpty(item)).filter(Boolean).slice(-20)
-      : [],
-    accounts: Array.isArray(source.accounts)
-      ? source.accounts.map((item) => normalizeBatchAccountStatus(item)).slice(-16)
-      : [],
-  };
-}
-
-function createEmptyReplenishmentStatus() {
-  return {
-    mode: '',
-    in_progress: false,
-    last_started_at: null,
-    last_finished_at: null,
-    last_error: '',
-    last_limit: null,
-    target_count: null,
-    threshold: null,
-    batch_size: null,
-    worker_count: null,
-    use_proxy: false,
-    healthy_count: null,
-    needed: null,
-    new_token_files: null,
-    last_scan_register_total: null,
-    last_scan_cpa_total: null,
-    last_scan_missing_count: null,
-    last_uploaded: null,
-    last_failed: null,
-    failed_names: [],
-    last_summary: '',
-    proxy_pool_size: 0,
-    log_file: '',
-    recent_events: [],
-    log_tail: [],
-    email_selection_mode: '',
-    last_selected_domain: '',
-    domain_stats: {},
-    current_batch: null,
-    batch_history: [],
-  };
-}
-
-function normalizeReplenishmentStatus(value) {
-  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-  const rawDomainStats = source.domain_stats && typeof source.domain_stats === 'object' && !Array.isArray(source.domain_stats)
-    ? source.domain_stats
-    : {};
-  const domainStats = {};
-  Object.entries(rawDomainStats).forEach(([domain, stat]) => {
-    const normalizedDomain = normalizeStringOrEmpty(domain).toLowerCase();
-    if (!normalizedDomain || !stat || typeof stat !== 'object' || Array.isArray(stat)) {
-      return;
-    }
-    domainStats[normalizedDomain] = {
-      total: normalizeNumberOrNull(stat.total) ?? 0,
-      success: normalizeNumberOrNull(stat.success) ?? 0,
-      fail: normalizeNumberOrNull(stat.fail) ?? 0,
-    };
-  });
-  return {
-    mode: normalizeStringOrEmpty(source.mode),
-    in_progress: normalizeBoolean(source.in_progress, false),
-    last_started_at: normalizeNumberOrNull(source.last_started_at),
-    last_finished_at: normalizeNumberOrNull(source.last_finished_at),
-    last_error: normalizeStringOrEmpty(source.last_error),
-    last_limit: normalizeNumberOrNull(source.last_limit),
-    target_count: normalizeNumberOrNull(source.target_count),
-    threshold: normalizeNumberOrNull(source.threshold),
-    batch_size: normalizeNumberOrNull(source.batch_size),
-    worker_count: normalizeNumberOrNull(source.worker_count),
-    use_proxy: normalizeBoolean(source.use_proxy, false),
-    healthy_count: normalizeNumberOrNull(source.healthy_count),
-    needed: normalizeNumberOrNull(source.needed),
-    new_token_files: normalizeNumberOrNull(source.new_token_files),
-    last_scan_register_total: normalizeNumberOrNull(source.last_scan_register_total),
-    last_scan_cpa_total: normalizeNumberOrNull(source.last_scan_cpa_total),
-    last_scan_missing_count: normalizeNumberOrNull(source.last_scan_missing_count),
-    last_uploaded: normalizeNumberOrNull(source.last_uploaded),
-    last_failed: normalizeNumberOrNull(source.last_failed),
-    failed_names: Array.isArray(source.failed_names)
-      ? source.failed_names.map((item) => normalizeStringOrEmpty(item)).filter(Boolean).slice(0, 20)
-      : [],
-    last_summary: normalizeStringOrEmpty(source.last_summary),
-    proxy_pool_size: normalizeNumberOrNull(source.proxy_pool_size) ?? 0,
-    log_file: normalizeStringOrEmpty(source.log_file),
-    recent_events: Array.isArray(source.recent_events)
-      ? source.recent_events.map((item) => normalizeStringOrEmpty(item)).filter(Boolean).slice(-80)
-      : [],
-    log_tail: Array.isArray(source.log_tail)
-      ? source.log_tail.map((item) => normalizeStringOrEmpty(item)).filter(Boolean).slice(-120)
-      : [],
-    email_selection_mode: normalizeStringOrEmpty(source.email_selection_mode),
-    last_selected_domain: normalizeStringOrEmpty(source.last_selected_domain),
-    domain_stats: domainStats,
-    current_batch: source.current_batch && typeof source.current_batch === 'object'
-      ? normalizeBatchStatus(source.current_batch)
-      : null,
-    batch_history: Array.isArray(source.batch_history)
-      ? source.batch_history.map((item) => normalizeBatchStatus(item)).slice(-12)
-      : [],
-  };
-}
-
-function readReplenishmentStatus() {
-  const statusPath = resolveReadableFilePath(REPLENISHMENT_STATUS_PATH);
-  if (!statusPath) {
-    return createEmptyReplenishmentStatus();
-  }
-  try {
-    const raw = fs.readFileSync(statusPath, 'utf8');
-    const parsed = JSON.parse(raw);
-    return normalizeReplenishmentStatus(parsed);
-  } catch {
-    return createEmptyReplenishmentStatus();
-  }
-}
-
-function writeReplenishmentStatus(status) {
-  ensureWritableFilePath(REPLENISHMENT_STATUS_PATH);
-  const normalized = normalizeReplenishmentStatus(status);
-  fs.writeFileSync(REPLENISHMENT_STATUS_PATH, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
-}
-
-function updateReplenishmentStatus(partial) {
-  const current = readReplenishmentStatus();
-  writeReplenishmentStatus({
-    ...current,
-    ...(partial && typeof partial === 'object' ? partial : {}),
-  });
-}
-
-function getTrackedReplenishmentProcess() {
-  const trackedPid = normalizeNumberOrNull(runtimeScheduler.replenishmentPid);
-  if (trackedPid && isPidRunning(trackedPid)) {
-    runtimeScheduler.replenishmentInProgress = true;
-    return {
-      pid: trackedPid,
-      source: runtimeScheduler.replenishmentChild ? 'scheduler-child' : 'scheduler-pid',
-      mode: '',
-    };
-  }
-
-  const lockPayload = readProcessLock(REPLENISHMENT_LOCK_PATH);
-  const lockPid = normalizeNumberOrNull(lockPayload.pid);
-  if (lockPid && isPidRunning(lockPid)) {
-    runtimeScheduler.replenishmentInProgress = true;
-    runtimeScheduler.replenishmentPid = lockPid;
-    return {
-      pid: lockPid,
-      source: 'replenishment-lock',
-      mode: normalizeStringOrEmpty(lockPayload.mode),
-    };
-  }
-
-  runtimeScheduler.replenishmentInProgress = false;
-  runtimeScheduler.replenishmentChild = null;
-  runtimeScheduler.replenishmentPid = null;
-  return null;
-}
-
-function clearStaleTrackedReplenishmentStatus() {
-  if (getTrackedReplenishmentProcess()) {
-    return;
-  }
-  const current = readReplenishmentStatus();
-  if (!normalizeBoolean(current.in_progress, false)) {
-    return;
-  }
-  updateReplenishmentStatus({
-    in_progress: false,
-    last_finished_at: normalizeNumberOrNull(current.last_finished_at) ?? Date.now(),
-    last_error: normalizeStringOrEmpty(current.last_error),
-    last_summary: normalizeStringOrEmpty(current.last_summary) || 'Cleared stale replenishment status with no tracked process.',
-  });
-}
-
-function isTrackedReplenishmentStalled(trackedProcess) {
-  if (!trackedProcess) {
-    return false;
-  }
-  const lastOutputAt = normalizeNumberOrNull(runtimeScheduler.replenishmentLastOutputAt);
-  if (!lastOutputAt) {
-    return false;
-  }
-  return Date.now() - lastOutputAt > REPLENISHMENT_STALL_TIMEOUT_MS;
-}
-
-async function enforceReplenishmentWatchdog() {
-  if (runtimeScheduler.replenishmentWatchdogInProgress) {
-    return;
-  }
-  const tracked = getTrackedReplenishmentProcess();
-  if (!tracked || runtimeScheduler.replenishmentStopRequested || !isTrackedReplenishmentStalled(tracked)) {
-    return;
-  }
-
-  runtimeScheduler.replenishmentWatchdogInProgress = true;
-  const pid = Number(tracked.pid || 0);
-  const lastOutputAt = normalizeNumberOrNull(runtimeScheduler.replenishmentLastOutputAt);
-  try {
-    if (pid > 0) {
-      console.warn(`[Replenish] Watchdog terminating stalled process ${pid}; no output for ${Date.now() - (lastOutputAt || Date.now())}ms`);
-      await terminateTrackedProcess(pid);
-    }
-    const lockPayload = readProcessLock(REPLENISHMENT_LOCK_PATH);
-    if (normalizeNumberOrNull(lockPayload.pid) === pid) {
-      removeProcessLock(REPLENISHMENT_LOCK_PATH);
-    }
-    runtimeScheduler.replenishmentInProgress = false;
-    runtimeScheduler.replenishmentChild = null;
-    runtimeScheduler.replenishmentPid = null;
-    runtimeScheduler.replenishmentStopRequested = false;
-    runtimeScheduler.replenishmentLastOutputAt = null;
-    updateReplenishmentStatus({
-      in_progress: false,
-      last_finished_at: Date.now(),
-      last_error: 'Replenishment watchdog terminated stalled process (no progress).',
-      last_summary: 'Replenishment stalled and was restarted by watchdog.',
-    });
-  } catch (error) {
-    console.error(`[Replenish] Watchdog failed: ${String(error?.message || error)}`);
-  } finally {
-    runtimeScheduler.replenishmentWatchdogInProgress = false;
-  }
 }
 
 function normalizeCredentialRuntimeEntry(value) {
@@ -982,6 +369,7 @@ function normalizeCredentialRuntimeEntry(value) {
     : [];
   return {
     provider: normalizeStringOrEmpty(source.provider),
+    auth_index: normalizeStringOrEmpty(source.auth_index),
     last_status: normalizeStringOrEmpty(source.last_status),
     last_reason: normalizeStringOrEmpty(source.last_reason),
     last_probe_at: normalizeNumberOrNull(source.last_probe_at),
@@ -1034,30 +422,59 @@ function normalizeRuntimeStateStore(value) {
       last_cycle_started_at: normalizeNumberOrNull(worker.last_cycle_started_at),
       last_cycle_finished_at: normalizeNumberOrNull(worker.last_cycle_finished_at),
       last_error: normalizeStringOrEmpty(worker.last_error),
+      probe_cursor_name: normalizeStringOrEmpty(worker.probe_cursor_name),
+      last_probe_count: normalizeNumberOrNull(worker.last_probe_count) ?? 0,
     },
   };
 }
 
+const runtimeStateStore = createSerializedJsonStore({
+  filePath: RUNTIME_STATE_PATH,
+  createDefault: createEmptyRuntimeState,
+  normalize: normalizeRuntimeStateStore,
+});
+
 function readRuntimeState() {
-  const statePath = resolveReadableFilePath(RUNTIME_STATE_PATH);
-  if (!statePath) {
-    return createEmptyRuntimeState();
-  }
-  try {
-    const raw = fs.readFileSync(statePath, 'utf8');
-    const parsed = JSON.parse(raw);
-    return normalizeRuntimeStateStore(parsed);
-  } catch (error) {
-    console.error('Failed to read credential runtime state, falling back to empty store', error);
-    return createEmptyRuntimeState();
-  }
+  return runtimeStateStore.read();
 }
 
-function writeRuntimeState(store) {
-  ensureWritableFilePath(RUNTIME_STATE_PATH);
-  const normalized = normalizeRuntimeStateStore(store);
-  fs.mkdirSync(path.dirname(RUNTIME_STATE_PATH), { recursive: true });
-  fs.writeFileSync(RUNTIME_STATE_PATH, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+function mutateRuntimeState(mutator) {
+  return runtimeStateStore.mutate(mutator);
+}
+
+function patchRuntimeWorkerState(patch) {
+  return mutateRuntimeState((state) => {
+    const next = setRuntimeWorkerState(state, patch);
+    state.by_cpa_url = next.by_cpa_url;
+    state.worker = next.worker;
+    return next.worker;
+  });
+}
+
+function patchCredentialRuntimeStateUnlocked(cpaUrlKey, credentialName, patch, { rejectOlderProbe = false } = {}) {
+  return mutateRuntimeState((state) => {
+    const current = getCredentialRuntimeState(state, cpaUrlKey, credentialName);
+    const currentProbeAt = normalizeNumberOrNull(current?.last_probe_at);
+    const incomingProbeAt = normalizeNumberOrNull(patch?.last_probe_at);
+    if (rejectOlderProbe && currentProbeAt !== null && incomingProbeAt !== null && incomingProbeAt < currentProbeAt) {
+      return current;
+    }
+    return setCredentialRuntimeState(state, cpaUrlKey, credentialName, patch);
+  });
+}
+
+function patchCredentialRuntimeStateForCredential(config, cpaUrlKey, credential, patch, options) {
+  return runCredentialStatusOperation(cpaUrlKey, credential?.name, async () => {
+    const currentCredential = await fetchCredentialFromCpaByName(config, credential?.name, { fresh: true });
+    if (!isSameCredentialIdentity(currentCredential?.auth_index, credential?.auth_index)) {
+      return getCredentialRuntimeState(readRuntimeState(), cpaUrlKey, credential?.name);
+    }
+    return patchCredentialRuntimeStateUnlocked(cpaUrlKey, credential?.name, patch, options);
+  });
+}
+
+function removeCredentialRuntimeStateUnlocked(cpaUrlKey, credentialName) {
+  return mutateRuntimeState((state) => removeCredentialRuntimeState(state, cpaUrlKey, credentialName));
 }
 
 function setRuntimeWorkerState(store, nextPartialState) {
@@ -1074,6 +491,12 @@ function setRuntimeWorkerState(store, nextPartialState) {
     last_error: nextPartialState?.last_error !== undefined
       ? normalizeStringOrEmpty(nextPartialState.last_error)
       : normalizedStore.worker.last_error,
+    probe_cursor_name: nextPartialState?.probe_cursor_name !== undefined
+      ? normalizeStringOrEmpty(nextPartialState.probe_cursor_name)
+      : normalizedStore.worker.probe_cursor_name,
+    last_probe_count: nextPartialState?.last_probe_count !== undefined
+      ? normalizeNumberOrNull(nextPartialState.last_probe_count) ?? 0
+      : normalizedStore.worker.last_probe_count,
   };
   return normalizedStore;
 }
@@ -1086,286 +509,11 @@ function resolveRequestSecret(req) {
   if (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) {
     return String(req.body.password || '').trim();
   }
-  return String(req.query?.password || '').trim();
+  return '';
 }
 
 function normalizeCpaBaseUrl(rawUrl) {
   return String(rawUrl || '').trim().replace(/\/+$/, '');
-}
-
-function normalizeMailDomain(rawDomain) {
-  return String(rawDomain || '').trim().toLowerCase().replace(/^@+/, '');
-}
-
-function isValidMailDomain(domain) {
-  return /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i.test(domain);
-}
-
-function buildCookieHeaderFromResponse(response) {
-  const headerValues = typeof response?.headers?.getSetCookie === 'function'
-    ? response.headers.getSetCookie()
-    : [response?.headers?.get?.('set-cookie')].filter(Boolean);
-  return headerValues
-    .map((value) => String(value || '').split(';')[0].trim())
-    .filter(Boolean)
-    .join('; ');
-}
-
-function shouldDelayAutoReplenishment(status, nowMs = Date.now()) {
-  const normalizedStatus = normalizeReplenishmentStatus(status);
-  const lastStartedAt = normalizeNumberOrNull(normalizedStatus.last_started_at);
-  const lastFinishedAt = normalizeNumberOrNull(normalizedStatus.last_finished_at);
-  const latestActivityAt = Math.max(lastStartedAt || 0, lastFinishedAt || 0);
-  if (!latestActivityAt) {
-    return false;
-  }
-  return nowMs - latestActivityAt < AUTO_REPLENISH_RESTART_GUARD_MS;
-}
-
-function buildMailDomainTestMailbox(domain) {
-  const randomPart = Math.random().toString(36).slice(2, 10);
-  const normalized = normalizeMailDomain(domain);
-  const localPart = `cpamc-domain-test-${Date.now()}-${randomPart}`;
-  if (normalized.startsWith('*.')) {
-    return `${localPart}@${localPart}.${normalized.slice(2)}`;
-  }
-  return `${localPart}@${normalized}`;
-}
-
-async function fetchMailService(config, {
-  method = 'GET',
-  pathname,
-  query,
-  body,
-  headers = {},
-  timeoutMs = MAIL_REQUEST_TIMEOUT_MS,
-}) {
-  const mailApiBase = normalizeCpaBaseUrl(config?.mail_api_base);
-  if (!mailApiBase) {
-    throw new Error('mail_api_base is required');
-  }
-
-  const endpointUrl = new URL(pathname, `${mailApiBase}/`);
-  if (query && typeof query === 'object') {
-    Object.entries(query).forEach(([key, value]) => {
-      if (value === undefined || value === null || value === '') return;
-      endpointUrl.searchParams.set(key, String(value));
-    });
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(endpointUrl.toString(), {
-      method,
-      headers: {
-        Accept: 'application/json',
-        ...headers,
-        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-      },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-    });
-    const data = await readJsonLikeResponse(response);
-    return {
-      status: response.status,
-      ok: response.ok,
-      data,
-      response,
-    };
-  } catch (error) {
-    if (error?.name === 'AbortError') {
-      throw createRequestError(`Mail API ${method} ${pathname} timed out after ${timeoutMs}ms`, 0, null);
-    }
-    const cause = error && typeof error === 'object' ? (error.cause || {}) : {};
-    const causeCode = String(cause.code || '').trim();
-    const causeMessage = String(cause.message || '').trim();
-    const rawMessage = String(error?.message || 'fetch failed').trim();
-    const detail = [rawMessage, causeCode, causeMessage].filter(Boolean).join(' | ');
-    throw createRequestError(
-      `Mail API ${method} ${pathname} failed: ${detail}`,
-      0,
-      null,
-    );
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function runMailDomainSmokeTest(targetConfig) {
-  const domain = normalizeMailDomain(targetConfig?.domain);
-  const provider = normalizeMailProvider(targetConfig?.mail_email_provider || 'mailfree');
-  const mailApiBase = normalizeCpaBaseUrl(targetConfig?.mail_api_base);
-  const mailUsername = String(targetConfig?.mail_username || '').trim();
-  const mailPassword = String(targetConfig?.mail_password || '').trim();
-  const mailHostHeader = normalizeHostHeader(targetConfig?.mail_host_header || '');
-  const duckmailApiKey = String(targetConfig?.duckmail_api_key || '').trim();
-
-  if (!mailApiBase) {
-    throw new Error('mail_api_base is required');
-  }
-  if (provider === 'mailfree' && !mailUsername) {
-    throw new Error('mail_username is required');
-  }
-  if (provider === 'mailfree' && !mailPassword) {
-    throw new Error('mail_password is required');
-  }
-  if (provider === 'inbucket' && !mailUsername) {
-    throw new Error('mail_username is required');
-  }
-  if ((provider === 'inbucket' || provider === 'inbucket_ice') && !mailPassword) {
-    throw new Error('mail_password is required');
-  }
-  if (!domain) {
-    throw new Error('domain is required');
-  }
-  if (!isValidMailDomain(domain)) {
-    throw new Error(`invalid domain: ${domain}`);
-  }
-
-  const mailbox = buildMailDomainTestMailbox(domain);
-  const payload = {
-    provider,
-    domain,
-    mailbox,
-    ok: false,
-    login_status: null,
-    list_status: null,
-    message: '',
-    error: '',
-  };
-
-  if (provider === 'inbucket' || provider === 'inbucket_ice') {
-    const basicAuth = `Basic ${Buffer.from(`${mailUsername}:${mailPassword}`).toString('base64')}`;
-    const listResult = await fetchMailService(
-      { mail_api_base: mailApiBase },
-      {
-        method: 'GET',
-        pathname: `/api/v1/mailbox/${encodeURIComponent(mailbox)}`,
-        headers: {
-          'User-Agent': 'Mozilla/5.0',
-          Authorization: basicAuth,
-          ...(mailHostHeader ? { Host: mailHostHeader } : {}),
-        },
-      },
-    );
-    payload.list_status = listResult.status;
-    if (!listResult.ok) {
-      payload.error = String(listResult.data?.error || listResult.data?.message || `mailbox list failed (${listResult.status})`);
-      throw createRequestError(payload.error, listResult.status, payload);
-    }
-    payload.ok = true;
-    payload.message = 'Inbucket mailbox listing succeeded.';
-    return payload;
-  }
-
-  if (provider === 'duckmail') {
-    if (!duckmailApiKey) {
-      throw new Error('duckmail_api_key is required');
-    }
-    const accountPassword = `Dm!${Math.random().toString(36).slice(2, 12)}A1`;
-    const createResult = await fetchMailService(
-      { mail_api_base: mailApiBase },
-      {
-        method: 'POST',
-        pathname: '/accounts',
-        headers: {
-          Authorization: `Bearer ${duckmailApiKey}`,
-        },
-        body: {
-          address: mailbox,
-          password: accountPassword,
-          expiresIn: 3600,
-        },
-      },
-    );
-    if (!createResult.ok && createResult.status !== 409) {
-      payload.error = String(createResult.data?.error || createResult.data?.message || `duckmail account create failed (${createResult.status})`);
-      throw createRequestError(payload.error, createResult.status, payload);
-    }
-
-    const tokenResult = await fetchMailService(
-      { mail_api_base: mailApiBase },
-      {
-        method: 'POST',
-        pathname: '/token',
-        body: {
-          address: mailbox,
-          password: accountPassword,
-        },
-      },
-    );
-    payload.login_status = tokenResult.status;
-    const bearerToken = String(tokenResult.data?.token || '').trim();
-    if (!tokenResult.ok || !bearerToken) {
-      payload.error = String(tokenResult.data?.error || tokenResult.data?.message || `duckmail token failed (${tokenResult.status})`);
-      throw createRequestError(payload.error, tokenResult.status, payload);
-    }
-
-    const listResult = await fetchMailService(
-      { mail_api_base: mailApiBase },
-      {
-        method: 'GET',
-        pathname: '/messages',
-        headers: {
-          Authorization: `Bearer ${bearerToken}`,
-        },
-      },
-    );
-    payload.list_status = listResult.status;
-    if (!listResult.ok) {
-      payload.error = String(listResult.data?.error || listResult.data?.message || `duckmail mailbox list failed (${listResult.status})`);
-      throw createRequestError(payload.error, listResult.status, payload);
-    }
-    payload.ok = true;
-    payload.message = 'DuckMail mailbox create/token/list succeeded.';
-    return payload;
-  }
-
-  const loginResult = await fetchMailService(
-    { mail_api_base: mailApiBase },
-    {
-      method: 'POST',
-      pathname: '/api/login',
-      body: {
-        username: mailUsername,
-        password: mailPassword,
-      },
-    },
-  );
-  payload.login_status = loginResult.status;
-  if (!loginResult.ok) {
-    payload.error = String(loginResult.data?.error || loginResult.data?.message || `login failed (${loginResult.status})`);
-    throw createRequestError(payload.error, loginResult.status, payload);
-  }
-
-  const cookieHeader = buildCookieHeaderFromResponse(loginResult.response);
-  if (!cookieHeader) {
-    payload.error = 'mail login succeeded but no session cookie was returned';
-    throw createRequestError(payload.error, loginResult.status, payload);
-  }
-
-  const listResult = await fetchMailService(
-    { mail_api_base: mailApiBase },
-    {
-      method: 'GET',
-      pathname: '/api/emails',
-      query: { mailbox },
-      headers: {
-        Cookie: cookieHeader,
-      },
-    },
-  );
-  payload.list_status = listResult.status;
-  if (!listResult.ok) {
-    payload.error = String(listResult.data?.error || listResult.data?.message || `mailbox list failed (${listResult.status})`);
-    throw createRequestError(payload.error, listResult.status, payload);
-  }
-
-  payload.ok = true;
-  payload.message = 'Mail login and mailbox listing succeeded.';
-  return payload;
 }
 
 function buildCpaEndpointUrl(baseUrl, pathname) {
@@ -1407,8 +555,8 @@ async function cpaRequest(config, { method = 'GET', pathname, body, timeoutMs = 
   if (!cpaUrl) {
     throw new Error('cpa_url is required');
   }
-  if (!managementKey) {
-    throw new Error('management_key is required');
+  if (!isAuthorizedManagementKey(managementKey, managementKey)) {
+    throw new Error('management_key is required and must not be a placeholder');
   }
 
   const controller = new AbortController();
@@ -1458,14 +606,14 @@ function sanitizePushTestName(rawName) {
     .replace(/^-+|-+$/g, '') || `push-test-${Date.now()}.json`;
 }
 
-async function uploadAuthFileToCpa(config, { name, content, timeoutMs = CPA_REQUEST_TIMEOUT_MS }) {
+async function uploadAuthFileToCpaUnlocked(config, { name, content, timeoutMs = CPA_REQUEST_TIMEOUT_MS }) {
   const cpaUrl = normalizeCpaBaseUrl(config?.cpa_url);
   const managementKey = String(config?.management_key || '').trim();
   if (!cpaUrl) {
     throw new Error('cpa_url is required');
   }
-  if (!managementKey) {
-    throw new Error('management_key is required');
+  if (!isAuthorizedManagementKey(managementKey, managementKey)) {
+    throw new Error('management_key is required and must not be a placeholder');
   }
 
   const filename = sanitizePushTestName(name);
@@ -1488,6 +636,7 @@ async function uploadAuthFileToCpa(config, { name, content, timeoutMs = CPA_REQU
     if (!response.ok) {
       throw createRequestError(`CPA POST /v0/management/auth-files failed (${response.status})`, response.status, data);
     }
+    invalidateCpaAuthFilesCache(config);
     return {
       status: response.status,
       data,
@@ -1503,13 +652,26 @@ async function uploadAuthFileToCpa(config, { name, content, timeoutMs = CPA_REQU
   }
 }
 
+function uploadAuthFileToCpa(config, options) {
+  const filename = sanitizePushTestName(options?.name);
+  const cpaUrlKey = normalizeCpaUrlForArchive(config?.cpa_url, config?.cpa_url);
+  return runCredentialStatusOperation(cpaUrlKey, filename, async () => {
+    const result = await uploadAuthFileToCpaUnlocked(config, { ...options, name: filename });
+    await removeCredentialRuntimeStateUnlocked(cpaUrlKey, filename);
+    await removeArchiveNamesSerialized(cpaUrlKey, [filename]);
+    return result;
+  });
+}
+
 async function deleteAuthFileFromCpa(config, credentialName, timeoutMs = CPA_REQUEST_TIMEOUT_MS) {
   const query = new URLSearchParams({ name: credentialName }).toString();
-  return cpaRequest(config, {
+  const result = await cpaRequest(config, {
     method: 'DELETE',
     pathname: `/v0/management/auth-files?${query}`,
     timeoutMs,
   });
+  invalidateCpaAuthFilesCache(config);
+  return result;
 }
 
 async function runRemotePushSmokeTest(targetConfig) {
@@ -1573,12 +735,21 @@ function normalizeCredentialRecord(value) {
   };
 }
 
-async function fetchAuthFilesFromCpa(config) {
+function getCpaAuthFilesCacheKey(config) {
+  return `${normalizeCpaBaseUrl(config?.cpa_url)}\n${String(config?.management_key || '').trim()}`;
+}
+
+function invalidateCpaAuthFilesCache(config) {
+  cpaAuthFilesCache.invalidate(getCpaAuthFilesCacheKey(config));
+}
+
+async function requestAuthFilesFromCpa(config) {
   let result;
   try {
     result = await cpaRequest(config, {
       method: 'GET',
       pathname: '/v0/management/auth-files',
+      timeoutMs: CPA_AUTH_FILES_REQUEST_TIMEOUT_MS,
     });
   } catch (error) {
     const status = Number(error?.response?.status) || 0;
@@ -1588,10 +759,11 @@ async function fetchAuthFilesFromCpa(config) {
     }
 
     console.warn(`[CPA] GET /v0/management/auth-files failed once (status=${status || 'timeout'}), retrying once...`);
-    await sleep(1000);
+    await sleep(CPA_AUTH_FILES_RETRY_DELAY_MS);
     result = await cpaRequest(config, {
       method: 'GET',
       pathname: '/v0/management/auth-files',
+      timeoutMs: CPA_AUTH_FILES_REQUEST_TIMEOUT_MS,
     });
   }
 
@@ -1599,6 +771,11 @@ async function fetchAuthFilesFromCpa(config) {
   return files
     .map((item) => normalizeCredentialRecord(item))
     .filter((item) => item.name && item.auth_index);
+}
+
+function fetchAuthFilesFromCpa(config, { maxAgeMs = CPA_AUTH_FILES_CACHE_TTL_MS } = {}) {
+  const cacheKey = getCpaAuthFilesCacheKey(config);
+  return cpaAuthFilesCache.get(cacheKey, () => requestAuthFilesFromCpa(config), { maxAgeMs });
 }
 
 function buildProbePayload(credential) {
@@ -1631,19 +808,31 @@ function buildProbePayload(credential) {
   };
 }
 
-async function probeCredentialFromCpa(config, credential) {
-  const result = await cpaRequest(config, {
-    method: 'POST',
-    pathname: '/v0/management/api-call',
-    body: buildProbePayload(credential),
-  });
-  return result.data && typeof result.data === 'object'
-    ? result.data
-    : { status_code: result.status, body: result.data };
+function probeApiCallFromCpa(config, payload) {
+  const authIndex = normalizeStringOrEmpty(payload?.auth_index);
+  const execute = async () => {
+    const result = await cpaRequest(config, {
+      method: 'POST',
+      pathname: '/v0/management/api-call',
+      body: payload,
+    });
+    return result.data && typeof result.data === 'object'
+      ? result.data
+      : { status_code: result.status, body: result.data };
+  };
+  if (!authIndex) {
+    return execute();
+  }
+  const probeKey = `${normalizeCpaBaseUrl(config?.cpa_url)}\n${String(config?.management_key || '').trim()}\n${JSON.stringify(payload)}`;
+  return runKeyedCredentialProbe(probeKey, execute);
+}
+
+function probeCredentialFromCpa(config, credential) {
+  return probeApiCallFromCpa(config, buildProbePayload(credential));
 }
 
 async function updateCredentialDisabledStatus(config, credentialName, disabled) {
-  return cpaRequest(config, {
+  const result = await cpaRequest(config, {
     method: 'PATCH',
     pathname: '/v0/management/auth-files/status',
     body: {
@@ -1651,32 +840,188 @@ async function updateCredentialDisabledStatus(config, credentialName, disabled) 
       disabled,
     },
   });
+  invalidateCpaAuthFilesCache(config);
+  return result;
 }
 
-function toEpochMsFromSeconds(value) {
-  const seconds = normalizeNumberOrNull(value);
-  if (seconds === null || seconds <= 0) return null;
-  return Math.floor(seconds * 1000);
+const runKeyedCredentialOperation = createKeyedOperationQueue();
+
+function runCredentialStatusOperation(cpaUrlKey, credentialName, operation) {
+  const key = `${normalizeCpaUrlForArchive(cpaUrlKey)}\n${normalizeCredentialName(credentialName)}`;
+  return runKeyedCredentialOperation(key, operation);
 }
 
-function resolveRuntimeNextProbeAtMs(status, quota, normalIntervalMs, nowMs) {
-  const quotaResetAtMs = toEpochMsFromSeconds(quota?.resetAt ?? null);
-  if (status === 'rate_limited') {
-    return Math.max(nowMs + RATE_LIMIT_RETRY_MS, quotaResetAtMs || 0);
-  }
-  if (status === 'quota_exhausted' || status === 'quota_low_remaining') {
-    if (quotaResetAtMs) {
-      return Math.max(nowMs + RUNTIME_RECHECK_FLOOR_MS, quotaResetAtMs);
+function runCredentialStatusOperations(cpaUrlKey, credentialNames, operation) {
+  const names = Array.from(new Set(
+    credentialNames.map((name) => normalizeCredentialName(name)).filter(Boolean),
+  )).sort((left, right) => left.localeCompare(right));
+  const acquire = (index) => {
+    if (index >= names.length) {
+      return operation();
     }
-    return nowMs + normalIntervalMs;
+    return runCredentialStatusOperation(cpaUrlKey, names[index], () => acquire(index + 1));
+  };
+  return acquire(0);
+}
+
+async function fetchCredentialFromCpaByName(config, credentialName, { fresh = false } = {}) {
+  const credentials = await fetchAuthFilesFromCpa(config, {
+    maxAgeMs: fresh ? -1 : CPA_AUTH_FILES_CACHE_TTL_MS,
+  });
+  const normalizedName = normalizeCredentialName(credentialName);
+  const credential = credentials.find((item) => item.name === normalizedName) || null;
+  if (!credential) {
+    throw createRequestError(`CPA credential not found: ${normalizedName}`, 404, null);
   }
-  if (status === 'invalidated' || status === 'unauthorized' || status === 'expired_by_time' || status === 'unknown') {
-    return nowMs + normalIntervalMs;
-  }
-  return nowMs + normalIntervalMs;
+  return credential;
+}
+
+function restoreCredentialRuntimeEntry(cpaUrlKey, credentialName, previousEntry) {
+  return mutateRuntimeState((state) => {
+    if (!previousEntry) {
+      removeCredentialRuntimeState(state, cpaUrlKey, credentialName);
+      return null;
+    }
+    return setCredentialRuntimeState(state, cpaUrlKey, credentialName, previousEntry);
+  });
+}
+
+async function updateCredentialStatusWithRuntimeState(config, {
+  cpaUrlKey,
+  credentialName,
+  disabled,
+  runtimeStatePatch,
+  knownPreviousDisabled,
+  requireRuntimeOwnership = false,
+  claimRuntimeOwnership = false,
+  expectedProbeAtMs = null,
+  expectedAuthIndex = '',
+  requireExactProbeVersion = false,
+  retryOnFailureAtMs = null,
+}) {
+  return runCredentialStatusOperation(cpaUrlKey, credentialName, async () => {
+    const currentRuntimeState = readRuntimeState();
+    const previousEntry = getCredentialRuntimeState(currentRuntimeState, cpaUrlKey, credentialName);
+    const currentCredential = knownPreviousDisabled === undefined
+      ? await fetchCredentialFromCpaByName(config, credentialName, { fresh: true })
+      : null;
+    const previousDisabled = knownPreviousDisabled === undefined
+      ? Boolean(currentCredential?.disabled)
+      : Boolean(knownPreviousDisabled);
+    const currentAuthIndex = normalizeStringOrEmpty(
+      currentCredential?.auth_index || expectedAuthIndex || runtimeStatePatch?.auth_index,
+    );
+    if (
+      expectedAuthIndex
+      && !isSameCredentialIdentity(currentCredential?.auth_index, expectedAuthIndex)
+    ) {
+      return {
+        cpa_url: normalizeCpaUrlForArchive(cpaUrlKey),
+        name: normalizeCredentialName(credentialName),
+        disabled: previousDisabled,
+        state: serializeRuntimeCredentialState(previousEntry),
+        skipped: true,
+        skip_reason: 'credential_identity_changed',
+      };
+    }
+    const previousEntryForIdentity = isSameCredentialIdentity(previousEntry?.auth_index, currentAuthIndex)
+      ? previousEntry
+      : null;
+    const resolvedRuntimeStatePatch = runtimeStatePatch
+      ? {
+        ...runtimeStatePatch,
+        auth_index: currentAuthIndex,
+      }
+      : runtimeStatePatch;
+    const patchProbeAtMs = normalizeNumberOrNull(resolvedRuntimeStatePatch?.last_probe_at);
+    if (expectedProbeAtMs !== null && patchProbeAtMs !== null && patchProbeAtMs !== expectedProbeAtMs) {
+      throw createRequestError('runtime probe timestamp does not match expected_probe_at_ms', 400, null);
+    }
+    const precondition = evaluateCredentialStatusTransitionPrecondition({
+      previousDisabled,
+      previousRuntimeState: previousEntryForIdentity,
+      expectedProbeAtMs,
+      requireRuntimeOwnership,
+      claimRuntimeOwnership,
+      requireExactProbeVersion,
+    });
+    if (precondition.skipped) {
+      return {
+        cpa_url: normalizeCpaUrlForArchive(cpaUrlKey),
+        name: normalizeCredentialName(credentialName),
+        disabled: previousDisabled,
+        state: serializeRuntimeCredentialState(previousEntryForIdentity),
+        skipped: true,
+        skip_reason: precondition.reason,
+      };
+    }
+    const effectiveRuntimeStatus = normalizeStringOrEmpty(
+      resolvedRuntimeStatePatch?.last_status || previousEntryForIdentity?.last_status,
+    );
+    if (resolvedRuntimeStatePatch?.archived_by_runtime && !shouldAutoArchive(effectiveRuntimeStatus)) {
+      throw createRequestError('runtime archive ownership can only be claimed from an automatic archive probe result', 409, null);
+    }
+    if (claimRuntimeOwnership && !shouldAutoDisable(effectiveRuntimeStatus)) {
+      throw createRequestError('runtime ownership can only be claimed from an automatic disable probe result', 409, null);
+    }
+    let transition;
+    try {
+      transition = await executeCredentialStatusTransaction({
+        previousDisabled,
+        targetDisabled: Boolean(disabled),
+        previousRuntimeState: previousEntryForIdentity,
+        runtimeStatePatch: resolvedRuntimeStatePatch,
+        applyCredentialStatus: (nextDisabled) => updateCredentialDisabledStatus(config, credentialName, nextDisabled),
+        applyRuntimeState: (patch) => patchCredentialRuntimeStateUnlocked(cpaUrlKey, credentialName, patch),
+        restoreRuntimeState: (entry) => restoreCredentialRuntimeEntry(cpaUrlKey, credentialName, entry),
+        readCredentialDisabled: async () => {
+          invalidateCpaAuthFilesCache(config);
+          return Boolean((await fetchCredentialFromCpaByName(config, credentialName, { fresh: true })).disabled);
+        },
+      });
+    } catch (error) {
+      const retryAtMs = normalizeNumberOrNull(retryOnFailureAtMs);
+      if (retryAtMs !== null && retryAtMs > 0) {
+        await patchCredentialRuntimeStateUnlocked(cpaUrlKey, credentialName, {
+          auth_index: currentAuthIndex,
+          next_probe_at_ms: retryAtMs,
+        });
+      }
+      throw error;
+    }
+    if (resolvedRuntimeStatePatch?.archived_by_runtime === false) {
+      try {
+        await removeArchiveNamesSerialized(cpaUrlKey, [credentialName]);
+      } catch (error) {
+        const retryAtMs = normalizeNumberOrNull(retryOnFailureAtMs);
+        if (retryAtMs !== null && retryAtMs > 0) {
+          await patchCredentialRuntimeStateUnlocked(cpaUrlKey, credentialName, {
+            auth_index: currentAuthIndex,
+            next_probe_at_ms: retryAtMs,
+          });
+        }
+        const archiveError = new Error(`Credential status changed but archive cleanup failed: ${String(error?.message || error)}`);
+        archiveError.transition = {
+          rolled_back: false,
+          inconsistent: true,
+          rollback_error: String(error?.message || error),
+        };
+        throw archiveError;
+      }
+    }
+    return {
+      cpa_url: normalizeCpaUrlForArchive(cpaUrlKey),
+      name: normalizeCredentialName(credentialName),
+      disabled: transition.disabled,
+      state: serializeRuntimeCredentialState(transition.state),
+    };
+  });
 }
 
 function resolveCredentialDueAtMs(credential, runtimeEntry, normalIntervalMs) {
+  if (!isSameCredentialIdentity(runtimeEntry?.auth_index, credential?.auth_index)) {
+    return 0;
+  }
   if (runtimeEntry?.next_probe_at_ms) {
     return runtimeEntry.next_probe_at_ms;
   }
@@ -1686,6 +1031,17 @@ function resolveCredentialDueAtMs(credential, runtimeEntry, normalIntervalMs) {
   return 0;
 }
 
+function resolveRuntimeProbeStart(cpaUrlKey, credential, normalIntervalMs) {
+  return runCredentialStatusOperation(cpaUrlKey, credential?.name, () => {
+    const latestEntry = getCredentialRuntimeState(readRuntimeState(), cpaUrlKey, credential?.name);
+    return {
+      shouldStart: canProbeCredentialInRuntime(credential, latestEntry || {})
+        && resolveCredentialDueAtMs(credential, latestEntry, normalIntervalMs) <= Date.now(),
+      requireRuntimeOwnership: hasRuntimeOwnershipForCredential(credential, latestEntry),
+    };
+  });
+}
+
 function upsertArchiveName(store, cpaUrlKey, credentialName) {
   return upsertArchiveEntry(store, cpaUrlKey, {
     name: credentialName,
@@ -1693,21 +1049,42 @@ function upsertArchiveName(store, cpaUrlKey, credentialName) {
   });
 }
 
-function pruneRuntimeBucket(store, cpaUrlKey, activeCredentialNames) {
-  const bucket = getRuntimeBucket(store, cpaUrlKey, { createIfMissing: false });
-  if (!bucket) return false;
-  const nextCredentials = {};
-  let changed = false;
-  Object.entries(bucket.credentials).forEach(([name, entry]) => {
-    if (!activeCredentialNames.has(name)) {
-      changed = true;
-      return;
+function removeArchiveNames(store, cpaUrlKey, credentialNames) {
+  const removing = new Set(normalizeArchiveNames(credentialNames));
+  const currentEntries = getArchiveEntries(store, cpaUrlKey);
+  const nextEntries = currentEntries.filter((item) => !removing.has(item.name));
+  setArchiveEntries(store, cpaUrlKey, nextEntries);
+  return {
+    entries: nextEntries,
+    removed: currentEntries.length - nextEntries.length,
+  };
+}
+
+function removeArchiveNamesSerialized(cpaUrlKey, credentialNames) {
+  return mutateArchiveStore((store) => removeArchiveNames(store, cpaUrlKey, credentialNames));
+}
+
+function addRuntimeOwnedArchiveName(config, cpaUrlKey, credentialName, expectedProbeAtMs, expectedAuthIndex) {
+  return runCredentialStatusOperation(cpaUrlKey, credentialName, async () => {
+    let currentCredential;
+    try {
+      currentCredential = await fetchCredentialFromCpaByName(config, credentialName, { fresh: true });
+    } catch (error) {
+      if (Number(error?.response?.status) === 404) {
+        return { committed: false, added: false };
+      }
+      throw error;
     }
-    nextCredentials[name] = entry;
+    if (!isSameCredentialIdentity(currentCredential?.auth_index, expectedAuthIndex)) {
+      return { committed: false, added: false };
+    }
+    const runtimeEntry = getCredentialRuntimeState(readRuntimeState(), cpaUrlKey, credentialName);
+    if (!canCommitRuntimeArchive(runtimeEntry, expectedProbeAtMs)) {
+      return { committed: false, added: false };
+    }
+    const added = await mutateArchiveStore((store) => upsertArchiveName(store, cpaUrlKey, credentialName));
+    return { committed: true, added };
   });
-  if (!changed) return false;
-  replaceRuntimeBucket(store, cpaUrlKey, { credentials: nextCredentials });
-  return true;
 }
 
 function formatRuntimeTime(ms) {
@@ -1742,6 +1119,7 @@ function formatProbeDetail(response) {
 function buildRuntimeProbeStatePatch(probeResult, probeResponse, overrides = {}) {
   return {
     provider: normalizeStringOrEmpty(overrides.provider),
+    auth_index: normalizeStringOrEmpty(overrides.auth_index),
     last_status: normalizeStringOrEmpty(probeResult?.status),
     last_reason: normalizeStringOrEmpty(probeResult?.reason),
     last_probe_at: normalizeNumberOrNull(overrides.last_probe_at ?? Date.now()),
@@ -1813,6 +1191,15 @@ function normalizeCredentialName(rawName) {
 function normalizeCpaUrlForArchive(rawUrl, fallbackUrl = '') {
   const value = String(rawUrl || fallbackUrl || '').trim().replace(/\/+$/, '');
   return value || '__default__';
+}
+
+function resolveConfiguredCpaUrlKey(config, requestedUrl = '') {
+  const configuredKey = normalizeCpaUrlForArchive(normalizeCpaBaseUrl(config?.cpa_url));
+  const requestedValue = normalizeCpaBaseUrl(requestedUrl);
+  if (requestedValue && normalizeCpaUrlForArchive(requestedValue) !== configuredKey) {
+    throw createRequestError('cpa_url does not match the configured CPA endpoint', 400, null);
+  }
+  return configuredKey;
 }
 
 function getArchiveNames(store, cpaUrlKey) {
@@ -1918,48 +1305,21 @@ function removeCredentialRuntimeState(store, cpaUrlKey, credentialName) {
 }
 
 function buildRuntimeStatusPayload(config) {
-  clearStaleTrackedReplenishmentStatus();
   const runtimeState = readRuntimeState();
-  const replenishmentStatus = readReplenishmentStatus();
-  const trackedReplenishment = getTrackedReplenishmentProcess();
   const cpaUrlKey = normalizeCpaUrlForArchive(config?.cpa_url, config?.cpa_url);
   const bucket = getRuntimeBucket(runtimeState, cpaUrlKey, { createIfMissing: false }) || normalizeRuntimeBucket({});
   const credentialStates = {};
 
   Object.entries(bucket.credentials).forEach(([name, entry]) => {
-    credentialStates[name] = {
-      provider: normalizeStringOrEmpty(entry.provider),
-      last_status: normalizeStringOrEmpty(entry.last_status),
-      last_reason: normalizeStringOrEmpty(entry.last_reason),
-      last_probe_at: normalizeNumberOrNull(entry.last_probe_at),
-      last_probe_at_iso: formatRuntimeTime(entry.last_probe_at),
-      last_probe_detail: normalizeStringOrEmpty(entry.last_probe_detail),
-      last_reset_at: normalizeNumberOrNull(entry.last_reset_at),
-      last_quota_source: normalizeStringOrEmpty(entry.last_quota_source),
-      last_quota_used_percent: normalizeNumberOrNull(entry.last_quota_used_percent),
-      last_quota_cards: Array.isArray(entry.last_quota_cards) ? entry.last_quota_cards : [],
-      next_probe_at_ms: normalizeNumberOrNull(entry.next_probe_at_ms),
-      archived_by_runtime: normalizeBoolean(entry.archived_by_runtime, false),
-      disabled_by_runtime: normalizeBoolean(entry.disabled_by_runtime, false),
-    };
+    credentialStates[name] = serializeRuntimeCredentialState(entry);
   });
 
   const configEnabled = parseBoolSafe(config?.auto_probe_enabled, false);
-  const hasRuntimeConfig = Boolean(normalizeCpaBaseUrl(config?.cpa_url) && String(config?.management_key || '').trim());
-  const healthyCodexCount = countNormalCodexAccountsFromRuntime(runtimeState, cpaUrlKey);
-  const replenishmentStalled = isTrackedReplenishmentStalled(trackedReplenishment);
-  const replenishmentTracked = (Boolean(trackedReplenishment) && !replenishmentStalled)
-    || (!trackedReplenishment && normalizeBoolean(replenishmentStatus.in_progress, false));
-  const statusHealthyCount = normalizeNumberOrNull(replenishmentStatus.healthy_count);
-  const derivedHealthyCount = statusHealthyCount ?? healthyCodexCount;
-  const statusTargetCount = normalizeNumberOrNull(replenishmentStatus.target_count);
-  const configTargetCount = normalizeNonNegativeInteger(
-    config?.codex_replenish_target_count,
-    normalizeNonNegativeInteger(config?.codex_target_count, 0),
+  const managementKey = String(config?.management_key || '').trim();
+  const hasRuntimeConfig = Boolean(
+    normalizeCpaBaseUrl(config?.cpa_url)
+    && isAuthorizedManagementKey(managementKey, managementKey),
   );
-  const effectiveTargetCount = statusTargetCount ?? configTargetCount;
-  const statusNeeded = normalizeNumberOrNull(replenishmentStatus.needed);
-  const derivedNeeded = statusNeeded ?? Math.max(0, effectiveTargetCount - derivedHealthyCount);
 
   return {
     cpa_url: cpaUrlKey,
@@ -1974,179 +1334,85 @@ function buildRuntimeStatusPayload(config) {
       last_cycle_finished_at: normalizeNumberOrNull(runtimeState.worker?.last_cycle_finished_at),
       last_cycle_finished_at_iso: formatRuntimeTime(runtimeState.worker?.last_cycle_finished_at),
       last_error: normalizeStringOrEmpty(runtimeState.worker?.last_error),
-    },
-      replenishment: {
-        enabled: parseBoolSafe(config?.codex_replenish_enabled, false),
-        in_progress: replenishmentTracked,
-        stop_requested: runtimeScheduler.replenishmentStopRequested,
-        process_pid: trackedReplenishment?.pid ?? normalizeNumberOrNull(runtimeScheduler.replenishmentPid),
-        stalled: replenishmentStalled,
-        last_output_at: normalizeNumberOrNull(runtimeScheduler.replenishmentLastOutputAt),
-        last_output_at_iso: formatRuntimeTime(runtimeScheduler.replenishmentLastOutputAt),
-        mode: normalizeStringOrEmpty(replenishmentStatus.mode),
-      healthy_count: derivedHealthyCount,
-      proxy_pool_size: normalizeNumberOrNull(replenishmentStatus.proxy_pool_size),
-      target_count: effectiveTargetCount,
-      threshold: normalizeNumberOrNull(replenishmentStatus.threshold),
-      batch_size: normalizeNumberOrNull(replenishmentStatus.batch_size) ?? normalizeCodexReplenishBatchSize(config?.codex_replenish_batch_size, 1),
-      worker_count: normalizeNumberOrNull(replenishmentStatus.worker_count) ?? normalizeCodexReplenishWorkerCount(config?.codex_replenish_worker_count, 1),
-      use_proxy: normalizeBoolean(replenishmentStatus.use_proxy, false),
-      needed: derivedNeeded,
-      new_token_files: normalizeNumberOrNull(replenishmentStatus.new_token_files),
-      last_limit: normalizeNumberOrNull(replenishmentStatus.last_limit),
-      last_scan_register_total: normalizeNumberOrNull(replenishmentStatus.last_scan_register_total),
-      last_scan_cpa_total: normalizeNumberOrNull(replenishmentStatus.last_scan_cpa_total),
-      last_scan_missing_count: normalizeNumberOrNull(replenishmentStatus.last_scan_missing_count),
-      last_uploaded: normalizeNumberOrNull(replenishmentStatus.last_uploaded),
-      last_failed: normalizeNumberOrNull(replenishmentStatus.last_failed),
-      failed_names: Array.isArray(replenishmentStatus.failed_names) ? replenishmentStatus.failed_names : [],
-      log_file: normalizeStringOrEmpty(replenishmentStatus.log_file),
-      recent_events: Array.isArray(replenishmentStatus.recent_events) ? replenishmentStatus.recent_events : [],
-      log_tail: Array.isArray(replenishmentStatus.log_tail) ? replenishmentStatus.log_tail : [],
-      last_started_at: normalizeNumberOrNull(replenishmentStatus.last_started_at),
-      last_started_at_iso: formatRuntimeTime(replenishmentStatus.last_started_at),
-      last_finished_at: normalizeNumberOrNull(replenishmentStatus.last_finished_at),
-      last_finished_at_iso: formatRuntimeTime(replenishmentStatus.last_finished_at),
-      last_error: normalizeStringOrEmpty(replenishmentStatus.last_error),
-      last_summary: normalizeStringOrEmpty(replenishmentStatus.last_summary),
-      email_selection_mode: normalizeStringOrEmpty(replenishmentStatus.email_selection_mode),
-      last_selected_domain: normalizeStringOrEmpty(replenishmentStatus.last_selected_domain),
-      domain_stats: replenishmentStatus.domain_stats && typeof replenishmentStatus.domain_stats === 'object' ? replenishmentStatus.domain_stats : {},
-      current_batch: replenishmentStatus.current_batch && typeof replenishmentStatus.current_batch === 'object' ? replenishmentStatus.current_batch : null,
-      batch_history: Array.isArray(replenishmentStatus.batch_history) ? replenishmentStatus.batch_history : [],
+      probe_cursor_name: normalizeStringOrEmpty(runtimeState.worker?.probe_cursor_name),
+      last_probe_count: normalizeNumberOrNull(runtimeState.worker?.last_probe_count) ?? 0,
     },
     credentials: credentialStates,
   };
 }
 
-function looksLikeCodexRuntimeCredential(name, entry) {
-  const provider = normalizeStringOrEmpty(entry?.provider).toLowerCase();
-  const quotaCards = Array.isArray(entry?.last_quota_cards) ? entry.last_quota_cards : [];
-  return (
-    provider === 'codex'
-    || String(name || '').startsWith('codex-')
-    || quotaCards.length > 0
-    || ![null, '', 'unknown'].includes(entry?.last_quota_source)
-  );
-}
-
-function countNormalCodexAccountsFromRuntime(runtimeState, cpaUrlKey) {
-  const bucket = getRuntimeBucket(runtimeState, cpaUrlKey, { createIfMissing: false }) || normalizeRuntimeBucket({});
-  let count = 0;
-  Object.entries(bucket.credentials || {}).forEach(([name, entry]) => {
-    if (!looksLikeCodexRuntimeCredential(name, entry)) {
-      return;
-    }
-    if (normalizeStringOrEmpty(entry?.last_status) !== 'active') {
-      return;
-    }
-    if (normalizeBoolean(entry?.disabled_by_runtime, false)) {
-      return;
-    }
-    count += 1;
-  });
-  return count;
-}
-
-function countUsableCodexAccounts(credentials, runtimeState, cpaUrlKey) {
-  const files = Array.isArray(credentials) ? credentials : [];
-  const bucket = getRuntimeBucket(runtimeState, cpaUrlKey, { createIfMissing: false }) || normalizeRuntimeBucket({});
-  const bucketCredentials = bucket.credentials || {};
-  let count = 0;
-
-  files.forEach((credential) => {
-    const provider = normalizeStringOrEmpty(credential?.provider).toLowerCase();
-    if (provider !== 'codex') {
-      return;
-    }
-    if (normalizeBoolean(credential?.disabled, false)) {
-      return;
-    }
-
-    const name = normalizeCredentialName(credential?.name);
-    const runtimeEntry = bucketCredentials[name] || {};
-    const runtimeStatus = normalizeStringOrEmpty(runtimeEntry?.last_status).toLowerCase();
-    const cpaStatus = normalizeStringOrEmpty(credential?.status).toLowerCase();
-    const resolvedStatus = runtimeStatus || cpaStatus;
-    if (resolvedStatus !== 'active') {
-      return;
-    }
-    if (normalizeBoolean(runtimeEntry?.disabled_by_runtime, false)) {
-      return;
-    }
-    if (normalizeBoolean(runtimeEntry?.archived_by_runtime, false)) {
-      return;
-    }
-
-    count += 1;
-  });
-
-  return count;
+function serializeRuntimeCredentialState(entry) {
+  const normalized = normalizeCredentialRuntimeEntry(entry || {});
+  return {
+    ...normalized,
+    last_probe_at_iso: formatRuntimeTime(normalized.last_probe_at),
+  };
 }
 
 async function runBackendAutomationCycle() {
-  await enforceReplenishmentWatchdog();
   if (runtimeScheduler.cycleInProgress) {
     return;
   }
 
   runtimeScheduler.cycleInProgress = true;
   const cycleStartedAt = Date.now();
-  let runtimeState = setRuntimeWorkerState(readRuntimeState(), {
-    cycle_in_progress: true,
-    last_cycle_started_at: cycleStartedAt,
-    last_error: '',
-  });
-  writeRuntimeState(runtimeState);
 
   try {
+    await patchRuntimeWorkerState({
+      cycle_in_progress: true,
+      last_cycle_started_at: cycleStartedAt,
+      last_error: '',
+    });
     const config = readConfig();
     const autoProbeEnabled = parseBoolSafe(config.auto_probe_enabled, false);
     const cpaBaseUrl = normalizeCpaBaseUrl(config.cpa_url);
     const managementKey = String(config.management_key || '').trim();
 
-    if (!autoProbeEnabled || !cpaBaseUrl || !managementKey) {
-      runtimeState = setRuntimeWorkerState(runtimeState, {
+    if (!autoProbeEnabled || !cpaBaseUrl || !isAuthorizedManagementKey(managementKey, managementKey)) {
+      await patchRuntimeWorkerState({
         cycle_in_progress: false,
         last_cycle_finished_at: Date.now(),
         last_error: '',
       });
-      writeRuntimeState(runtimeState);
       return;
     }
 
     const normalIntervalMs = Math.max(1, parseIntSafe(config.auto_probe_interval_minutes, 60)) * 60 * 1000;
+    const autoProbeBatchSize = Math.max(1, parseIntSafe(config.auto_probe_batch_size, AUTO_PROBE_BATCH_SIZE_DEFAULT));
     const cpaUrlKey = normalizeCpaUrlForArchive(cpaBaseUrl, cpaBaseUrl);
     const credentials = await fetchAuthFilesFromCpa(config);
-    const activeCredentialNames = new Set(credentials.map((item) => item.name).filter(Boolean));
-    pruneRuntimeBucket(runtimeState, cpaUrlKey, activeCredentialNames);
-
-    const archiveStore = readArchiveStore();
-    const archivedNameSet = new Set(getArchiveNames(archiveStore, cpaUrlKey));
-    let archiveStoreChanged = false;
+    const planningState = readRuntimeState();
+    const bucket = getRuntimeBucket(planningState, cpaUrlKey, { createIfMissing: false }) || normalizeRuntimeBucket({});
+    const archivedNameSet = new Set(getArchiveNames(readArchiveStore(), cpaUrlKey));
     const nowMs = Date.now();
+    const bucketCredentials = bucket.credentials || {};
+    const probeCandidates = credentials.filter((credential) => canProbeCredentialInRuntime(
+      credential,
+      bucketCredentials[credential.name] || {},
+    ));
+    const probePlan = selectCredentialsForProbe(probeCandidates, {
+      archivedNameSet,
+      bucketCredentials,
+      nowMs,
+      normalIntervalMs,
+      cursorName: planningState.worker?.probe_cursor_name,
+      maxPerCycle: autoProbeBatchSize,
+      resolveDueAtMs: resolveCredentialDueAtMs,
+    });
+    const credentialsToProbe = probePlan.selected;
 
-    for (const credential of credentials) {
+    const processCredential = async (credential) => {
       if (!credential.name || archivedNameSet.has(credential.name)) {
-        continue;
+        return;
       }
-
-      let runtimeEntry = getCredentialRuntimeState(runtimeState, cpaUrlKey, credential.name);
-      if (runtimeEntry?.archived_by_runtime) {
-        runtimeEntry = setCredentialRuntimeState(runtimeState, cpaUrlKey, credential.name, {
-          archived_by_runtime: false,
-        });
+      if (getArchiveNames(readArchiveStore(), cpaUrlKey).includes(credential.name)) {
+        return;
       }
-      if (!credential.disabled && runtimeEntry?.disabled_by_runtime) {
-        runtimeEntry = setCredentialRuntimeState(runtimeState, cpaUrlKey, credential.name, {
-          disabled_by_runtime: false,
-        });
+      const probeStart = await resolveRuntimeProbeStart(cpaUrlKey, credential, normalIntervalMs);
+      if (!probeStart.shouldStart) {
+        return;
       }
-
-      const dueAtMs = resolveCredentialDueAtMs(credential, runtimeEntry, normalIntervalMs);
-      if (dueAtMs > nowMs) {
-        continue;
-      }
+      const requireExistingRuntimeOwnership = probeStart.requireRuntimeOwnership;
 
       let probeResponse;
       let probeResult;
@@ -2159,276 +1425,179 @@ async function runBackendAutomationCycle() {
         codexQuotaDisableRemainingPercent: parseIntSafe(config.codex_quota_disable_remaining_percent, 10),
       });
 
+      const probeAt = Date.now();
       const nextBaseState = buildRuntimeProbeStatePatch(probeResult, probeResponse, {
         provider: credential.provider,
+        auth_index: credential.auth_index,
+        last_probe_at: probeAt,
       });
 
       if (probeResult.status === 'active') {
-        const shouldEnable = Boolean(credential.disabled && runtimeEntry?.disabled_by_runtime);
-        if (shouldEnable) {
-          await updateCredentialDisabledStatus(config, credential.name, false);
+        if (requireExistingRuntimeOwnership) {
+          const transition = await updateCredentialStatusWithRuntimeState(config, {
+            cpaUrlKey,
+            credentialName: credential.name,
+            disabled: false,
+            runtimeStatePatch: {
+              ...nextBaseState,
+              next_probe_at_ms: probeAt + normalIntervalMs,
+              archived_by_runtime: false,
+              disabled_by_runtime: false,
+            },
+            requireRuntimeOwnership: true,
+            expectedProbeAtMs: probeAt,
+            expectedAuthIndex: credential.auth_index,
+            retryOnFailureAtMs: Date.now() + AUTOMATION_RETRY_DELAY_MS,
+          });
+          if (transition.skipped) {
+            const clearRuntimeOwnership = transition.skip_reason === 'credential_manually_disabled'
+              || transition.skip_reason === 'runtime_ownership_missing';
+            await patchCredentialRuntimeStateForCredential(config, cpaUrlKey, credential, {
+              ...nextBaseState,
+              next_probe_at_ms: probeAt + normalIntervalMs,
+              archived_by_runtime: false,
+              ...(clearRuntimeOwnership ? { disabled_by_runtime: false } : {}),
+            }, { rejectOlderProbe: true });
+          }
+        } else {
+          await patchCredentialRuntimeStateForCredential(config, cpaUrlKey, credential, {
+            ...nextBaseState,
+            next_probe_at_ms: probeAt + normalIntervalMs,
+            archived_by_runtime: false,
+            disabled_by_runtime: false,
+          }, { rejectOlderProbe: true });
         }
-        setCredentialRuntimeState(runtimeState, cpaUrlKey, credential.name, {
-          ...nextBaseState,
-          next_probe_at_ms: nowMs + normalIntervalMs,
-          archived_by_runtime: false,
-          disabled_by_runtime: false,
-        });
-        continue;
+        return;
       }
 
       if (shouldAutoArchive(probeResult.status)) {
-        if (!credential.disabled) {
-          await updateCredentialDisabledStatus(config, credential.name, true);
-        }
-        if (upsertArchiveName(archiveStore, cpaUrlKey, credential.name)) {
-          archiveStoreChanged = true;
-          archivedNameSet.add(credential.name);
-        }
-        setCredentialRuntimeState(runtimeState, cpaUrlKey, credential.name, {
-          ...nextBaseState,
-          next_probe_at_ms: null,
-          archived_by_runtime: true,
-          disabled_by_runtime: true,
+        const transition = await updateCredentialStatusWithRuntimeState(config, {
+          cpaUrlKey,
+          credentialName: credential.name,
+          disabled: true,
+          runtimeStatePatch: {
+            ...nextBaseState,
+            next_probe_at_ms: null,
+            archived_by_runtime: true,
+            disabled_by_runtime: true,
+          },
+          claimRuntimeOwnership: !requireExistingRuntimeOwnership,
+          requireRuntimeOwnership: requireExistingRuntimeOwnership,
+          expectedProbeAtMs: probeAt,
+          expectedAuthIndex: credential.auth_index,
+          retryOnFailureAtMs: Date.now() + AUTOMATION_RETRY_DELAY_MS,
         });
-        continue;
+        if (transition.skipped) {
+          const clearRuntimeOwnership = transition.skip_reason === 'credential_manually_disabled'
+            || transition.skip_reason === 'runtime_ownership_missing';
+          await patchCredentialRuntimeStateForCredential(config, cpaUrlKey, credential, {
+            ...nextBaseState,
+            next_probe_at_ms: probeAt + normalIntervalMs,
+            archived_by_runtime: false,
+            ...(clearRuntimeOwnership ? { disabled_by_runtime: false } : {}),
+          }, { rejectOlderProbe: true });
+          return;
+        }
+        try {
+          const archiveCommit = await addRuntimeOwnedArchiveName(
+            config,
+            cpaUrlKey,
+            credential.name,
+            probeAt,
+            credential.auth_index,
+          );
+          if (archiveCommit.committed) {
+            archivedNameSet.add(credential.name);
+          }
+        } catch (error) {
+          await updateCredentialStatusWithRuntimeState(config, {
+            cpaUrlKey,
+            credentialName: credential.name,
+            disabled: true,
+            runtimeStatePatch: {
+              archived_by_runtime: false,
+              disabled_by_runtime: true,
+              next_probe_at_ms: Date.now() + AUTOMATION_RETRY_DELAY_MS,
+            },
+            requireRuntimeOwnership: true,
+            expectedProbeAtMs: probeAt,
+            expectedAuthIndex: credential.auth_index,
+            retryOnFailureAtMs: Date.now() + AUTOMATION_RETRY_DELAY_MS,
+          });
+          throw error;
+        }
+        return;
       }
 
       if (shouldAutoDisable(probeResult.status)) {
-        if (!credential.disabled) {
-          await updateCredentialDisabledStatus(config, credential.name, true);
-        }
-        setCredentialRuntimeState(runtimeState, cpaUrlKey, credential.name, {
-          ...nextBaseState,
-          next_probe_at_ms: resolveRuntimeNextProbeAtMs(probeResult.status, probeResult.quota, normalIntervalMs, nowMs),
-          archived_by_runtime: false,
-          disabled_by_runtime: true,
+        const nextProbeAtMs = resolveRuntimeNextProbeAtMs(probeResult.status, probeResult.quota, normalIntervalMs, probeAt);
+        const transition = await updateCredentialStatusWithRuntimeState(config, {
+          cpaUrlKey,
+          credentialName: credential.name,
+          disabled: true,
+          runtimeStatePatch: {
+            ...nextBaseState,
+            next_probe_at_ms: nextProbeAtMs,
+            archived_by_runtime: false,
+            disabled_by_runtime: true,
+          },
+          claimRuntimeOwnership: !requireExistingRuntimeOwnership,
+          requireRuntimeOwnership: requireExistingRuntimeOwnership,
+          expectedProbeAtMs: probeAt,
+          expectedAuthIndex: credential.auth_index,
+          retryOnFailureAtMs: Date.now() + AUTOMATION_RETRY_DELAY_MS,
         });
-        continue;
+        if (transition.skipped) {
+          const clearRuntimeOwnership = transition.skip_reason === 'credential_manually_disabled'
+            || transition.skip_reason === 'runtime_ownership_missing';
+          await patchCredentialRuntimeStateForCredential(config, cpaUrlKey, credential, {
+            ...nextBaseState,
+            next_probe_at_ms: nextProbeAtMs,
+            archived_by_runtime: false,
+            ...(clearRuntimeOwnership ? { disabled_by_runtime: false } : {}),
+          }, { rejectOlderProbe: true });
+        }
+        return;
       }
 
-      setCredentialRuntimeState(runtimeState, cpaUrlKey, credential.name, {
+      await patchCredentialRuntimeStateForCredential(config, cpaUrlKey, credential, {
         ...nextBaseState,
-        next_probe_at_ms: nowMs + normalIntervalMs,
+        next_probe_at_ms: probeAt + normalIntervalMs,
         archived_by_runtime: false,
-        disabled_by_runtime: Boolean(runtimeEntry?.disabled_by_runtime && credential.disabled),
-      });
+        disabled_by_runtime: requireExistingRuntimeOwnership,
+      }, { rejectOlderProbe: true });
+    };
+    const probeSettled = await mapWithConcurrency(
+      credentialsToProbe,
+      Math.min(AUTO_PROBE_MAX_CONCURRENCY, autoProbeBatchSize),
+      processCredential,
+    );
+    const failedProbe = probeSettled.find((item) => item.status === 'rejected');
+    if (failedProbe) {
+      throw failedProbe.reason;
     }
 
-    if (archiveStoreChanged) {
-      writeArchiveStore(archiveStore);
-    }
-
-    runtimeState = setRuntimeWorkerState(runtimeState, {
+    await patchRuntimeWorkerState({
       cycle_in_progress: false,
       last_cycle_finished_at: Date.now(),
       last_error: '',
+      probe_cursor_name: probePlan.nextCursorName,
+      last_probe_count: credentialsToProbe.length,
     });
-    writeRuntimeState(runtimeState);
-
-    // Phase: Codex Replenishment Check
-    if (parseBoolSafe(config.codex_replenish_enabled, false)) {
-      const targetCount = normalizeNonNegativeInteger(config.codex_replenish_target_count, normalizeNonNegativeInteger(config.codex_target_count, 0));
-      const threshold = normalizeCodexReplenishThreshold(config.codex_replenish_threshold, targetCount, 0);
-      const normalCodexCount = countUsableCodexAccounts(credentials, runtimeState, cpaUrlKey);
-      if (normalCodexCount >= threshold) {
-        console.log(`[Replenish] Skip spawn because healthy Codex count ${normalCodexCount} is above threshold ${threshold} (target ${targetCount})`);
-        return;
-      }
-      const replenishmentStatus = readReplenishmentStatus();
-      if (shouldDelayAutoReplenishment(replenishmentStatus)) {
-        console.log(`[Replenish] Skip auto spawn because the last replenishment activity is within the ${AUTO_REPLENISH_RESTART_GUARD_MS}ms restart guard window.`);
-        return;
-      }
-      setImmediate(() => {
-        spawnReplenishmentProcess().catch((err) => console.error('Codex replenishment trigger failed', err));
-      });
-    }
   } catch (error) {
-    runtimeState = setRuntimeWorkerState(runtimeState, {
-      cycle_in_progress: false,
-      last_cycle_finished_at: Date.now(),
-      last_error: String(error?.message || error),
-    });
-    writeRuntimeState(runtimeState);
+    try {
+      await patchRuntimeWorkerState({
+        cycle_in_progress: false,
+        last_cycle_finished_at: Date.now(),
+        last_error: String(error?.message || error),
+      });
+    } catch (stateError) {
+      console.error('Failed to persist backend automation error state', stateError);
+    }
     console.error('Backend automation cycle failed', error);
   } finally {
     runtimeScheduler.cycleInProgress = false;
   }
-}
-
-async function spawnReplenishmentProcess(options = {}) {
-  const tracked = getTrackedReplenishmentProcess();
-  if (tracked) {
-    console.log(`[Replenish] Skip spawn because replenishment process ${tracked.pid} is already running (${tracked.source})`);
-    return;
-  }
-
-  clearStaleTrackedReplenishmentStatus();
-
-  const { spawn } = await import('child_process');
-  const pythonPath = String(process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3'));
-  const scriptPath = path.join(PROJECT_ROOT, 'replenish_codex.py');
-  const configPath = CONFIG_PATH;
-  const statePath = RUNTIME_STATE_PATH;
-  const args = ['-u', scriptPath, '--config', configPath, '--state', statePath];
-  const needed = normalizeNumberOrNull(options?.needed);
-  if (needed !== null && needed > 0) {
-    args.push('--needed', String(needed));
-  }
-
-  console.log(`[Replenish] Spawning ${pythonPath} ${args.join(' ')}`);
-  runtimeScheduler.replenishmentInProgress = true;
-  runtimeScheduler.replenishmentStopRequested = false;
-
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (callback) => {
-      if (runtimeScheduler.replenishmentChild === child) {
-        runtimeScheduler.replenishmentInProgress = false;
-        runtimeScheduler.replenishmentChild = null;
-        runtimeScheduler.replenishmentPid = null;
-        runtimeScheduler.replenishmentStopRequested = false;
-        runtimeScheduler.replenishmentLastOutputAt = null;
-      }
-      if (!settled) {
-        settled = true;
-        callback();
-      }
-    };
-
-    const child = spawn(pythonPath, args, {
-      env: {
-        ...process.env,
-        PYTHONUNBUFFERED: '1',
-        PYTHONIOENCODING: 'utf-8',
-        PYTHONUTF8: '1',
-      },
-      windowsHide: process.platform === 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    const streamLog = (prefix, chunk, writer = console.log) => {
-      const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk ?? '');
-      if (!text) return;
-      text.split(/\r?\n/).forEach((line) => {
-        const trimmed = line.trimEnd();
-        if (trimmed) {
-          runtimeScheduler.replenishmentLastOutputAt = Date.now();
-          writer(`${prefix}${trimmed}`);
-        }
-      });
-    };
-
-    child.stdout?.on('data', (chunk) => {
-      streamLog('[Replenish] stdout: ', chunk, console.log);
-    });
-
-    child.stderr?.on('data', (chunk) => {
-      streamLog('[Replenish] stderr: ', chunk, console.warn);
-    });
-
-    child.on('error', (error) => {
-      finish(() => {
-        console.error(`[Replenish] Process errored: ${error.message}`);
-        reject(error);
-      });
-    });
-
-    child.on('close', (code, signal) => {
-      if (code && code !== 0) {
-        finish(() => {
-          const error = new Error(`replenish_codex.py exited with code ${code}${signal ? ` signal ${signal}` : ''}`);
-          console.error(`[Replenish] Process errored: ${error.message}`);
-          reject(error);
-        });
-        return;
-      }
-      finish(() => resolve());
-    });
-
-    runtimeScheduler.replenishmentChild = child;
-    runtimeScheduler.replenishmentPid = child.pid || null;
-    runtimeScheduler.replenishmentLastOutputAt = Date.now();
-  });
-}
-
-async function terminateTrackedProcess(pid) {
-  if (process.platform === 'win32') {
-    const { execFile } = await import('child_process');
-    return new Promise((resolve, reject) => {
-      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, (error) => {
-        if (error) {
-          return reject(new Error(`Failed to stop replenishment process ${pid}.`));
-        }
-        resolve();
-      });
-    });
-  }
-
-  try {
-    process.kill(pid, 'SIGTERM');
-  } catch (error) {
-    if (error?.code !== 'ESRCH') {
-      throw new Error(`Failed to stop replenishment process ${pid}.`);
-    }
-  }
-
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    if (!isPidRunning(pid)) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-
-  try {
-    process.kill(pid, 'SIGKILL');
-  } catch (error) {
-    if (error?.code !== 'ESRCH') {
-      throw new Error(`Failed to force stop replenishment process ${pid}.`);
-    }
-  }
-}
-
-async function stopTrackedReplenishmentProcess() {
-  const tracked = getTrackedReplenishmentProcess();
-  const pid = Number(tracked?.pid || 0);
-  if (!pid) {
-    return {
-      requested: false,
-      stopped: false,
-      pid: null,
-      message: 'No tracked replenishment process is currently running.',
-    };
-  }
-
-  runtimeScheduler.replenishmentStopRequested = true;
-
-  await terminateTrackedProcess(pid);
-
-  runtimeScheduler.replenishmentInProgress = false;
-  runtimeScheduler.replenishmentChild = null;
-  runtimeScheduler.replenishmentPid = null;
-  runtimeScheduler.replenishmentStopRequested = false;
-  runtimeScheduler.replenishmentLastOutputAt = null;
-  const lockPayload = readProcessLock(REPLENISHMENT_LOCK_PATH);
-  if (normalizeNumberOrNull(lockPayload.pid) === pid) {
-    removeProcessLock(REPLENISHMENT_LOCK_PATH);
-  }
-  updateReplenishmentStatus({
-    in_progress: false,
-    last_finished_at: Date.now(),
-    last_error: 'Stopped manually from dashboard.',
-    last_summary: normalizeStringOrEmpty(readReplenishmentStatus().last_summary) || 'Stopped manually from dashboard.',
-  });
-
-  return {
-    requested: true,
-    stopped: true,
-    pid,
-    message: `Stopped replenishment process ${pid}.`,
-  };
 }
 
 function startBackendAutomationScheduler() {
@@ -2437,10 +1606,8 @@ function startBackendAutomationScheduler() {
   }
   runtimeScheduler.started = true;
   runtimeScheduler.timer = setInterval(() => {
-    void enforceReplenishmentWatchdog();
     void runBackendAutomationCycle();
   }, RUNTIME_WAKE_INTERVAL_MS);
-  void enforceReplenishmentWatchdog();
   void runBackendAutomationCycle();
 }
 
@@ -2460,7 +1627,7 @@ app.post('/api/auth/login', (req, res) => {
 app.post('/api/config', (req, res) => {
   const config = readConfig();
   if (isAuthorized(resolveRequestSecret(req), config)) {
-    res.json({ ok: true, config, mail_meta: readMailMeta(config) });
+    res.json({ ok: true, config });
   } else {
     res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
@@ -2470,100 +1637,24 @@ app.post('/api/config', (req, res) => {
 app.post('/api/config/update', (req, res) => {
   const { old_password, new_config } = req.body;
   const config = readConfig();
-  const nextConfig = new_config && typeof new_config === 'object' ? new_config : {};
+  const nextConfig = new_config && typeof new_config === 'object' && !Array.isArray(new_config) ? new_config : {};
 
   // To update config, they must provide the correct current password
   if (isAuthorized(old_password, config)) {
     try {
-      const nextAutoProbeEnabled = nextConfig.auto_probe_enabled !== undefined
-        ? parseBoolSafe(nextConfig.auto_probe_enabled, parseBoolSafe(config.auto_probe_enabled, false))
-        : parseBoolSafe(config.auto_probe_enabled, false);
-      const nextAutoProbeIntervalMinutesRaw = nextConfig.auto_probe_interval_minutes !== undefined
-        ? parseIntSafe(nextConfig.auto_probe_interval_minutes, parseIntSafe(config.auto_probe_interval_minutes, 60))
-        : parseIntSafe(config.auto_probe_interval_minutes, 60);
-      const nextAutoProbeIntervalMinutes = Math.max(1, Math.min(1440, nextAutoProbeIntervalMinutesRaw));
-      
-      const nextQuotaDisableRemainingPercentRaw = nextConfig.codex_quota_disable_remaining_percent !== undefined
-        ? parseIntSafe(nextConfig.codex_quota_disable_remaining_percent, parseIntSafe(config.codex_quota_disable_remaining_percent, 10))
-        : parseIntSafe(config.codex_quota_disable_remaining_percent, 10);
-      const nextQuotaDisableRemainingPercent = Math.max(0, Math.min(100, nextQuotaDisableRemainingPercentRaw));
-
-      const nextCodexReplenishEnabled = nextConfig.codex_replenish_enabled !== undefined
-        ? parseBoolSafe(nextConfig.codex_replenish_enabled, config.codex_replenish_enabled)
-        : config.codex_replenish_enabled;
-      
-      const nextCodexReplenishTargetCountRaw = nextConfig.codex_replenish_target_count !== undefined || nextConfig.codex_target_count !== undefined
-        ? resolveCodexReplenishTargetCount(nextConfig, config.codex_replenish_target_count)
-        : config.codex_replenish_target_count;
-      const nextCodexReplenishTargetCount = normalizeNonNegativeInteger(
-        nextCodexReplenishTargetCountRaw,
-        normalizeNonNegativeInteger(config.codex_replenish_target_count, 5),
-      );
-      
-      const nextCodexReplenishThresholdRaw = nextConfig.codex_replenish_threshold !== undefined
-        ? parseIntSafe(nextConfig.codex_replenish_threshold, config.codex_replenish_threshold)
-        : config.codex_replenish_threshold;
-      const nextCodexReplenishThreshold = normalizeCodexReplenishThreshold(
-        nextCodexReplenishThresholdRaw,
-        nextCodexReplenishTargetCount,
-        normalizeCodexReplenishThreshold(config.codex_replenish_threshold, nextCodexReplenishTargetCount, 2),
-      );
-      const nextCodexReplenishBatchSize = nextConfig.codex_replenish_batch_size !== undefined
-        ? normalizeCodexReplenishBatchSize(nextConfig.codex_replenish_batch_size, config.codex_replenish_batch_size)
-        : normalizeCodexReplenishBatchSize(config.codex_replenish_batch_size, 1);
-      const nextCodexReplenishWorkerCount = nextConfig.codex_replenish_worker_count !== undefined
-        ? normalizeCodexReplenishWorkerCount(nextConfig.codex_replenish_worker_count, config.codex_replenish_worker_count)
-        : normalizeCodexReplenishWorkerCount(config.codex_replenish_worker_count, 1);
-
-      const nextCodexReplenishUseProxy = nextConfig.codex_replenish_use_proxy !== undefined
-        ? parseBoolSafe(nextConfig.codex_replenish_use_proxy, config.codex_replenish_use_proxy)
-        : config.codex_replenish_use_proxy;
-      const nextCodexReplenishProxyPool = nextConfig.codex_replenish_proxy_pool !== undefined
-        ? String(nextConfig.codex_replenish_proxy_pool || '')
-        : String(config.codex_replenish_proxy_pool || '');
-
       writeConfig({
         cpa_url: nextConfig.cpa_url !== undefined ? nextConfig.cpa_url : config.cpa_url,
         management_key: nextConfig.management_key !== undefined ? nextConfig.management_key : config.management_key,
-        mail_email_provider: nextConfig.mail_email_provider !== undefined ? normalizeMailProvider(nextConfig.mail_email_provider) : config.mail_email_provider,
-        mailfree_api_base: nextConfig.mailfree_api_base !== undefined ? nextConfig.mailfree_api_base : config.mailfree_api_base,
-        mailfree_username: nextConfig.mailfree_username !== undefined ? nextConfig.mailfree_username : config.mailfree_username,
-        mailfree_password: nextConfig.mailfree_password !== undefined ? nextConfig.mailfree_password : config.mailfree_password,
-        mailfree_mail_domain: nextConfig.mailfree_mail_domain !== undefined ? nextConfig.mailfree_mail_domain : config.mailfree_mail_domain,
-        mailfree_mail_domains: nextConfig.mailfree_mail_domains !== undefined ? nextConfig.mailfree_mail_domains : config.mailfree_mail_domains,
-        mail_api_base: nextConfig.mail_api_base !== undefined ? nextConfig.mail_api_base : config.mail_api_base,
-        mail_username: nextConfig.mail_username !== undefined ? nextConfig.mail_username : config.mail_username,
-        mail_password: nextConfig.mail_password !== undefined ? nextConfig.mail_password : config.mail_password,
-        mail_email_domain: nextConfig.mail_email_domain !== undefined ? nextConfig.mail_email_domain : config.mail_email_domain,
-        mail_email_domains: nextConfig.mail_email_domains !== undefined ? nextConfig.mail_email_domains : config.mail_email_domains,
-        inbucket_mail_api_base: nextConfig.inbucket_mail_api_base !== undefined ? nextConfig.inbucket_mail_api_base : config.inbucket_mail_api_base,
-        inbucket_mail_username: nextConfig.inbucket_mail_username !== undefined ? nextConfig.inbucket_mail_username : config.inbucket_mail_username,
-        inbucket_mail_password: nextConfig.inbucket_mail_password !== undefined ? nextConfig.inbucket_mail_password : config.inbucket_mail_password,
-        inbucket_mail_domain: nextConfig.inbucket_mail_domain !== undefined ? nextConfig.inbucket_mail_domain : config.inbucket_mail_domain,
-        inbucket_mail_domains: nextConfig.inbucket_mail_domains !== undefined ? nextConfig.inbucket_mail_domains : config.inbucket_mail_domains,
-        inbucket_mail_disabled_domains: nextConfig.inbucket_mail_disabled_domains !== undefined ? nextConfig.inbucket_mail_disabled_domains : config.inbucket_mail_disabled_domains,
-        inbucket_ice_mail_api_base: config.inbucket_ice_mail_api_base,
-        inbucket_ice_mail_username: config.inbucket_ice_mail_username,
-        inbucket_ice_mail_password: config.inbucket_ice_mail_password,
-        inbucket_ice_mail_host: config.inbucket_ice_mail_host,
-        inbucket_ice_mail_domain: nextConfig.inbucket_ice_mail_domain !== undefined ? nextConfig.inbucket_ice_mail_domain : config.inbucket_ice_mail_domain,
-        inbucket_ice_mail_domains: nextConfig.inbucket_ice_mail_domains !== undefined ? nextConfig.inbucket_ice_mail_domains : config.inbucket_ice_mail_domains,
-        duckmail_api_base: nextConfig.duckmail_api_base !== undefined ? nextConfig.duckmail_api_base : config.duckmail_api_base,
-        duckmail_api_key: nextConfig.duckmail_api_key !== undefined ? nextConfig.duckmail_api_key : config.duckmail_api_key,
-        duckmail_mail_domain: nextConfig.duckmail_mail_domain !== undefined ? nextConfig.duckmail_mail_domain : config.duckmail_mail_domain,
-        duckmail_mail_domains: nextConfig.duckmail_mail_domains !== undefined ? nextConfig.duckmail_mail_domains : config.duckmail_mail_domains,
-        mail_randomize_from_list: nextConfig.mail_randomize_from_list !== undefined ? parseBoolSafe(nextConfig.mail_randomize_from_list, config.mail_randomize_from_list) : config.mail_randomize_from_list,
-        codex_replenish_enabled: nextCodexReplenishEnabled,
-        codex_target_count: nextCodexReplenishTargetCount,
-        codex_replenish_target_count: nextCodexReplenishTargetCount,
-        codex_replenish_threshold: nextCodexReplenishThreshold,
-        codex_replenish_batch_size: nextCodexReplenishBatchSize,
-        codex_replenish_worker_count: nextCodexReplenishWorkerCount,
-        codex_replenish_use_proxy: nextCodexReplenishUseProxy,
-        codex_replenish_proxy_pool: nextCodexReplenishProxyPool,
-        auto_probe_enabled: nextAutoProbeEnabled,
-        auto_probe_interval_minutes: nextAutoProbeIntervalMinutes,
-        codex_quota_disable_remaining_percent: nextQuotaDisableRemainingPercent,
+        auto_probe_enabled: nextConfig.auto_probe_enabled !== undefined ? nextConfig.auto_probe_enabled : config.auto_probe_enabled,
+        auto_probe_interval_minutes: nextConfig.auto_probe_interval_minutes !== undefined
+          ? nextConfig.auto_probe_interval_minutes
+          : config.auto_probe_interval_minutes,
+        auto_probe_batch_size: nextConfig.auto_probe_batch_size !== undefined
+          ? nextConfig.auto_probe_batch_size
+          : config.auto_probe_batch_size,
+        codex_quota_disable_remaining_percent: nextConfig.codex_quota_disable_remaining_percent !== undefined
+          ? nextConfig.codex_quota_disable_remaining_percent
+          : config.codex_quota_disable_remaining_percent,
       });
       res.json({ ok: true });
     } catch (e) {
@@ -2591,7 +1682,8 @@ app.post('/api/remote/push-test', async (req, res) => {
     const payload = await runRemotePushSmokeTest(targetConfig);
     res.json({ ok: true, payload });
   } catch (error) {
-    res.status(502).json({
+    const responseStatus = Number(error?.response?.status) || 0;
+    res.status(responseStatus >= 400 && responseStatus < 500 ? responseStatus : 502).json({
       ok: false,
       error: String(error?.message || error),
       payload: {
@@ -2646,13 +1738,71 @@ app.patch('/api/cpa/auth-files/status', async (req, res) => {
       return;
     }
     const disabled = Boolean(body.disabled);
-    const result = await updateCredentialDisabledStatus(config, name, disabled);
-    res.json(result.data ?? { ok: true });
+    const cpaUrlKey = resolveConfiguredCpaUrlKey(config, body.cpa_url);
+    const requestedRuntimeState = body.runtime_state && typeof body.runtime_state === 'object' && !Array.isArray(body.runtime_state)
+      ? body.runtime_state
+      : {};
+    const allowedRuntimeStateFields = new Set(['disabled_by_runtime', 'archived_by_runtime', 'next_probe_at_ms']);
+    const unsupportedRuntimeStateFields = Object.keys(requestedRuntimeState)
+      .filter((field) => !allowedRuntimeStateFields.has(field));
+    if (unsupportedRuntimeStateFields.length > 0) {
+      res.status(400).json({
+        ok: false,
+        error: `runtime_state contains unsupported status-transition fields: ${unsupportedRuntimeStateFields.join(', ')}`,
+      });
+      return;
+    }
+    const runtimeStatePatch = {
+      ...requestedRuntimeState,
+      disabled_by_runtime: normalizeBoolean(requestedRuntimeState.disabled_by_runtime, false),
+      archived_by_runtime: normalizeBoolean(requestedRuntimeState.archived_by_runtime, false),
+      next_probe_at_ms: Object.hasOwn(requestedRuntimeState, 'next_probe_at_ms')
+        ? normalizeNumberOrNull(requestedRuntimeState.next_probe_at_ms)
+        : null,
+    };
+    const requireRuntimeOwnership = Boolean(body.require_runtime_ownership);
+    const claimRuntimeOwnership = runtimeStatePatch.disabled_by_runtime && !requireRuntimeOwnership;
+    const expectedProbeAtMs = normalizeNumberOrNull(body.expected_probe_at_ms);
+    const expectedAuthIndex = normalizeStringOrEmpty(body.expected_auth_index);
+    if (!expectedAuthIndex) {
+      res.status(400).json({ ok: false, error: 'expected_auth_index is required for credential status transitions' });
+      return;
+    }
+    if ((claimRuntimeOwnership || requireRuntimeOwnership) && (expectedProbeAtMs === null || expectedProbeAtMs <= 0)) {
+      res.status(400).json({ ok: false, error: 'expected_probe_at_ms is required for automatic status transitions' });
+      return;
+    }
+    if (runtimeStatePatch.disabled_by_runtime && !disabled) {
+      res.status(400).json({ ok: false, error: 'runtime ownership can only be claimed while disabling a credential' });
+      return;
+    }
+    if (runtimeStatePatch.archived_by_runtime && (!disabled || !runtimeStatePatch.disabled_by_runtime)) {
+      res.status(400).json({ ok: false, error: 'runtime archive ownership requires a runtime-owned disabled credential' });
+      return;
+    }
+    const payload = await updateCredentialStatusWithRuntimeState(config, {
+      cpaUrlKey,
+      credentialName: name,
+      disabled,
+      runtimeStatePatch,
+      claimRuntimeOwnership,
+      requireRuntimeOwnership,
+      expectedProbeAtMs,
+      expectedAuthIndex,
+      requireExactProbeVersion: claimRuntimeOwnership || requireRuntimeOwnership,
+    });
+    if (payload.skipped && payload.skip_reason === 'credential_identity_changed') {
+      res.status(409).json({ ok: false, error: 'credential identity changed before status transition', payload });
+      return;
+    }
+    res.json({ ok: true, payload });
   } catch (error) {
-    res.status(502).json({
+    const responseStatus = Number(error?.response?.status) || 0;
+    res.status(responseStatus >= 400 && responseStatus < 500 ? responseStatus : 502).json({
       ok: false,
       error: String(error?.message || error),
       payload: error?.response?.data ?? null,
+      transition: error?.transition ?? null,
     });
   }
 });
@@ -2670,10 +1820,42 @@ app.delete('/api/cpa/auth-files', async (req, res) => {
       res.status(400).json({ ok: false, error: 'name is required' });
       return;
     }
-    const result = await deleteAuthFileFromCpa(config, name);
-    res.json(result.data ?? { ok: true });
+    const expectedAuthIndex = normalizeStringOrEmpty(req.query?.expected_auth_index);
+    if (!expectedAuthIndex) {
+      res.status(400).json({ ok: false, error: 'expected_auth_index is required' });
+      return;
+    }
+    const cpaUrlKey = resolveConfiguredCpaUrlKey(config);
+    const deletion = await runCredentialStatusOperation(cpaUrlKey, name, async () => {
+      let result = null;
+      let notFound = false;
+      try {
+        const currentCredential = await fetchCredentialFromCpaByName(config, name, { fresh: true });
+        if (!isSameCredentialIdentity(currentCredential?.auth_index, expectedAuthIndex)) {
+          const runtimeEntry = getCredentialRuntimeState(readRuntimeState(), cpaUrlKey, name);
+          if (!runtimeEntry?.auth_index || isSameCredentialIdentity(runtimeEntry.auth_index, expectedAuthIndex)) {
+            await removeCredentialRuntimeStateUnlocked(cpaUrlKey, name);
+          }
+          throw createRequestError('credential identity changed before deletion', 409, null);
+        }
+        result = await deleteAuthFileFromCpa(config, name);
+      } catch (error) {
+        if (Number(error?.response?.status) !== 404) {
+          throw error;
+        }
+        notFound = true;
+        invalidateCpaAuthFilesCache(config);
+      }
+      await removeCredentialRuntimeStateUnlocked(cpaUrlKey, name);
+      await removeArchiveNamesSerialized(cpaUrlKey, [name]);
+      return { result, notFound };
+    });
+    res.json(deletion.notFound
+      ? { ok: true, deleted: false, reason: 'not found on CPA' }
+      : (deletion.result?.data ?? { ok: true }));
   } catch (error) {
-    res.status(502).json({
+    const responseStatus = Number(error?.response?.status) || 0;
+    res.status(responseStatus >= 400 && responseStatus < 500 ? responseStatus : 502).json({
       ok: false,
       error: String(error?.message || error),
       payload: error?.response?.data ?? null,
@@ -2690,12 +1872,8 @@ app.post('/api/cpa/api-call', async (req, res) => {
 
   try {
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
-    const result = await cpaRequest(config, {
-      method: 'POST',
-      pathname: '/v0/management/api-call',
-      body,
-    });
-    res.status(result.status || 200).json(result.data ?? {});
+    const probeResponse = await probeApiCallFromCpa(config, body);
+    res.json(probeResponse);
   } catch (error) {
     res.status(502).json({
       ok: false,
@@ -2705,45 +1883,7 @@ app.post('/api/cpa/api-call', async (req, res) => {
   }
 });
 
-app.post('/api/mail/domain-test', async (req, res) => {
-  const config = readConfig();
-  if (!isAuthorized(resolveRequestSecret(req), config)) {
-    res.status(401).json({ ok: false, error: 'Unauthorized' });
-    return;
-  }
-
-  try {
-    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
-    const payload = await runMailDomainSmokeTest({
-      mail_email_provider: body.mail_email_provider !== undefined ? body.mail_email_provider : config.mail_email_provider,
-      mail_api_base: body.mail_api_base !== undefined ? body.mail_api_base : config.mail_api_base,
-      mail_username: body.mail_username !== undefined ? body.mail_username : config.mail_username,
-      mail_password: body.mail_password !== undefined ? body.mail_password : config.mail_password,
-      mail_host_header: body.mail_host_header !== undefined ? body.mail_host_header : config.mail_host_header,
-      duckmail_api_key: body.duckmail_api_key !== undefined ? body.duckmail_api_key : config.duckmail_api_key,
-      domain: body.domain !== undefined ? body.domain : config.mail_email_domain,
-    });
-    res.json({ ok: true, payload });
-  } catch (error) {
-    const fallbackDomain = normalizeMailDomain(req.body?.domain || config.mail_email_domain);
-    const fallbackMailbox = fallbackDomain ? buildMailDomainTestMailbox(fallbackDomain) : '';
-    res.status(502).json({
-      ok: false,
-      error: String(error?.message || error),
-      payload: {
-        domain: fallbackDomain,
-        mailbox: fallbackMailbox,
-        ok: false,
-        login_status: Number(error?.response?.data?.login_status) || null,
-        list_status: Number(error?.response?.data?.list_status) || null,
-        message: '',
-        error: String(error?.response?.data?.error || error?.message || error),
-      },
-    });
-  }
-});
-
-app.post('/api/archive/list', (req, res) => {
+app.post('/api/archive/list', async (req, res) => {
   const body = req.body || {};
   const config = readConfig();
   if (!isAuthorized(resolveRequestSecret(req), config)) {
@@ -2751,16 +1891,26 @@ app.post('/api/archive/list', (req, res) => {
     return;
   }
   try {
-    const cpaUrlKey = normalizeCpaUrlForArchive(body.cpa_url, config.cpa_url);
-    const store = readArchiveStore();
-    const entries = getArchiveEntries(store, cpaUrlKey);
-    const names = entries.map((item) => item.name);
+    const cpaUrlKey = resolveConfiguredCpaUrlKey(config, body.cpa_url);
+    let cpaNames = null;
+    try {
+      const cpaFiles = await fetchAuthFilesFromCpa(config);
+      cpaNames = new Set(cpaFiles.map((f) => normalizeCredentialName(f.name)));
+    } catch {
+      // CPA unreachable, return all archive entries as-is
+    }
+    const currentEntries = getArchiveEntries(readArchiveStore(), cpaUrlKey);
+    const validEntries = cpaNames === null
+      ? currentEntries
+      : currentEntries.filter((item) => cpaNames.has(item.name));
+
+    const names = validEntries.map((item) => item.name);
     res.json({
       ok: true,
       payload: {
         cpa_url: cpaUrlKey,
         names,
-        entries: entries.map((item) => ({
+        entries: validEntries.map((item) => ({
           name: item.name,
           archived_at: normalizeArchiveTimestamp(item.archived_at),
           archived_at_iso: formatRuntimeTime(item.archived_at),
@@ -2769,11 +1919,12 @@ app.post('/api/archive/list', (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({ ok: false, error: String(error?.message || error) });
+    const responseStatus = Number(error?.response?.status) || 0;
+    res.status(responseStatus >= 400 && responseStatus < 500 ? responseStatus : 500).json({ ok: false, error: String(error?.message || error) });
   }
 });
 
-app.post('/api/archive/add', (req, res) => {
+app.post('/api/archive/add', async (req, res) => {
   const body = req.body || {};
   const config = readConfig();
   if (!isAuthorized(resolveRequestSecret(req), config)) {
@@ -2781,22 +1932,67 @@ app.post('/api/archive/add', (req, res) => {
     return;
   }
   try {
-    const cpaUrlKey = normalizeCpaUrlForArchive(body.cpa_url, config.cpa_url);
+    const cpaUrlKey = resolveConfiguredCpaUrlKey(config, body.cpa_url);
     const incoming = normalizeArchiveNames(body.names);
     if (!incoming.length) {
       res.status(400).json({ ok: false, error: 'names is required' });
       return;
     }
-    const store = readArchiveStore();
-    const currentEntries = getArchiveEntries(store, cpaUrlKey);
-    const currentNameSet = new Set(currentEntries.map((item) => item.name));
-    const addedEntries = incoming
-      .filter((name) => !currentNameSet.has(name))
-      .map((name) => ({ name, archived_at: Date.now() }));
-    const mergedEntries = normalizeArchiveEntries([...currentEntries, ...addedEntries]);
+    const requireRuntimeOwnership = Boolean(body.require_runtime_ownership);
+    const expectedProbeAtMs = normalizeNumberOrNull(body.expected_probe_at_ms);
+    const expectedAuthIndex = normalizeStringOrEmpty(body.expected_auth_index);
+    if (requireRuntimeOwnership && (expectedProbeAtMs === null || expectedProbeAtMs <= 0)) {
+      res.status(400).json({ ok: false, error: 'expected_probe_at_ms is required for automatic archive transitions' });
+      return;
+    }
+    if (requireRuntimeOwnership && !expectedAuthIndex) {
+      res.status(400).json({ ok: false, error: 'expected_auth_index is required for automatic archive transitions' });
+      return;
+    }
+    let added = 0;
+    let skipped = [];
+    if (requireRuntimeOwnership) {
+      const results = await Promise.all(incoming.map(async (name) => ({
+        name,
+        result: await addRuntimeOwnedArchiveName(config, cpaUrlKey, name, expectedProbeAtMs, expectedAuthIndex),
+      })));
+      added = results.filter((item) => item.result.added).length;
+      skipped = results.filter((item) => !item.result.committed).map((item) => item.name);
+    } else {
+      const rawAuthIndices = body.auth_indices && typeof body.auth_indices === 'object' && !Array.isArray(body.auth_indices)
+        ? body.auth_indices
+        : {};
+      const expectedAuthIndices = Object.fromEntries(incoming.map((name) => [
+        name,
+        normalizeStringOrEmpty(rawAuthIndices[name]),
+      ]));
+      const missingIdentities = incoming.filter((name) => !expectedAuthIndices[name]);
+      if (missingIdentities.length > 0) {
+        res.status(400).json({ ok: false, error: `auth_indices are required for: ${missingIdentities.join(', ')}` });
+        return;
+      }
+      const manualCommit = await runCredentialStatusOperations(cpaUrlKey, incoming, async () => {
+        const credentials = await fetchAuthFilesFromCpa(config, { maxAgeMs: -1 });
+        const credentialsByName = new Map(credentials.map((credential) => [credential.name, credential]));
+        const eligibleNames = incoming.filter((name) => {
+          const credential = credentialsByName.get(name);
+          return Boolean(credential?.disabled)
+            && isSameCredentialIdentity(credential?.auth_index, expectedAuthIndices[name]);
+        });
+        const addedCount = await mutateArchiveStore((store) => eligibleNames.reduce(
+          (count, name) => count + (upsertArchiveName(store, cpaUrlKey, name) ? 1 : 0),
+          0,
+        ));
+        return {
+          added: addedCount,
+          skipped: incoming.filter((name) => !eligibleNames.includes(name)),
+        };
+      });
+      added = manualCommit.added;
+      skipped = manualCommit.skipped;
+    }
+    const mergedEntries = getArchiveEntries(readArchiveStore(), cpaUrlKey);
     const merged = mergedEntries.map((item) => item.name);
-    setArchiveEntries(store, cpaUrlKey, mergedEntries);
-    writeArchiveStore(store);
     res.json({
       ok: true,
       payload: {
@@ -2808,15 +2004,17 @@ app.post('/api/archive/add', (req, res) => {
           archived_at_iso: formatRuntimeTime(item.archived_at),
         })),
         total: merged.length,
-        added: addedEntries.length,
+        added,
+        skipped,
       },
     });
   } catch (error) {
-    res.status(500).json({ ok: false, error: String(error?.message || error) });
+    const responseStatus = Number(error?.response?.status) || 0;
+    res.status(responseStatus >= 400 && responseStatus < 500 ? responseStatus : 500).json({ ok: false, error: String(error?.message || error) });
   }
 });
 
-app.post('/api/archive/remove', (req, res) => {
+app.post('/api/archive/remove', async (req, res) => {
   const body = req.body || {};
   const config = readConfig();
   if (!isAuthorized(resolveRequestSecret(req), config)) {
@@ -2824,18 +2022,15 @@ app.post('/api/archive/remove', (req, res) => {
     return;
   }
   try {
-    const cpaUrlKey = normalizeCpaUrlForArchive(body.cpa_url, config.cpa_url);
-    const removing = new Set(normalizeArchiveNames(body.names));
-    if (!removing.size) {
+    const cpaUrlKey = resolveConfiguredCpaUrlKey(config, body.cpa_url);
+    const removing = normalizeArchiveNames(body.names);
+    if (!removing.length) {
       res.status(400).json({ ok: false, error: 'names is required' });
       return;
     }
-    const store = readArchiveStore();
-    const currentEntries = getArchiveEntries(store, cpaUrlKey);
-    const nextEntries = currentEntries.filter((item) => !removing.has(item.name));
+    const archiveMutation = await removeArchiveNamesSerialized(cpaUrlKey, removing);
+    const nextEntries = archiveMutation.entries;
     const next = nextEntries.map((item) => item.name);
-    setArchiveEntries(store, cpaUrlKey, nextEntries);
-    writeArchiveStore(store);
     res.json({
       ok: true,
       payload: {
@@ -2847,11 +2042,12 @@ app.post('/api/archive/remove', (req, res) => {
           archived_at_iso: formatRuntimeTime(item.archived_at),
         })),
         total: next.length,
-        removed: currentEntries.length - next.length,
+        removed: archiveMutation.removed,
       },
     });
   } catch (error) {
-    res.status(500).json({ ok: false, error: String(error?.message || error) });
+    const responseStatus = Number(error?.response?.status) || 0;
+    res.status(responseStatus >= 400 && responseStatus < 500 ? responseStatus : 500).json({ ok: false, error: String(error?.message || error) });
   }
 });
 
@@ -2867,143 +2063,8 @@ app.get('/api/runtime/status', (req, res) => {
       payload: buildRuntimeStatusPayload(config),
     });
   } catch (error) {
-    res.status(500).json({ ok: false, error: String(error?.message || error) });
-  }
-});
-
-app.post('/api/runtime/replenishment/stop', async (req, res) => {
-  const config = readConfig();
-  if (!isAuthorized(resolveRequestSecret(req), config)) {
-    res.status(401).json({ ok: false, error: 'Unauthorized' });
-    return;
-  }
-
-  try {
-    const payload = await stopTrackedReplenishmentProcess();
-    res.json({ ok: true, payload });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: String(error?.message || error),
-      payload: {
-        requested: true,
-        stopped: false,
-        pid: normalizeNumberOrNull(runtimeScheduler.replenishmentPid),
-        message: String(error?.message || error),
-      },
-    });
-  }
-});
-
-app.post('/api/runtime/replenishment/start', async (req, res) => {
-  const config = readConfig();
-  if (!isAuthorized(resolveRequestSecret(req), config)) {
-    res.status(401).json({ ok: false, error: 'Unauthorized' });
-    return;
-  }
-
-  try {
-    clearStaleTrackedReplenishmentStatus();
-
-    const targetCount = normalizeNonNegativeInteger(
-      config.codex_replenish_target_count,
-      normalizeNonNegativeInteger(config.codex_target_count, 0),
-    );
-    const threshold = normalizeCodexReplenishThreshold(config.codex_replenish_threshold, targetCount, 0);
-    const runtimeState = readRuntimeState();
-    const cpaUrlKey = normalizeCpaUrlForArchive(config?.cpa_url, config?.cpa_url);
-    let healthyCount = countNormalCodexAccountsFromRuntime(runtimeState, cpaUrlKey);
-    try {
-      const credentials = await fetchAuthFilesFromCpa(config);
-      healthyCount = countUsableCodexAccounts(credentials, runtimeState, cpaUrlKey);
-    } catch (error) {
-      console.warn(`[Replenish] Falling back to runtime-only healthy count for manual start: ${String(error?.message || error)}`);
-    }
-    const needed = Math.max(0, targetCount - healthyCount);
-
-    const tracked = getTrackedReplenishmentProcess();
-    if (tracked) {
-      res.json({
-        ok: true,
-        payload: {
-          started: false,
-          already_running: true,
-          pid: tracked.pid,
-          needed,
-          healthy_count: healthyCount,
-          target_count: targetCount,
-          threshold,
-          message: `A replenishment process is already running (PID ${tracked.pid}).`,
-        },
-      });
-      return;
-    }
-
-    if (targetCount <= 0) {
-      res.json({
-        ok: true,
-        payload: {
-          started: false,
-          already_running: false,
-          pid: null,
-          needed: 0,
-          healthy_count: healthyCount,
-          target_count: targetCount,
-          threshold,
-          message: 'Target count is 0. Increase codex_replenish_target_count before starting replenishment.',
-        },
-      });
-      return;
-    }
-
-    if (needed <= 0) {
-      updateReplenishmentStatus({
-        in_progress: false,
-        target_count: targetCount,
-        threshold,
-        needed: 0,
-        last_finished_at: Date.now(),
-        last_error: '',
-        last_summary: `Manual start skipped because healthy Codex count ${healthyCount} already meets target ${targetCount}.`,
-      });
-      res.json({
-        ok: true,
-        payload: {
-          started: false,
-          already_running: false,
-          pid: null,
-          needed: 0,
-          healthy_count: healthyCount,
-          target_count: targetCount,
-          threshold,
-          message: `Healthy Codex count ${healthyCount} already meets target ${targetCount}.`,
-        },
-      });
-      return;
-    }
-
-    void spawnReplenishmentProcess({ needed }).catch((err) => {
-      console.error('Manual Codex replenishment trigger failed', err);
-    });
-
-    res.json({
-      ok: true,
-      payload: {
-        started: true,
-        already_running: false,
-        pid: null,
-        needed,
-        healthy_count: healthyCount,
-        target_count: targetCount,
-        threshold,
-        message: `Started manual replenishment for ${needed} account(s).`,
-      },
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: String(error?.message || error),
-    });
+    const responseStatus = Number(error?.response?.status) || 0;
+    res.status(responseStatus >= 400 && responseStatus < 500 ? responseStatus : 500).json({ ok: false, error: String(error?.message || error) });
   }
 });
 
@@ -3023,11 +2084,12 @@ app.get('/api/runtime/credential-state', (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({ ok: false, error: String(error?.message || error) });
+    const responseStatus = Number(error?.response?.status) || 0;
+    res.status(responseStatus >= 400 && responseStatus < 500 ? responseStatus : 500).json({ ok: false, error: String(error?.message || error) });
   }
 });
 
-app.post('/api/runtime/credential-state/upsert', (req, res) => {
+app.post('/api/runtime/credential-state/upsert', async (req, res) => {
   const config = readConfig();
   if (!isAuthorized(resolveRequestSecret(req), config)) {
     res.status(401).json({ ok: false, error: 'Unauthorized' });
@@ -3036,27 +2098,49 @@ app.post('/api/runtime/credential-state/upsert', (req, res) => {
 
   try {
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
-    const cpaUrlKey = normalizeCpaUrlForArchive(body.cpa_url, config.cpa_url);
+    const cpaUrlKey = resolveConfiguredCpaUrlKey(config, body.cpa_url);
     const credentialName = normalizeCredentialName(body.name);
     if (!credentialName) {
       res.status(400).json({ ok: false, error: 'name is required' });
       return;
     }
+    const expectedAuthIndex = normalizeStringOrEmpty(body.auth_index);
+    if (!expectedAuthIndex) {
+      res.status(400).json({ ok: false, error: 'auth_index is required' });
+      return;
+    }
 
-    const runtimeState = readRuntimeState();
-    const nextEntry = setCredentialRuntimeState(runtimeState, cpaUrlKey, credentialName, body.state);
-    writeRuntimeState(runtimeState);
+    const statePatch = body.state && typeof body.state === 'object' && !Array.isArray(body.state) ? body.state : {};
+    if (
+      Object.hasOwn(statePatch, 'disabled_by_runtime')
+      || Object.hasOwn(statePatch, 'archived_by_runtime')
+      || Object.hasOwn(statePatch, 'auth_index')
+    ) {
+      res.status(400).json({ ok: false, error: 'runtime ownership and credential identity fields are server-managed' });
+      return;
+    }
+    const nextEntry = await runCredentialStatusOperation(cpaUrlKey, credentialName, async () => {
+      const currentCredential = await fetchCredentialFromCpaByName(config, credentialName, { fresh: true });
+      if (!isSameCredentialIdentity(currentCredential?.auth_index, expectedAuthIndex)) {
+        throw createRequestError('credential identity changed before runtime state persistence', 409, null);
+      }
+      return patchCredentialRuntimeStateUnlocked(cpaUrlKey, credentialName, {
+        ...statePatch,
+        auth_index: expectedAuthIndex,
+      }, { rejectOlderProbe: true });
+    });
 
     res.json({
       ok: true,
       payload: {
         cpa_url: cpaUrlKey,
         name: credentialName,
-        state: nextEntry,
+        state: serializeRuntimeCredentialState(nextEntry),
       },
     });
   } catch (error) {
-    res.status(500).json({ ok: false, error: String(error?.message || error) });
+    const responseStatus = Number(error?.response?.status) || 0;
+    res.status(responseStatus >= 400 && responseStatus < 500 ? responseStatus : 500).json({ ok: false, error: String(error?.message || error) });
   }
 });
 

@@ -10,6 +10,7 @@ import {
   runCredentialArchiveRemove,
   updateCredentialStatus,
 } from '../../lib/api';
+import { batchWithLimit } from '../../lib/concurrency';
 import type { Credential } from '../../lib/api';
 import { useGlobalModal } from '../../components/global-modal/useGlobalModal';
 
@@ -241,12 +242,15 @@ export default function ArchivedCredentialsPanelV3({ cpaReady, cpaUrl }: Archive
       const removableNames: string[] = [];
       const failedNames: string[] = [];
 
-      for (const name of targets) {
+      await batchWithLimit(targets, async (name) => {
         setRunningRestoreNames((prev) => new Set(prev).add(name));
         try {
           const credential = credentialByName.get(name) || null;
           if (credential) {
-            await updateCredentialStatus(name, false);
+            await updateCredentialStatus(name, false, {
+              cpaUrl,
+              expectedAuthIndex: String(credential.auth_index || ''),
+            });
           }
           removableNames.push(name);
         } catch {
@@ -258,7 +262,7 @@ export default function ArchivedCredentialsPanelV3({ cpaReady, cpaUrl }: Archive
             return next;
           });
         }
-      }
+      }, 5);
 
       if (removableNames.length) {
         await removeFromArchive(removableNames);
@@ -272,6 +276,12 @@ export default function ArchivedCredentialsPanelV3({ cpaReady, cpaUrl }: Archive
           confirmText: text('Confirm', '纭'),
         });
       }
+    } catch (error) {
+      showAlert({
+        title: text('Error', '閿欒'),
+        message: String((error as { message?: string })?.message || error || text('Failed to restore', '鎭㈠澶辫触')),
+        confirmText: text('Confirm', '纭'),
+      });
     } finally {
       setIsBusy(false);
     }
@@ -284,12 +294,12 @@ export default function ArchivedCredentialsPanelV3({ cpaReady, cpaUrl }: Archive
       const removableNames: string[] = [];
       const failedNames: string[] = [];
 
-      for (const name of targets) {
+      await batchWithLimit(targets, async (name) => {
         setRunningDeleteNames((prev) => new Set(prev).add(name));
         try {
           const credential = credentialByName.get(name) || null;
           if (credential) {
-            await deleteCredential(name);
+            await deleteCredential(name, String(credential.auth_index || ''));
           }
           removableNames.push(name);
         } catch {
@@ -301,7 +311,7 @@ export default function ArchivedCredentialsPanelV3({ cpaReady, cpaUrl }: Archive
             return next;
           });
         }
-      }
+      }, 5);
 
       if (removableNames.length) {
         await removeFromArchive(removableNames);
@@ -315,6 +325,12 @@ export default function ArchivedCredentialsPanelV3({ cpaReady, cpaUrl }: Archive
           confirmText: text('Confirm', '纭'),
         });
       }
+    } catch (error) {
+      showAlert({
+        title: text('Error', '閿欒'),
+        message: String((error as { message?: string })?.message || error || text('Failed to delete', '鍒犻櫎澶辫触')),
+        confirmText: text('Confirm', '纭'),
+      });
     } finally {
       setIsBusy(false);
     }

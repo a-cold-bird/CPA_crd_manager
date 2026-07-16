@@ -1,31 +1,18 @@
-﻿import { Settings } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { Settings } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  clearAuthFilesCache,
   cpaApi,
   configApi,
-  fetchRuntimeStatus,
-  runMailDomainTest,
   runRemotePushTest,
-  startReplenishment,
-  stopReplenishment,
-  type MailDomainTestPayload,
-  type ReplenishmentBatchStatus,
   type RemotePushTestPayload,
-  type RuntimeStatusPayload,
 } from '../../lib/api';
-import { buildEmailDomainStats } from '../../lib/domainStats.js';
 
 interface SettingsMessage {
   type: '' | 'success' | 'error';
   text: string;
-}
-
-interface DomainTestState {
-  status: 'idle' | 'testing' | 'success' | 'error';
-  message: string;
-  payload: MailDomainTestPayload | null;
 }
 
 interface SettingsPanelProps {
@@ -33,760 +20,33 @@ interface SettingsPanelProps {
   setCpaUrl: Dispatch<SetStateAction<string>>;
   newPassword: string;
   setNewPassword: Dispatch<SetStateAction<string>>;
-  mailApiBase: string;
-  setMailApiBase: Dispatch<SetStateAction<string>>;
-  mailUsername: string;
-  setMailUsername: Dispatch<SetStateAction<string>>;
-  mailPassword: string;
-  setMailPassword: Dispatch<SetStateAction<string>>;
-  mailEmailProvider: 'mailfree' | 'inbucket' | 'inbucket_ice' | 'duckmail';
-  setMailEmailProvider: Dispatch<SetStateAction<'mailfree' | 'inbucket' | 'inbucket_ice' | 'duckmail'>>;
-  inbucketApiBase: string;
-  duckmailApiBase: string;
-  duckmailApiKey: string;
-  setDuckmailApiKey: Dispatch<SetStateAction<string>>;
-  mailEmailDomain: string;
-  setMailEmailDomain: Dispatch<SetStateAction<string>>;
-  mailEmailDomains: string;
-  setMailEmailDomains: Dispatch<SetStateAction<string>>;
-  inbucketDomains: string[];
-  inbucketIceDomains: string[];
-  setInbucketDomains: Dispatch<SetStateAction<string[]>>;
-  inbucketDisabledDomains: string[];
-  setInbucketDisabledDomains: Dispatch<SetStateAction<string[]>>;
-  duckmailDomains: string[];
-  mailRandomizeFromList: boolean;
-  setMailRandomizeFromList: Dispatch<SetStateAction<boolean>>;
-  codexReplenishEnabled: boolean;
-  setCodexReplenishEnabled: Dispatch<SetStateAction<boolean>>;
-  codexReplenishTargetCount: number;
-  setCodexReplenishTargetCount: Dispatch<SetStateAction<number>>;
-  codexReplenishThreshold: number;
-  setCodexReplenishThreshold: Dispatch<SetStateAction<number>>;
-  codexReplenishBatchSize: number;
-  setCodexReplenishBatchSize: Dispatch<SetStateAction<number>>;
-  codexReplenishWorkerCount: number;
-  setCodexReplenishWorkerCount: Dispatch<SetStateAction<number>>;
-  codexReplenishUseProxy: boolean;
-  setCodexReplenishUseProxy: Dispatch<SetStateAction<boolean>>;
-  codexReplenishProxyPool: string;
-  setCodexReplenishProxyPool: Dispatch<SetStateAction<string>>;
   savingSettings: boolean;
   setSavingSettings: Dispatch<SetStateAction<boolean>>;
   message: SettingsMessage;
   setMessage: Dispatch<SetStateAction<SettingsMessage>>;
 }
 
-const DOMAIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
-const WILDCARD_DOMAIN_PATTERN = /^\*\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
-
-function normalizeDomain(input: string): string {
-  return input.trim().toLowerCase().replace(/^@+/, '');
-}
-
-function isValidDomainInput(input: string): boolean {
-  const normalized = normalizeDomain(input);
-  if (!normalized) return false;
-  return DOMAIN_PATTERN.test(normalized) || WILDCARD_DOMAIN_PATTERN.test(normalized);
-}
-
-function parseDomainList(input: string): string[] {
-  return Array.from(new Set(
-    input
-      .replace(/\r/g, '\n')
-      .split(/[\n,]+/)
-      .map((item) => normalizeDomain(item))
-      .filter(Boolean),
-  ));
-}
-
-function stringifyDomainList(domains: string[]): string {
-  return domains.join(', ');
-}
-
-function toSampleMailbox(domain: string): string {
-  const normalized = normalizeDomain(domain);
-  if (normalized.startsWith('*.')) {
-    const base = normalized.slice(2);
-    return `sample@sample.${base}`;
-  }
-  return `sample@${normalized}`;
-}
-
-function normalizeNonNegativeInteger(value: unknown, fallback = 0): number {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(0, parsed);
-}
-
-function normalizeReplenishThreshold(value: unknown, targetCount: number, fallback = 0): number {
-  return Math.min(normalizeNonNegativeInteger(value, fallback), Math.max(0, targetCount));
-}
-
-function normalizeReplenishBatchSize(value: unknown, fallback = 1): number {
-  return Math.max(1, Math.min(200, normalizeNonNegativeInteger(value, fallback)));
-}
-
-function normalizeReplenishWorkerCount(value: unknown, fallback = 1): number {
-  return Math.max(1, Math.min(200, normalizeNonNegativeInteger(value, fallback)));
-}
-
-function getReplenishmentResultLabel(
-  status: RuntimeStatusPayload['replenishment'] | null,
-  text: (en: string, zh: string) => string,
-): string {
-  if (!status) return text('No status', '暂无状态');
-  if (status.in_progress) return text('Registration running', '注册运行中');
-  if (!status.enabled) return text('Disabled', '已禁用');
-
-  const summary = String(status.last_summary || '').toLowerCase();
-  if (summary.includes('disabled')) return text('Disabled', '已禁用');
-  if (summary.includes('target count is 0')) return text('Target count is 0', '目标数量为 0');
-  if (summary.includes('no replenishment needed')) return text('No replenishment needed', '当前无需补货');
-  if (summary.includes('succeeded') || Number(status.last_uploaded || 0) > 0) {
-    return text('Registration succeeded', '注册成功');
-  }
-  if (summary.includes('failed') || !!String(status.last_error || '').trim() || Number(status.last_failed || 0) > 0) {
-    return text('Registration failed', '注册失败');
-  }
-  return text('Idle', '空闲');
-}
-
-function StatusCard({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="rounded-md border border-border/60 bg-card/60 px-3 py-2">
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div>{value}</div>
-    </div>
-  );
-}
-
-function getSuccessRateBadgeClass(rate: number | null): string {
-  if (rate === null) return 'border-border/60 bg-background/60 text-muted-foreground';
-  if (rate >= 70) return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400';
-  if (rate >= 30) return 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400';
-  return 'border-destructive/30 bg-destructive/10 text-destructive';
-}
-
-function formatBatchTime(value: number | null, text: (en: string, zh: string) => string): string {
-  if (!value) return text('Unknown', '未知');
-  try {
-    return new Intl.DateTimeFormat(undefined, {
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    }).format(new Date(value));
-  } catch {
-    return text('Unknown', '未知');
-  }
-}
-
-function getEmailSelectionModeLabel(mode: string, text: (en: string, zh: string) => string): string {
-  switch (String(mode || '').trim().toLowerCase()) {
-    case 'per_account_random_from_list':
-      return text('Per-account random', '每账号随机');
-    case 'random_from_list':
-      return text('Random from list', '从列表随机');
-    case 'default':
-      return text('Default domain', '默认域名');
-    case 'first_available':
-      return text('First available', '首个可用域名');
-    default:
-      return text('Unknown', '未知');
-  }
-}
-
-function getBatchBadgeClass(status: string): string {
-  switch (String(status || '').trim().toLowerCase()) {
-    case 'succeeded':
-      return 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400';
-    case 'partial':
-      return 'bg-amber-500/15 text-amber-700 dark:text-amber-400';
-    case 'failed':
-      return 'bg-destructive/10 text-destructive';
-    case 'uploading':
-    case 'registering':
-      return 'bg-sky-500/15 text-sky-700 dark:text-sky-400';
-    default:
-      return 'bg-muted text-muted-foreground';
-  }
-}
-
-function getAccountStatusLabel(status: string, text: (en: string, zh: string) => string): string {
-  switch (String(status || '').trim().toLowerCase()) {
-    case 'registering':
-      return text('Registering', '注册中');
-    case 'retrying':
-      return text('Retrying', '重试中');
-    case 'registered':
-      return text('Registered', '已注册');
-    case 'codex_failed':
-      return text('Codex failed', 'Codex 失败');
-    case 'register_failed':
-      return text('Register failed', '注册失败');
-    case 'upload_failed':
-      return text('Upload failed', '上传失败');
-    case 'completed':
-      return text('Completed', '已完成');
-    default:
-      return text('Unknown', '未知');
-  }
-}
-
-function buildSimpleReplenishmentLogLines(
-  status: RuntimeStatusPayload['replenishment'] | null,
-  text: (en: string, zh: string) => string,
-): string[] {
-  if (!status) return [];
-
-  const lines: string[] = [];
-  const pushLine = (value: string) => {
-    const normalized = String(value || '').trim();
-    if (!normalized) return;
-    if (lines[lines.length - 1] === normalized) return;
-    lines.push(normalized);
-  };
-
-  if (status.in_progress) {
-    pushLine(text('Registration running.', '注册运行中。'));
-  }
-
-  if (status.current_batch?.events?.length) {
-    status.current_batch.events.forEach(pushLine);
-  }
-  if (status.recent_events?.length) {
-    status.recent_events.forEach(pushLine);
-  }
-
-  if (!lines.length && status.log_tail?.length) {
-    status.log_tail
-      .filter((line) => {
-        const normalized = String(line || '').trim();
-        return normalized.startsWith('[OK]')
-          || normalized.startsWith('[FAIL')
-          || normalized.includes('Started replenish job')
-          || normalized.includes('Using external proxy pool')
-          || normalized.includes('Uploaded ')
-          || normalized.includes('No token files')
-          || normalized.includes('Batch ')
-          || normalized.includes('[OTP]');
-      })
-      .forEach(pushLine);
-  }
-
-  if (status.last_summary) {
-    pushLine(`${text('Summary', '摘要')}: ${status.last_summary}`);
-  }
-  if (status.last_error) {
-    pushLine(`${text('Error', '错误')}: ${status.last_error}`);
-  }
-
-  return lines.slice(-18);
-}
-
-function SimpleReplenishmentLogCard({
-  lines,
-  text,
-}: {
-  lines: string[];
-  text: (en: string, zh: string) => string;
-}) {
-  return (
-    <div className="rounded-md border border-border/60 bg-card/60 px-3 py-3">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="text-xs font-medium text-muted-foreground">{text('Live Log', '实时日志')}</div>
-        <div className="text-[11px] text-muted-foreground">{text(`${lines.length} lines`, `${lines.length} 行`)}</div>
-      </div>
-      {lines.length === 0 ? (
-        <div className="text-xs text-muted-foreground">{text('No replenishment logs yet.', '暂无补货日志。')}</div>
-      ) : (
-        <div className="max-h-64 space-y-1 overflow-auto rounded-md border border-border/50 bg-background/50 px-3 py-2">
-          {lines.map((line, index) => (
-            <div key={`simple-log-${index}`} className="font-mono text-xs text-muted-foreground">
-              {line}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ReplenishmentAccountsCard({
-  accounts,
-  text,
-}: {
-  accounts: ReplenishmentBatchStatus['accounts'];
-  text: (en: string, zh: string) => string;
-}) {
-  return (
-    <div className="rounded-lg border border-border/70 bg-card/70 p-4">
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <div className="text-sm font-medium">{text('Account Details', '账号明细')}</div>
-        <div className="text-[11px] text-muted-foreground">
-          {text(`${accounts.length} items`, `${accounts.length} 条`)}
-        </div>
-      </div>
-      <div className="space-y-2 rounded-md border border-border/60 bg-background/40 px-3 py-3">
-        {accounts.length === 0 ? (
-          <div className="text-xs text-muted-foreground">{text('No account details yet.', '暂无账号明细。')}</div>
-        ) : (
-          accounts
-            .slice()
-            .map((account, index) => (
-              <div key={`account-${account.updated_at ?? index}-${account.idx ?? index}-${account.email || index}`} className="rounded-md border border-border/60 bg-card/60 px-3 py-2">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="font-mono text-xs">{account.email || text('Pending email', '待生成邮箱')}</div>
-                  <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${getBatchBadgeClass(account.status)}`}>
-                    {getAccountStatusLabel(account.status, text)}
-                  </span>
-                </div>
-                <div className="mt-2 flex flex-wrap gap-3 text-[11px] text-muted-foreground">
-                  <span>#{account.idx ?? '-'}/{account.total ?? '-'}</span>
-                  {account.proxy && <span>Proxy: <code>{account.proxy}</code></span>}
-                  <span>{text('Register', '注册')}: {account.register_ok ? text('OK', '成功') : text('Pending', '未完成')}</span>
-                  <span>Codex: {account.codex_ok ? text('OK', '成功') : text('Pending/Fail', '未完成/失败')}</span>
-                  <span>{text('Upload', '上传')}: {account.upload_ok ? text('OK', '成功') : text('Pending/Fail', '未完成/失败')}</span>
-                </div>
-                {account.error && <div className="mt-2 text-[11px] text-destructive">{account.error}</div>}
-              </div>
-            ))
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ReplenishmentRuntimeCard({
-  replenishmentStatus,
-  replenishmentResultLabel,
-  effectiveTargetCount,
-  effectiveBatchSize,
-  effectiveWorkerCount,
-  runtimeStatusError,
-  startingReplenishment,
-  stoppingReplenishment,
-  runtimeStatusLoading,
-  onStart,
-  onStop,
-  onRefresh,
-  simpleReplenishmentLogs,
-  replenishmentAccounts,
-  text,
-}: {
-  replenishmentStatus: RuntimeStatusPayload['replenishment'] | null;
-  replenishmentResultLabel: string;
-  effectiveTargetCount: number;
-  effectiveBatchSize: number;
-  effectiveWorkerCount: number;
-  runtimeStatusError: string;
-  startingReplenishment: boolean;
-  stoppingReplenishment: boolean;
-  runtimeStatusLoading: boolean;
-  onStart: () => void;
-  onStop: () => void;
-  onRefresh: () => void;
-  simpleReplenishmentLogs: string[];
-  replenishmentAccounts: ReplenishmentBatchStatus['accounts'];
-  text: (en: string, zh: string) => string;
-}) {
-  return (
-    <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4 xl:sticky xl:top-6">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <div className="space-y-1">
-          <h3 className="text-base font-semibold">{text('Runtime Status', '补货状态')}</h3>
-          <p className="text-xs text-muted-foreground">{text('Simple live summary of the backend replenishment worker.', '后端补货 worker 的简化实时摘要。')}</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={onStart} disabled={startingReplenishment || Boolean(replenishmentStatus?.in_progress)} className="inline-flex h-9 items-center justify-center rounded-md border border-primary/30 bg-primary/10 px-3 text-sm font-medium text-primary hover:bg-primary/15 disabled:opacity-50">{startingReplenishment ? text('Starting...', '启动中...') : text('Start Replenishment', '开始补货')}</button>
-          <button type="button" onClick={onStop} disabled={stoppingReplenishment || !replenishmentStatus?.in_progress} className="inline-flex h-9 items-center justify-center rounded-md border border-destructive/40 bg-destructive/5 px-3 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50">{stoppingReplenishment ? text('Stopping...', '停止中...') : text('Stop Replenishment', '停止补货')}</button>
-          <button type="button" onClick={onRefresh} disabled={runtimeStatusLoading} className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted disabled:opacity-50">{runtimeStatusLoading ? text('Refreshing...', '刷新中...') : text('Refresh Status', '刷新状态')}</button>
-        </div>
-      </div>
-
-      {runtimeStatusError && <div className="mb-3 rounded-md border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive">{runtimeStatusError}</div>}
-
-      {!replenishmentStatus ? (
-        <div className="rounded-md border border-dashed border-border/70 bg-muted/20 px-4 py-5 text-sm text-muted-foreground">{text('No runtime status available yet.', '暂无 runtime 状态。')}</div>
-      ) : (
-        <div className="space-y-3 text-sm">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-medium">{text('Status', '状态')}:</span>
-            <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${replenishmentStatus.in_progress ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400' : replenishmentStatus.enabled ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400' : 'bg-muted text-muted-foreground'}`}>
-              {replenishmentStatus.in_progress ? text('Running', '运行中') : replenishmentStatus.enabled ? text('Idle', '空闲') : text('Disabled', '已禁用')}
-            </span>
-            {replenishmentStatus.mode && <span className="text-muted-foreground">{text('Mode', '模式')}: {replenishmentStatus.mode}</span>}
-            {replenishmentStatus.process_pid && <span className="text-muted-foreground">PID: {replenishmentStatus.process_pid}</span>}
-          </div>
-
-          <div className="grid gap-3 md:grid-cols-2">
-            <StatusCard label={text('Last Result', '最近结果')} value={replenishmentResultLabel} />
-            <StatusCard label={text('Healthy', '已有数量')} value={replenishmentStatus.healthy_count ?? 0} />
-            <StatusCard label={text('Target', '目标数量')} value={replenishmentStatus.target_count ?? effectiveTargetCount} />
-            <StatusCard label={text('Missing', '缺失数量')} value={replenishmentStatus.needed ?? 0} />
-            <StatusCard label={text('Batch Size', '批量大小')} value={replenishmentStatus.batch_size ?? effectiveBatchSize} />
-            <StatusCard label={text('Worker Count', '并发数')} value={replenishmentStatus.worker_count ?? effectiveWorkerCount} />
-            <StatusCard label={text('Mail Mode', '邮箱模式')} value={getEmailSelectionModeLabel(replenishmentStatus.email_selection_mode, text)} />
-            <StatusCard label={text('Last Domain', '最近域名')} value={replenishmentStatus.last_selected_domain || text('Unknown', '未知')} />
-            <StatusCard label={text('Last Started', '上次开始')} value={formatBatchTime(replenishmentStatus.last_started_at, text)} />
-            <StatusCard label={text('Last Finished', '上次结束')} value={formatBatchTime(replenishmentStatus.last_finished_at, text)} />
-          </div>
-
-          <SimpleReplenishmentLogCard lines={simpleReplenishmentLogs} text={text} />
-          <ReplenishmentAccountsCard accounts={replenishmentAccounts} text={text} />
-
-          <div className="rounded-md border border-border/60 bg-card/60 px-3 py-2">
-            <div className="text-xs text-muted-foreground">{text('Backend Detail', '后端详情')}</div>
-            <div>{text('The UI now focuses on account-level progress. Full raw logs are still written to the backend log file.', '前端现在聚焦账号级进度，完整原始日志仍写入后端日志文件。')}</div>
-            {replenishmentStatus.log_file && <div className="mt-1 text-xs text-muted-foreground"><code>{replenishmentStatus.log_file}</code></div>}
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function CodexReplenishmentConfigCard({
-  codexReplenishEnabled,
-  setCodexReplenishEnabled,
-  effectiveTargetCount,
-  setCodexReplenishTargetCount,
-  effectiveThreshold,
-  setCodexReplenishThreshold,
-  effectiveBatchSize,
-  setCodexReplenishBatchSize,
-  effectiveWorkerCount,
-  setCodexReplenishWorkerCount,
-  codexReplenishUseProxy,
-  setCodexReplenishUseProxy,
-  text,
-}: {
-  codexReplenishEnabled: boolean;
-  setCodexReplenishEnabled: Dispatch<SetStateAction<boolean>>;
-  effectiveTargetCount: number;
-  setCodexReplenishTargetCount: Dispatch<SetStateAction<number>>;
-  effectiveThreshold: number;
-  setCodexReplenishThreshold: Dispatch<SetStateAction<number>>;
-  effectiveBatchSize: number;
-  setCodexReplenishBatchSize: Dispatch<SetStateAction<number>>;
-  effectiveWorkerCount: number;
-  setCodexReplenishWorkerCount: Dispatch<SetStateAction<number>>;
-  codexReplenishUseProxy: boolean;
-  setCodexReplenishUseProxy: Dispatch<SetStateAction<boolean>>;
-  text: (en: string, zh: string) => string;
-}) {
-  return (
-    <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4">
-      <div className="flex items-center justify-between">
-        <div className="space-y-1">
-          <h3 className="text-base font-semibold">{text('Codex Account Replenishment', 'Codex 自动补货')}</h3>
-          <p className="text-xs text-muted-foreground">{text('These values are saved into config and used by the backend runtime.', '这些值会写入配置文件，并由后端 runtime 使用。')}</p>
-        </div>
-        <label className="flex items-center gap-2 text-sm font-medium">
-          <input type="checkbox" checked={codexReplenishEnabled} onChange={(e) => setCodexReplenishEnabled(e.target.checked)} className="h-4 w-4 rounded border-input bg-background/50 accent-primary" />
-          {text('Enabled', '启用')}
-        </label>
-      </div>
-
-      <div className="grid gap-4 md:grid-cols-2">
-        <div className="grid gap-2">
-          <label className="text-sm font-medium">{text('Target Account Count', '目标账号总数')}</label>
-          <input type="number" min="0" step="1" value={effectiveTargetCount} onChange={(e) => { const nextTarget = normalizeNonNegativeInteger(e.target.value, 0); setCodexReplenishTargetCount(nextTarget); setCodexReplenishThreshold((prev) => normalizeReplenishThreshold(prev, nextTarget, 0)); }} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
-          <p className="text-xs text-muted-foreground"><code>codex_replenish_target_count</code></p>
-        </div>
-        <div className="grid gap-2">
-          <label className="text-sm font-medium">{text('Replenish Threshold', '补货触发阈值')}</label>
-          <input type="number" min="0" max={String(effectiveTargetCount)} step="1" value={effectiveThreshold} onChange={(e) => setCodexReplenishThreshold(normalizeReplenishThreshold(e.target.value, effectiveTargetCount, 0))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
-          <p className="text-xs text-muted-foreground"><code>codex_replenish_threshold</code></p>
-        </div>
-        <div className="grid gap-2">
-          <label className="text-sm font-medium">{text('Batch Size', '批量大小')}</label>
-          <input type="number" min="1" max="200" step="1" value={effectiveBatchSize} onChange={(e) => setCodexReplenishBatchSize(normalizeReplenishBatchSize(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
-          <p className="text-xs text-muted-foreground"><code>codex_replenish_batch_size</code></p>
-        </div>
-        <div className="grid gap-2">
-          <label className="text-sm font-medium">{text('Worker Count', '并发 Worker 数')}</label>
-          <input type="number" min="1" max="200" step="1" value={effectiveWorkerCount} onChange={(e) => setCodexReplenishWorkerCount(normalizeReplenishWorkerCount(e.target.value, 1))} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" />
-          <p className="text-xs text-muted-foreground"><code>codex_replenish_worker_count</code></p>
-        </div>
-      </div>
-
-      <div className="rounded-lg border border-border/60 bg-background/40 p-4 text-sm text-muted-foreground">
-        {effectiveTargetCount > 0 ? text(`Trigger replenishment when healthy Codex accounts < ${effectiveThreshold}, then refill back to ${effectiveTargetCount}. Each batch creates up to ${effectiveBatchSize} accounts with up to ${effectiveWorkerCount} concurrent workers.`, `当健康 Codex 账号数低于 ${effectiveThreshold} 时触发补货，并补回到 ${effectiveTargetCount} 个。每批最多注册 ${effectiveBatchSize} 个账号，并发 worker 最多 ${effectiveWorkerCount} 个。`) : text('Target count is 0, so replenishment will not create new accounts until you increase the target.', '当前目标数量为 0，在你把目标调高之前，自动补货不会新增账号。')}
-      </div>
-
-      <label className="flex items-center gap-2 text-sm font-medium">
-        <input type="checkbox" checked={codexReplenishUseProxy} onChange={(e) => setCodexReplenishUseProxy(e.target.checked)} className="h-4 w-4 rounded border-input bg-background/50 accent-primary" />
-        {text('Use Proxy for Registration', '注册时使用代理')}
-      </label>
-
-      <p className="text-xs text-muted-foreground">{text('External proxy pool remains in config. The settings page only shows the proxy switch now.', '外部代理池仍保留在配置文件中，设置界面现在只显示代理开关。')}</p>
-    </section>
-  );
-}
-
-export default function SettingsPanelV3(props: SettingsPanelProps) {
-  const {
-    cpaUrl,
-    setCpaUrl,
-    newPassword,
-    setNewPassword,
-    mailApiBase,
-    setMailApiBase,
-    mailUsername,
-    setMailUsername,
-    mailPassword,
-    setMailPassword,
-    mailEmailProvider,
-    setMailEmailProvider,
-    inbucketApiBase,
-    mailEmailDomain,
-    setMailEmailDomain,
-    mailEmailDomains,
-    setMailEmailDomains,
-    inbucketDomains,
-    inbucketIceDomains,
-    setInbucketDomains,
-    inbucketDisabledDomains,
-    setInbucketDisabledDomains,
-    duckmailApiBase,
-    duckmailApiKey,
-    setDuckmailApiKey,
-    duckmailDomains,
-    mailRandomizeFromList,
-    setMailRandomizeFromList,
-    codexReplenishEnabled,
-    setCodexReplenishEnabled,
-    codexReplenishTargetCount,
-    setCodexReplenishTargetCount,
-    codexReplenishThreshold,
-    setCodexReplenishThreshold,
-    codexReplenishBatchSize,
-    setCodexReplenishBatchSize,
-    codexReplenishWorkerCount,
-    setCodexReplenishWorkerCount,
-    codexReplenishUseProxy,
-    setCodexReplenishUseProxy,
-    codexReplenishProxyPool,
-    savingSettings,
-    setSavingSettings,
-    message,
-    setMessage,
-  } = props;
-
+export default function SettingsPanelV3({
+  cpaUrl,
+  setCpaUrl,
+  newPassword,
+  setNewPassword,
+  savingSettings,
+  setSavingSettings,
+  message,
+  setMessage,
+}: SettingsPanelProps) {
   const { i18n } = useTranslation();
   const isZh = i18n.language.startsWith('zh');
-  const text = (en: string, zh: string) => (isZh ? zh : en);
-
+  const text = useCallback((en: string, zh: string) => (isZh ? zh : en), [isZh]);
+  const [cpaUrlDraft, setCpaUrlDraft] = useState(cpaUrl);
   const [testingRemote, setTestingRemote] = useState(false);
   const [remoteTestResult, setRemoteTestResult] = useState<RemotePushTestPayload | null>(null);
   const [remoteTestError, setRemoteTestError] = useState('');
-  const [domainDraft, setDomainDraft] = useState('');
-  const [domainEditorError, setDomainEditorError] = useState('');
-  const [domainTestStates, setDomainTestStates] = useState<Record<string, DomainTestState>>({});
-  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatusPayload | null>(null);
-  const [runtimeStatusLoading, setRuntimeStatusLoading] = useState(false);
-  const [runtimeStatusError, setRuntimeStatusError] = useState('');
-  const [startingReplenishment, setStartingReplenishment] = useState(false);
-  const [stoppingReplenishment, setStoppingReplenishment] = useState(false);
-
-  const inbucketDomainOptions = useMemo(() => {
-    const sourceDomains = mailEmailProvider === 'inbucket'
-      ? parseDomainList(mailEmailDomains)
-      : mailEmailProvider === 'inbucket_ice'
-        ? inbucketIceDomains
-        : inbucketDomains;
-    const parsed = Array.from(new Set((sourceDomains || []).map((item) => normalizeDomain(String(item || ''))).filter(Boolean)));
-    const current = normalizeDomain(mailEmailDomain);
-    if ((mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice') && current && !parsed.includes(current)) parsed.unshift(current);
-    return parsed;
-  }, [inbucketDomains, inbucketIceDomains, mailEmailDomain, mailEmailDomains, mailEmailProvider]);
-
-  const inbucketDisabledSet = useMemo(
-    () => new Set((inbucketDisabledDomains || []).map((item) => normalizeDomain(String(item || ''))).filter(Boolean)),
-    [inbucketDisabledDomains],
-  );
-
-  const duckmailDomainOptions = useMemo(() => {
-    const parsed = Array.from(new Set((duckmailDomains || []).map((item) => normalizeDomain(String(item || ''))).filter(Boolean)));
-    const current = normalizeDomain(mailEmailDomain);
-    if (mailEmailProvider === 'duckmail' && current && !parsed.includes(current)) parsed.unshift(current);
-    return parsed;
-  }, [duckmailDomains, mailEmailDomain, mailEmailProvider]);
-
-  const mailfreeDomainOptions = useMemo(() => {
-    const parsed = parseDomainList(mailEmailDomains);
-    const current = normalizeDomain(mailEmailDomain);
-    if (mailEmailProvider === 'mailfree' && current && !parsed.includes(current)) parsed.unshift(current);
-    return parsed;
-  }, [mailEmailDomain, mailEmailDomains, mailEmailProvider]);
-
-  const emailDomainOptions = (mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice')
-    ? inbucketDomainOptions
-    : mailEmailProvider === 'duckmail'
-      ? duckmailDomainOptions
-      : mailfreeDomainOptions;
-
-  const selectableDomainOptions = useMemo(
-    () => (mailEmailProvider === 'inbucket' ? emailDomainOptions.filter((domain) => !inbucketDisabledSet.has(domain)) : emailDomainOptions),
-    [emailDomainOptions, inbucketDisabledSet, mailEmailProvider],
-  );
-
-  const effectiveTargetCount = normalizeNonNegativeInteger(codexReplenishTargetCount, 0);
-  const effectiveThreshold = normalizeReplenishThreshold(codexReplenishThreshold, effectiveTargetCount, 0);
-  const effectiveBatchSize = normalizeReplenishBatchSize(codexReplenishBatchSize, 1);
-  const effectiveWorkerCount = normalizeReplenishWorkerCount(codexReplenishWorkerCount, 1);
-  const replenishmentStatus = runtimeStatus?.replenishment ?? null;
-  const replenishmentResultLabel = getReplenishmentResultLabel(replenishmentStatus, text);
-  const simpleReplenishmentLogs = useMemo(
-    () => buildSimpleReplenishmentLogLines(replenishmentStatus, text),
-    [replenishmentStatus, text],
-  );
-  const replenishmentAccounts = useMemo(() => {
-    const batches = [
-      replenishmentStatus?.current_batch ?? null,
-      ...(replenishmentStatus?.batch_history ?? []).slice().reverse(),
-    ].filter(Boolean) as ReplenishmentBatchStatus[];
-
-    return batches
-      .flatMap((batch) => batch.accounts || [])
-      .slice()
-      .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0))
-      .slice(0, 20);
-  }, [replenishmentStatus]);
-
-  const emailDomainStats = useMemo(() => {
-    const persistedStats = replenishmentStatus?.domain_stats;
-    if (persistedStats && typeof persistedStats === 'object') {
-      return new Map(Object.entries(persistedStats));
-    }
-
-    const batches = [
-      replenishmentStatus?.current_batch ?? null,
-      ...(replenishmentStatus?.batch_history ?? []),
-    ].filter(Boolean) as ReplenishmentBatchStatus[];
-
-    return new Map(Object.entries(buildEmailDomainStats(batches, emailDomainOptions)));
-  }, [emailDomainOptions, replenishmentStatus]);
 
   useEffect(() => {
-    const normalized = normalizeDomain(mailEmailDomain);
-    if (selectableDomainOptions.length === 0) return;
-    if (!normalized || !selectableDomainOptions.includes(normalized)) {
-      setMailEmailDomain(selectableDomainOptions[0] || '');
-    }
-  }, [mailEmailDomain, selectableDomainOptions, setMailEmailDomain]);
-
-  const loadRuntimeStatus = async (silent = false) => {
-    if (!silent) setRuntimeStatusLoading(true);
-    try {
-      const data = await fetchRuntimeStatus();
-      if (data.ok && data.payload) {
-        setRuntimeStatus(data.payload);
-        setRuntimeStatusError('');
-      } else {
-        setRuntimeStatusError(data.error || text('Failed to load runtime status.', '加载 runtime 状态失败。'));
-      }
-    } catch (error: unknown) {
-      const messageText = typeof error === 'object' && error !== null && 'response' in error
-        ? String(((error as { response?: { data?: { error?: string } } }).response?.data?.error) || text('Failed to load runtime status.', '加载 runtime 状态失败。'))
-        : text('Failed to load runtime status.', '加载 runtime 状态失败。');
-      setRuntimeStatusError(messageText);
-    } finally {
-      if (!silent) setRuntimeStatusLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void loadRuntimeStatus(false);
-    const timer = window.setInterval(() => { void loadRuntimeStatus(true); }, replenishmentStatus?.in_progress ? 2500 : 15000);
-    return () => window.clearInterval(timer);
-  }, [replenishmentStatus?.in_progress]);
-  const commitDomains = (domains: string[]) => {
-    const nextDomains = parseDomainList(stringifyDomainList(domains));
-    setMailEmailDomains(stringifyDomainList(nextDomains));
-    if (mailEmailProvider === 'inbucket') {
-      setInbucketDomains(nextDomains);
-      setInbucketDisabledDomains((prev) => prev.filter((domain) => nextDomains.includes(normalizeDomain(domain))));
-    }
-    if (mailEmailDomain && !nextDomains.includes(normalizeDomain(mailEmailDomain))) {
-      setMailEmailDomain(nextDomains[0] || '');
-    }
-    setDomainTestStates((prev) => {
-      const next: Record<string, DomainTestState> = {};
-      nextDomains.forEach((domain) => {
-        if (prev[domain]) next[domain] = prev[domain];
-      });
-      return next;
-    });
-  };
-
-  const handleAddDomain = () => {
-    const normalized = normalizeDomain(domainDraft);
-    if (!normalized) {
-      setDomainEditorError(text('Please enter a domain first.', '请先输入域名。'));
-      return;
-    }
-    if (!isValidDomainInput(normalized)) {
-      setDomainEditorError(text(`Invalid domain: ${normalized}`, `域名格式无效: ${normalized}`));
-      return;
-    }
-    if (emailDomainOptions.includes(normalized)) {
-      setDomainEditorError(text(`Domain already exists: ${normalized}`, `域名已存在: ${normalized}`));
-      return;
-    }
-    commitDomains([...emailDomainOptions, normalized]);
-    if (!mailEmailDomain.trim()) setMailEmailDomain(normalized);
-    setDomainDraft('');
-    setDomainEditorError('');
-  };
-
-  const handleRemoveDomain = (domain: string) => {
-    commitDomains(emailDomainOptions.filter((item) => item !== domain));
-    setDomainEditorError('');
-  };
-
-  const handleToggleDomainDisabled = (domain: string) => {
-    if (mailEmailProvider !== 'inbucket') return;
-    const normalized = normalizeDomain(domain);
-    const nextDisabled = inbucketDisabledSet.has(normalized)
-      ? inbucketDisabledDomains.filter((item) => normalizeDomain(item) !== normalized)
-      : [...inbucketDisabledDomains, normalized];
-    const deduped = Array.from(new Set(nextDisabled.map((item) => normalizeDomain(item)).filter(Boolean)));
-    setInbucketDisabledDomains(deduped);
-    if (normalizeDomain(mailEmailDomain) === normalized) {
-      const fallback = emailDomainOptions.find((item) => normalizeDomain(item) !== normalized && !deduped.includes(normalizeDomain(item))) || '';
-      setMailEmailDomain(fallback);
-    }
-  };
-
-  const handleMailDomainTest = async (domain: string) => {
-    const normalized = normalizeDomain(domain);
-    if (!normalized) return;
-    setDomainTestStates((prev) => ({ ...prev, [normalized]: { status: 'testing', message: text('Testing domain...', '正在测试域名...'), payload: null } }));
-    try {
-      const data = await runMailDomainTest({
-        mail_email_provider: mailEmailProvider,
-        domain: normalized,
-        mail_api_base: mailApiBase.trim() || undefined,
-        mail_username: mailUsername.trim() || undefined,
-        mail_password: mailPassword || undefined,
-        duckmail_api_key: duckmailApiKey || undefined,
-      });
-      const payload = data.payload ?? null;
-      if (data.ok && payload) {
-        setDomainTestStates((prev) => ({ ...prev, [normalized]: { status: 'success', message: payload.message || text('Domain test passed.', '域名测试通过。'), payload } }));
-        return;
-      }
-      setDomainTestStates((prev) => ({ ...prev, [normalized]: { status: 'error', message: data.error || payload?.error || text('Domain test failed.', '域名测试失败。'), payload } }));
-    } catch (error: unknown) {
-      const messageText = typeof error === 'object' && error !== null && 'response' in error
-        ? String(((error as { response?: { data?: { error?: string } } }).response?.data?.error) || text('Domain test failed.', '域名测试失败。'))
-        : text('Domain test failed.', '域名测试失败。');
-      setDomainTestStates((prev) => ({ ...prev, [normalized]: { status: 'error', message: messageText, payload: null } }));
-    }
-  };
+    setCpaUrlDraft(cpaUrl);
+  }, [cpaUrl]);
 
   const handleRemotePushTest = async () => {
     setTestingRemote(true);
@@ -794,7 +54,7 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
     setRemoteTestResult(null);
     try {
       const data = await runRemotePushTest({
-        target_cpa_url: cpaUrl.trim() || undefined,
+        target_cpa_url: cpaUrlDraft.trim() || undefined,
         target_management_key: newPassword.trim() || undefined,
       });
       if (data.ok && data.payload) {
@@ -812,313 +72,121 @@ export default function SettingsPanelV3(props: SettingsPanelProps) {
     }
   };
 
-  const handleStopReplenishment = async () => {
-    setStoppingReplenishment(true);
-    setMessage({ type: '', text: '' });
-    try {
-      const data = await stopReplenishment();
-      if (data.ok && data.payload) {
-        setMessage({ type: data.payload.stopped ? 'success' : 'error', text: data.payload.message || text('Replenishment stop request completed.', '停止补货请求已完成。') });
-      } else {
-        setMessage({ type: 'error', text: data.error || text('Failed to stop replenishment.', '停止补货失败。') });
-      }
-    } catch (error: unknown) {
-      const messageText = typeof error === 'object' && error !== null && 'response' in error
-        ? String(((error as { response?: { data?: { error?: string } } }).response?.data?.error) || text('Failed to stop replenishment.', '停止补货失败。'))
-        : text('Failed to stop replenishment.', '停止补货失败。');
-      setMessage({ type: 'error', text: messageText });
-    } finally {
-      setStoppingReplenishment(false);
-      void loadRuntimeStatus(false);
-    }
-  };
-
-  const handleStartReplenishment = async () => {
-    setStartingReplenishment(true);
-    setMessage({ type: '', text: '' });
-    try {
-      const data = await startReplenishment();
-      if (data.ok && data.payload) {
-        setMessage({ type: 'success', text: data.payload.message || text('Manual replenishment request completed.', '手动补货请求已完成。') });
-      } else {
-        setMessage({ type: 'error', text: data.error || text('Failed to start replenishment.', '启动补货失败。') });
-      }
-    } catch (error: unknown) {
-      const messageText = typeof error === 'object' && error !== null && 'response' in error
-        ? String(((error as { response?: { data?: { error?: string } } }).response?.data?.error) || text('Failed to start replenishment.', '启动补货失败。'))
-        : text('Failed to start replenishment.', '启动补货失败。');
-      setMessage({ type: 'error', text: messageText });
-    } finally {
-      setStartingReplenishment(false);
-      void loadRuntimeStatus(false);
-    }
-  };
-
   const handleSave = async () => {
     setSavingSettings(true);
     setMessage({ type: '', text: '' });
     try {
-      const oldPass = localStorage.getItem('management_key');
-      const payload = {
-        old_password: oldPass,
+      const currentKey = String(localStorage.getItem('management_key') || '').trim();
+      const nextKey = newPassword.trim();
+      const { data } = await configApi.post('/config/update', {
+        old_password: currentKey,
         new_config: {
-          cpa_url: cpaUrl || undefined,
-          management_key: newPassword || undefined,
-          mail_email_provider: mailEmailProvider,
-          mail_api_base: mailApiBase,
-          mail_username: mailUsername,
-          mail_password: mailPassword,
-          duckmail_api_base: duckmailApiBase,
-          duckmail_api_key: duckmailApiKey,
-          duckmail_mail_domains: duckmailDomains.join(', '),
-          mail_email_domain: mailEmailDomain,
-          mail_email_domains: mailEmailDomains,
-          inbucket_mail_disabled_domains: inbucketDisabledDomains.join(', '),
-          mail_randomize_from_list: mailRandomizeFromList,
-          codex_replenish_enabled: codexReplenishEnabled,
-          codex_replenish_target_count: effectiveTargetCount,
-          codex_replenish_threshold: effectiveThreshold,
-          codex_replenish_batch_size: effectiveBatchSize,
-          codex_replenish_worker_count: effectiveWorkerCount,
-          codex_replenish_use_proxy: codexReplenishUseProxy,
-          codex_replenish_proxy_pool: codexReplenishProxyPool,
+          cpa_url: cpaUrlDraft.trim(),
+          ...(nextKey ? { management_key: nextKey } : {}),
         },
-      };
-      const { data } = await configApi.post('/config/update', payload);
+      });
       if (!data.ok) {
         setMessage({ type: 'error', text: text('Failed to update settings.', '设置更新失败。') });
         return;
       }
-      setMessage({ type: 'success', text: text('Settings updated successfully.', '设置已更新。') });
-      const resolvedUrl = cpaUrl.trim();
-      if (resolvedUrl) {
-        cpaApi.defaults.baseURL = resolvedUrl;
-        setCpaUrl(resolvedUrl);
-      }
-      if (newPassword) {
-        localStorage.setItem('management_key', newPassword);
+
+      const resolvedUrl = cpaUrlDraft.trim();
+      cpaApi.defaults.baseURL = '/api/cpa';
+      clearAuthFilesCache();
+      setCpaUrl(resolvedUrl);
+      if (nextKey) {
+        localStorage.setItem('management_key', nextKey);
         setNewPassword('');
       }
+      setMessage({ type: 'success', text: text('Settings updated successfully.', '设置已更新。') });
     } catch (error: unknown) {
-      const messageText = typeof error === 'object' && error !== null && 'message' in error
-        ? String((error as { message?: string }).message || text('Update failed.', '更新失败。'))
+      const messageText = typeof error === 'object' && error !== null && 'response' in error
+        ? String(((error as { response?: { data?: { error?: string } } }).response?.data?.error) || text('Update failed.', '更新失败。'))
         : text('Update failed.', '更新失败。');
       setMessage({ type: 'error', text: messageText });
     } finally {
       setSavingSettings(false);
     }
   };
+
   return (
-    <div className="w-full max-w-[1800px] rounded-2xl border border-border bg-card/95 p-6 shadow-sm">
+    <div className="w-full max-w-5xl rounded-2xl border border-border bg-card/95 p-6 shadow-sm">
       <h2 className="mb-6 flex items-center gap-2 text-xl font-semibold">
         <Settings className="h-5 w-5" />
-        {text('Service Configuration', '服务配置')}
+        {text('Remote CPA Configuration', '远程 CPA 配置')}
       </h2>
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_720px]">
-        <div className="space-y-6">
-        <div className="grid gap-6 md:grid-cols-2">
-          <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4">
-            <div className="space-y-1">
-              <h3 className="text-base font-semibold">{text('CPA Console', 'CPA 控制台')}</h3>
-              <p className="text-xs text-muted-foreground">{text('Local console authentication and remote CPA target.', '本地控制台认证和远程 CPA 目标配置。')}</p>
-            </div>
-            <div className="grid gap-2">
-              <label className="text-sm font-medium">{text('CPA API URL', 'CPA API 地址')}</label>
-              <input type="url" value={cpaUrl} onChange={(e) => setCpaUrl(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" placeholder="http://127.0.0.1:8080" />
-            </div>
-            <div className="grid gap-2">
-              <label className="text-sm font-medium">{text('New Management Key', '新的管理密钥')}</label>
-              <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" placeholder={text('Leave blank to keep current', '留空则保持当前')} />
-            </div>
-          </section>
-
-          <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4">
-            <div className="space-y-1">
-              <h3 className="text-base font-semibold">{text('Mail Service', '邮箱服务')}</h3>
-              <p className="text-xs text-muted-foreground">{text('Mailbox backend used during registration.', '注册流程使用的邮箱后端配置。')}</p>
-            </div>
-            <div className="grid gap-2">
-              <label className="text-sm font-medium">{text('Mail Provider', '邮箱提供方')}</label>
-              <select
-                value={mailEmailProvider}
-                onChange={(e) => {
-                  const value = String(e.target.value || '').trim().toLowerCase();
-                  setMailEmailProvider(value === 'inbucket' || value === 'inbucket_ice' || value === 'duckmail' ? value : 'mailfree');
-                }}
-                className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm"
-              >
-                <option value="mailfree">mailfree</option>
-                <option value="inbucket">inbucket</option>
-                <option value="inbucket_ice">inbucket_ice</option>
-                <option value="duckmail">duckmail</option>
-              </select>
-              <p className="text-xs text-muted-foreground">
-                {mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice'
-                  ? mailEmailProvider === 'inbucket_ice'
-                    ? text('Using fixed inbucket_ice API/credentials (locked), only domain list is editable.', '当前使用固定的 inbucket_ice 接口与凭据（已锁定），仅域名列表可编辑。')
-                    : text('Using editable Inbucket API/credentials with configured domain list.', '当前使用可编辑的 Inbucket API/账号密码和域名列表。')
-                  : mailEmailProvider === 'duckmail'
-                    ? text('Using DuckMail API key based mailbox service.', '当前使用 DuckMail API Key 邮箱服务。')
-                  : text('Using the editable mailfree configuration below.', '当前使用可编辑的 mailfree 配置。')}
-              </p>
-            </div>
-            <div className="grid gap-2">
-              <label className="text-sm font-medium">{text('Mail API Base', '邮件 API 地址')}</label>
-              <input type="url" value={mailApiBase} onChange={(e) => setMailApiBase(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="https://mail-api.example.com" disabled={mailEmailProvider === 'duckmail' || mailEmailProvider === 'inbucket_ice'} />
-              {(mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice') && inbucketApiBase && <p className="text-xs text-muted-foreground">{text('Current Inbucket default', '当前 Inbucket 默认值')}: <code>{inbucketApiBase}</code></p>}
-              {mailEmailProvider === 'inbucket_ice' && <p className="text-xs text-muted-foreground">{text('inbucket_ice API endpoint is fixed and cannot be changed in UI.', 'inbucket_ice 接口地址为固定值，不能在界面中修改。')}</p>}
-              {mailEmailProvider === 'duckmail' && duckmailApiBase && <p className="text-xs text-muted-foreground">{text('Loaded from DuckMail config', '读取自 DuckMail 配置')}: <code>{duckmailApiBase}</code></p>}
-            </div>
-            <div className="grid gap-2">
-              <label className="text-sm font-medium">{text('Mail Username', '邮箱用户名')}</label>
-              <input type="text" value={mailUsername} onChange={(e) => setMailUsername(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder="admin" disabled={mailEmailProvider === 'duckmail' || mailEmailProvider === 'inbucket_ice'} />
-            </div>
-            <div className="grid gap-2">
-              <label className="text-sm font-medium">{text('Mail Password', '邮箱密码')}</label>
-              <input type="password" value={mailPassword} onChange={(e) => setMailPassword(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm disabled:opacity-60" placeholder={text('Mail service password', '邮箱服务密码')} disabled={mailEmailProvider === 'duckmail' || mailEmailProvider === 'inbucket_ice'} />
-            </div>
-            {mailEmailProvider === 'duckmail' && (
-              <div className="grid gap-2">
-                <label className="text-sm font-medium">DuckMail API Key</label>
-                <input type="password" value={duckmailApiKey} onChange={(e) => setDuckmailApiKey(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" placeholder="dk_xxx" />
-              </div>
-            )}
-          </section>
-        </div>
-
+      <div className="grid gap-6 lg:grid-cols-2">
         <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4">
           <div className="space-y-1">
-            <h3 className="text-base font-semibold">{text('Mail Domains', '邮箱域名')}</h3>
-            <p className="text-xs text-muted-foreground">
-                {(mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice')
-                  ? mailEmailProvider === 'inbucket'
-                    ? text('Manage inbucket domains: add, remove, and disable domains.', '可管理 inbucket 域名：支持新增、移除和禁用。')
-                    : text('Read-only domains loaded from the configured Inbucket source.', '只读展示当前 Inbucket 配置源里的域名列表。')
-                : mailEmailProvider === 'duckmail'
-                  ? text('Read-only domains loaded from the configured DuckMail source.', '只读展示当前 DuckMail 配置源里的域名列表。')
-                : text('Maintain the allowed email domain list for registration.', '维护注册时可用的邮箱域名列表。')}
-            </p>
-          </div>
-          {(mailEmailProvider === 'mailfree' || mailEmailProvider === 'inbucket') && (
-            <div className="flex flex-col gap-3 md:flex-row">
-              <input type="text" value={domainDraft} onChange={(e) => setDomainDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleAddDomain(); } }} className="flex h-10 flex-1 rounded-md border border-input bg-background/50 px-3 py-2 text-sm" placeholder="example.com" />
-              <button type="button" onClick={handleAddDomain} className="inline-flex h-10 items-center justify-center rounded-md border border-border bg-background px-4 py-2 text-sm font-medium hover:bg-muted">{text('Add Domain', '添加域名')}</button>
-            </div>
-          )}
-          {domainEditorError && <div className="rounded-md border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive">{domainEditorError}</div>}
-          <div className="grid gap-3">
-            {emailDomainOptions.length === 0 ? (
-              <div className="rounded-lg border border-dashed border-border/70 bg-muted/20 px-4 py-5 text-sm text-muted-foreground">{text('No configured domains yet.', '暂无已配置域名。')}</div>
-            ) : emailDomainOptions.map((domain) => {
-              const testState = domainTestStates[domain];
-              const isTesting = testState?.status === 'testing';
-              const stat = emailDomainStats.get(domain);
-              const successRateValue = stat && stat.total > 0 ? Math.round((stat.success / stat.total) * 100) : null;
-              const successRate = successRateValue === null ? '--' : `${successRateValue}%`;
-              return (
-                <div key={domain} className="rounded-lg border border-border/70 bg-card/60 px-4 py-3">
-                  <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                    <div className="space-y-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium">{domain}</span>
-                        {domain === normalizeDomain(mailEmailDomain) && <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">{text('Default', '默认')}</span>}
-                        {mailEmailProvider === 'inbucket' && inbucketDisabledSet.has(domain) && <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-700 dark:text-amber-300">{text('Disabled', '已禁用')}</span>}
-                        <span className="rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-[11px] text-sky-700 dark:text-sky-300">
-                          {text('Total', '总次数')}: {stat?.total ?? 0}
-                        </span>
-                        <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-700 dark:text-emerald-300">
-                          {text('Success', '成功次数')}: {stat?.success ?? 0}
-                        </span>
-                        <span className="rounded-full border border-destructive/20 bg-destructive/10 px-2 py-0.5 text-[11px] text-destructive">
-                          {text('Fail', '失败次数')}: {stat?.fail ?? 0}
-                        </span>
-                        <span className={`rounded-full border px-2 py-0.5 text-[11px] ${getSuccessRateBadgeClass(successRateValue)}`}>
-                          {text('Success Rate', '成功率')}: {successRate}
-                        </span>
-                      </div>
-                      {testState?.message && <p className={`text-xs ${testState.status === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}>{testState.message}</p>}
-                      {(mailEmailProvider === 'inbucket' || mailEmailProvider === 'inbucket_ice' || mailEmailProvider === 'duckmail') && <p className="text-xs text-muted-foreground">{text('Example mailbox', '示例邮箱')}: <code>{toSampleMailbox(domain)}</code></p>}
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <button type="button" onClick={() => setMailEmailDomain(domain)} disabled={mailEmailProvider === 'inbucket' && inbucketDisabledSet.has(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted disabled:opacity-50">{text('Use as Default', '设为默认')}</button>
-                      <button type="button" onClick={() => { void handleMailDomainTest(domain); }} disabled={isTesting} className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted disabled:opacity-50">{isTesting ? text('Testing...', '测试中...') : text('Test Domain', '测试域名')}</button>
-                      {mailEmailProvider === 'inbucket' && <button type="button" onClick={() => handleToggleDomainDisabled(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-amber-500/40 bg-amber-500/5 px-3 text-sm font-medium text-amber-700 hover:bg-amber-500/10 dark:text-amber-300">{inbucketDisabledSet.has(domain) ? text('Enable', '启用') : text('Disable', '禁用')}</button>}
-                      {(mailEmailProvider === 'mailfree' || mailEmailProvider === 'inbucket') && <button type="button" onClick={() => handleRemoveDomain(domain)} className="inline-flex h-9 items-center justify-center rounded-md border border-destructive/40 bg-destructive/5 px-3 text-sm font-medium text-destructive hover:bg-destructive/10">{text('Remove', '移除')}</button>}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
+            <h3 className="text-base font-semibold">{text('CPA Console', 'CPA 控制台')}</h3>
+            <p className="text-xs text-muted-foreground">{text('Configure the remote CPA endpoint and optionally rotate the management key.', '配置远程 CPA 地址，并可按需更新管理密钥。')}</p>
           </div>
           <div className="grid gap-2">
-            <label className="text-sm font-medium">{text('Default Mail Domain', '默认邮箱域名')}</label>
-            <select value={mailEmailDomain} onChange={(e) => setMailEmailDomain(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm" disabled={selectableDomainOptions.length === 0}>
-              <option value="">{text('Select configured domain', '选择已配置域名')}</option>
-              {selectableDomainOptions.map((domain) => <option key={domain} value={domain}>{domain}</option>)}
-            </select>
+            <label className="text-sm font-medium">{text('CPA API URL', 'CPA API 地址')}</label>
+            <input
+              type="url"
+              value={cpaUrlDraft}
+              onChange={(event) => setCpaUrlDraft(event.target.value)}
+              className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm"
+              placeholder="http://host.docker.internal:8317"
+            />
           </div>
-          <label className="flex items-center gap-2 text-sm font-medium">
-            <input type="checkbox" checked={mailRandomizeFromList} onChange={(e) => setMailRandomizeFromList(e.target.checked)} className="h-4 w-4 rounded border-input bg-background/50 accent-primary" />
-            {text('Randomly pick from the domain list for replenishment', '补货时从域名列表随机选择')}
-          </label>
-          <p className="text-xs text-muted-foreground">
-            {mailRandomizeFromList
-              ? text('When enabled, each replenishment batch randomly selects one configured domain.', '启用后，每个补货批次会从已配置域名中随机选择一个。')
-              : text('When disabled, replenishment uses the default mail domain above.', '关闭后，补货固定使用上面的默认邮箱域名。')}
-          </p>
+          <div className="grid gap-2">
+            <label className="text-sm font-medium">{text('New Management Key', '新的管理密钥')}</label>
+            <input
+              type="password"
+              value={newPassword}
+              onChange={(event) => setNewPassword(event.target.value)}
+              className="flex h-10 w-full rounded-md border border-input bg-background/50 px-3 py-2 text-sm"
+              placeholder={text('Leave blank to keep current', '留空则保持当前')}
+            />
+          </div>
         </section>
 
         <section className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-4">
           <div className="space-y-1">
             <h3 className="text-base font-semibold">{text('Remote Push Test', '远程推送测试')}</h3>
-            <p className="text-xs text-muted-foreground">{text('Smoke test the current remote CPA target by reading, uploading, and deleting a temporary auth file.', '通过读取、上传、删除临时 auth file 的方式，对当前远程 CPA 目标执行 smoke test。')}</p>
+            <p className="text-xs text-muted-foreground">{text('Test remote auth-file read, temporary upload, and cleanup delete.', '测试远程 auth file 读取、临时上传和清理删除。')}</p>
           </div>
-          <button onClick={() => { void handleRemotePushTest(); }} disabled={testingRemote || !cpaUrl.trim()} className="inline-flex h-10 items-center justify-center rounded-md border border-border bg-background px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50">{testingRemote ? text('Testing Remote Push...', '正在测试远程推送...') : text('Test Remote Read + Push', '测试远程读取与推送')}</button>
-          {remoteTestError && <div className="rounded-md border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive">{remoteTestError}</div>}
-          {remoteTestResult && <div className="space-y-2 rounded-md border border-border bg-background/70 px-4 py-3 text-sm"><p><span className="font-medium">{text('Remote target', '远程目标')}:</span> {remoteTestResult.target_cpa_url}</p><p><span className="font-medium">{text('Read auth-files', '读取 auth-files')}:</span> {remoteTestResult.read_ok ? text('OK', '成功') : text('Failed', '失败')}</p><p><span className="font-medium">{text('Upload', '上传')}:</span> {remoteTestResult.push_test.upload_ok ? `${text('OK via', '成功，方式')} ${remoteTestResult.push_test.upload_mode}` : text('Failed', '失败')}</p><p><span className="font-medium">{text('Cleanup delete', '清理删除')}:</span> {remoteTestResult.push_test.cleanup_ok ? text('OK', '成功') : text('Not completed', '未完成')}</p></div>}
+          <button
+            type="button"
+            onClick={() => { void handleRemotePushTest(); }}
+            disabled={testingRemote || !cpaUrlDraft.trim()}
+            className="inline-flex h-10 items-center justify-center rounded-md border border-border bg-background px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+          >
+            {testingRemote ? text('Testing Remote Push...', '正在测试远程推送...') : text('Test Remote Read + Push', '测试远程读取与推送')}
+          </button>
+          {remoteTestError && (
+            <div className="rounded-md border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive">{remoteTestError}</div>
+          )}
+          {remoteTestResult && (
+            <div className="space-y-2 rounded-md border border-border bg-background/70 px-4 py-3 text-sm">
+              <p><span className="font-medium">{text('Remote target', '远程目标')}:</span> {remoteTestResult.target_cpa_url}</p>
+              <p><span className="font-medium">{text('Auth files', 'Auth files')}:</span> {remoteTestResult.auth_files_total}</p>
+              <p><span className="font-medium">{text('Read', '读取')}:</span> {remoteTestResult.read_ok ? text('OK', '成功') : text('Failed', '失败')}</p>
+              <p><span className="font-medium">{text('Upload', '上传')}:</span> {remoteTestResult.push_test.upload_ok ? `${text('OK via', '成功，方式')} ${remoteTestResult.push_test.upload_mode}` : text('Failed', '失败')}</p>
+              <p><span className="font-medium">{text('Cleanup delete', '清理删除')}:</span> {remoteTestResult.push_test.cleanup_ok ? text('OK', '成功') : text('Not completed', '未完成')}</p>
+              {remoteTestResult.push_test.error && <p className="text-destructive">{remoteTestResult.push_test.error}</p>}
+            </div>
+          )}
         </section>
-
-        {message.text && <div className={`rounded-md border px-4 py-3 text-sm ${message.type === 'success' ? 'border-primary/50 bg-primary/10 text-primary' : 'border-destructive/50 bg-destructive/10 text-destructive'}`}>{message.text}</div>}
-
-        <button onClick={() => { void handleSave(); }} disabled={savingSettings} className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{savingSettings ? text('Saving...', '保存中...') : text('Save Configuration', '保存配置')}</button>
-        </div>
-
-        <div className="space-y-6">
-          <CodexReplenishmentConfigCard
-            codexReplenishEnabled={codexReplenishEnabled}
-            setCodexReplenishEnabled={setCodexReplenishEnabled}
-            effectiveTargetCount={effectiveTargetCount}
-            setCodexReplenishTargetCount={setCodexReplenishTargetCount}
-            effectiveThreshold={effectiveThreshold}
-            setCodexReplenishThreshold={setCodexReplenishThreshold}
-            effectiveBatchSize={effectiveBatchSize}
-            setCodexReplenishBatchSize={setCodexReplenishBatchSize}
-            effectiveWorkerCount={effectiveWorkerCount}
-            setCodexReplenishWorkerCount={setCodexReplenishWorkerCount}
-            codexReplenishUseProxy={codexReplenishUseProxy}
-            setCodexReplenishUseProxy={setCodexReplenishUseProxy}
-            text={text}
-          />
-          <ReplenishmentRuntimeCard
-            replenishmentStatus={replenishmentStatus}
-            replenishmentResultLabel={replenishmentResultLabel}
-            effectiveTargetCount={effectiveTargetCount}
-            effectiveBatchSize={effectiveBatchSize}
-            effectiveWorkerCount={effectiveWorkerCount}
-            runtimeStatusError={runtimeStatusError}
-            startingReplenishment={startingReplenishment}
-            stoppingReplenishment={stoppingReplenishment}
-            runtimeStatusLoading={runtimeStatusLoading}
-            onStart={() => { void handleStartReplenishment(); }}
-            onStop={() => { void handleStopReplenishment(); }}
-            onRefresh={() => { void loadRuntimeStatus(false); }}
-            simpleReplenishmentLogs={simpleReplenishmentLogs}
-            replenishmentAccounts={replenishmentAccounts}
-            text={text}
-          />
-        </div>
       </div>
+
+      {message.text && (
+        <div className={`mt-6 rounded-md border px-4 py-3 text-sm ${message.type === 'success' ? 'border-primary/50 bg-primary/10 text-primary' : 'border-destructive/50 bg-destructive/10 text-destructive'}`}>
+          {message.text}
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={() => { void handleSave(); }}
+        disabled={savingSettings}
+        className="mt-6 inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+      >
+        {savingSettings ? text('Saving...', '保存中...') : text('Save Configuration', '保存配置')}
+      </button>
     </div>
   );
 }

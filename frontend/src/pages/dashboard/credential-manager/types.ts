@@ -4,6 +4,8 @@ import type { CodexQuotaCard, ProbeTier, ProbeUiStatus } from '../../../lib/prov
 export interface ProbeUiState {
     status: ProbeUiStatus;
     time: string;
+    updatedAtMs: number;
+    authIndex?: string;
     reason?: string;
     tier?: ProbeTier;
     detail?: string;

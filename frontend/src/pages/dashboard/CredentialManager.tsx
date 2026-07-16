@@ -13,32 +13,64 @@ import {
     upsertRuntimeCredentialState,
     updateCredentialStatus,
 } from '../../lib/api';
-import type { Credential, RuntimeCredentialState } from '../../lib/api';
+import { batchWithLimit } from '../../lib/concurrency';
+import type {
+    Credential,
+    CredentialArchivePayload,
+    CredentialStatusTransitionOptions,
+    LocalCliResult,
+    ProbeResponse,
+    RuntimeCredentialState,
+    RuntimeStatusPayload,
+} from '../../lib/api';
 import {
     resolveTierAfterProbe,
     resolveTierFromCredential,
     type CodexQuotaInfo,
+    type ProbeTier,
     type ProbeUiStatus,
 } from '../../lib/providerStrategies';
 import {
     canProbeCredential,
     classifyProviderProbe,
+    resolveRuntimeNextProbeAtMs,
     shouldAutoArchive,
     shouldAutoDisable,
     toProbeErrorResponse,
 } from '../../shared/providerRuntimeStrategies.js';
+import { summarizeCredentialOverview } from '../../shared/credentialOverview.js';
 import { useRunLock } from '../../hooks/useRunLock';
 import { useLockedInterval } from '../../hooks/useLockedInterval';
 import { useGlobalModal } from '../../components/global-modal/useGlobalModal';
 import CredentialTable from './credential-manager/CredentialTableV2';
 import CredentialManagerToolbar from './credential-manager/CredentialManagerToolbarV2';
 import CredentialSelectionBar from './credential-manager/CredentialSelectionBarV2';
+import CredentialOverview from './credential-manager/CredentialOverview';
 import type {
     CodexQuotaResumeEntry,
     CredentialManagerProps,
     ProbeUiState,
     StatusFilter,
 } from './credential-manager/types';
+
+const AUTO_DISABLE_STORAGE_KEY = 'credential_auto_disable';
+const AUTOMATION_RETRY_DELAY_MS = 30_000;
+const PROBE_MAX_CONCURRENCY = 5;
+
+interface CredentialOperationError {
+    message: string;
+    authIndex: string;
+}
+
+type ArchiveLoadStatus = 'idle' | 'loading' | 'loaded' | 'error';
+
+function stripProbeErrorDetail(detail: string): string {
+    return detail.replace(/\r?\n\r?\nerror:\r?\n[\s\S]*$/, '');
+}
+
+function isQuotaRecoveryStatus(status: ProbeUiStatus): boolean {
+    return status === 'quota_exhausted' || status === 'quota_low_remaining' || status === 'rate_limited';
+}
 
 export default function CredentialManager({
     cpaReady,
@@ -101,12 +133,20 @@ export default function CredentialManager({
     const [probeCancelRequested, setProbeCancelRequested] = useState(false);
     const probeCancelRequestedRef = useRef(false);
     const probeAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
-    const [isAutoDisable, setIsAutoDisable] = useState(true);
-    const [codexQuotaResumeMap, setCodexQuotaResumeMap] = useState<Record<string, CodexQuotaResumeEntry>>({});
+    const [isAutoDisable, setIsAutoDisable] = useState(() => localStorage.getItem(AUTO_DISABLE_STORAGE_KEY) !== '0');
+    const isAutoDisableRef = useRef(isAutoDisable);
+    const [operationErrors, setOperationErrors] = useState<Record<string, CredentialOperationError>>({});
+
+    const handleAutoDisableChange = (value: boolean) => {
+        isAutoDisableRef.current = value;
+        localStorage.setItem(AUTO_DISABLE_STORAGE_KEY, value ? '1' : '0');
+        setIsAutoDisable(value);
+    };
 
     // Batch Selection Data
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
     const [archivedNames, setArchivedNames] = useState<string[]>([]);
+    const [archiveLoadStatus, setArchiveLoadStatus] = useState<ArchiveLoadStatus>('idle');
     const [isArchiveBusy, setIsArchiveBusy] = useState(false);
     const [filterProvider, setFilterProvider] = useState<string>('all');
     const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
@@ -124,17 +164,52 @@ export default function CredentialManager({
 
     const runtimeStatusPayload = runtimeStatusResult?.payload || null;
 
+    const updateRuntimeCredentialStateCache = useCallback((name: string, state: RuntimeCredentialState) => {
+        queryClient.setQueryData<LocalCliResult<RuntimeStatusPayload>>(['runtime-status', cpaUrl], (old) => {
+            if (!old?.payload) return old;
+            return {
+                ...old,
+                payload: {
+                    ...old.payload,
+                    credentials: {
+                        ...old.payload.credentials,
+                        [name]: state,
+                    },
+                },
+            };
+        });
+    }, [cpaUrl, queryClient]);
+
     const toggleStatusMutation = useMutation({
-        mutationFn: ({ name, disabled }: { name: string, disabled: boolean }) => updateCredentialStatus(name, disabled),
+        mutationFn: ({
+            name,
+            disabled,
+            options,
+        }: {
+            name: string;
+            disabled: boolean;
+            options: CredentialStatusTransitionOptions;
+        }) => updateCredentialStatus(name, disabled, options),
     });
 
     const deleteMutation = useMutation({
-        mutationFn: (name: string) => deleteCredential(name),
+        mutationFn: ({ name, expectedAuthIndex }: { name: string; expectedAuthIndex: string }) => (
+            deleteCredential(name, expectedAuthIndex)
+        ),
         onSuccess: () => {
             clearAuthFilesCache();
             queryClient.invalidateQueries({ queryKey: ['credentials'] });
         }
     });
+
+    const runCredentialDelete = (name: string) => {
+        const credential = credentials.find((item) => item.name === name || item.id === name);
+        const expectedAuthIndex = String(credential?.auth_index || '');
+        if (!expectedAuthIndex) {
+            return Promise.reject(new Error(`Credential identity is unavailable: ${name}`));
+        }
+        return deleteMutation.mutateAsync({ name, expectedAuthIndex });
+    };
 
     const forceRefreshCredentials = useCallback(async () => {
         const fresh = await fetchAuthFilesForceRefresh();
@@ -143,7 +218,7 @@ export default function CredentialManager({
     }, [queryClient, cpaUrl]);
 
     const setCredentialDisabledInCache = (name: string, disabled: boolean) => {
-        queryClient.setQueriesData<Credential[]>({ queryKey: ['credentials'] }, (old) => {
+        queryClient.setQueryData<Credential[]>(['credentials', cpaUrl], (old) => {
             if (!old) return old;
             return old.map((item) => {
                 if (item.name === name || item.id === name) {
@@ -154,18 +229,38 @@ export default function CredentialManager({
         });
     };
 
-    const runStatusUpdate = async (name: string, disabled: boolean) => {
+    const runStatusUpdate = async (name: string, disabled: boolean, options: CredentialStatusTransitionOptions) => {
         setTogglingNames(prev => new Set(prev).add(name));
         try {
-            await toggleStatusMutation.mutateAsync({ name, disabled });
-            setCredentialDisabledInCache(name, disabled);
+            const payload = await toggleStatusMutation.mutateAsync({ name, disabled, options });
+            setCredentialDisabledInCache(name, payload.disabled);
+            updateRuntimeCredentialStateCache(name, payload.state);
+            setOperationErrors((prev) => {
+                if (!prev[name]) return prev;
+                const next = { ...prev };
+                delete next[name];
+                return next;
+            });
+            return payload;
         } finally {
             setTogglingNames(prev => { const n = new Set(prev); n.delete(name); return n; });
         }
     };
 
     const handleToggleStatus = async (cred: Credential) => {
-        await runStatusUpdate(cred.name, !cred.disabled);
+        try {
+            await runStatusUpdate(cred.name, !cred.disabled, {
+                cpaUrl,
+                expectedAuthIndex: String(cred.auth_index || ''),
+            });
+        } catch (error: unknown) {
+            const message = String((error as { message?: string })?.message || error || t('Credential update failed'));
+            setOperationErrors((prev) => ({
+                ...prev,
+                [cred.name]: { message, authIndex: String(cred.auth_index || '') },
+            }));
+            showAlert({ title: t('Error'), message, confirmText: t('Confirm', 'Confirm') });
+        }
     };
 
     const handleDeleteSingle = async (name: string) => {
@@ -179,7 +274,7 @@ export default function CredentialManager({
 
         setDeletingNames(prev => new Set(prev).add(name));
         try {
-            await deleteMutation.mutateAsync(name);
+            await runCredentialDelete(name);
         } catch {
             setDeletingNames(prev => { const n = new Set(prev); n.delete(name); return n; });
             showAlert({ title: t('Error'), message: t('Delete failed'), confirmText: t('Confirm', 'Confirm') });
@@ -216,19 +311,22 @@ export default function CredentialManager({
     const persistRuntimeProbeSnapshot = useCallback(async (
         cred: Credential,
         state: Partial<RuntimeCredentialState>,
-    ) => {
-        if (!cpaUrl || !cred.name) return;
-        try {
-            await upsertRuntimeCredentialState({
-                cpa_url: cpaUrl,
-                name: cred.name,
-                state,
-            });
-            queryClient.invalidateQueries({ queryKey: ['runtime-status', cpaUrl] });
-        } catch {
-            // Runtime persistence failure should not block manual probe UX.
+    ): Promise<RuntimeCredentialState> => {
+        if (!cpaUrl || !cred.name) {
+            throw new Error('Runtime state persistence requires a CPA URL and credential name');
         }
-    }, [cpaUrl, queryClient]);
+        const result = await upsertRuntimeCredentialState({
+            cpa_url: cpaUrl,
+            name: cred.name,
+            auth_index: String(cred.auth_index || ''),
+            state,
+        });
+        if (!result.ok || !result.payload?.state) {
+            throw new Error(String(result.error || 'Runtime state persistence failed'));
+        }
+        updateRuntimeCredentialStateCache(cred.name, result.payload.state);
+        return result.payload.state;
+    }, [cpaUrl, updateRuntimeCredentialStateCache]);
 
     const formatRuntimeProbeTime = (value: number | null | undefined): string => {
         if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return '';
@@ -243,103 +341,141 @@ export default function CredentialManager({
 
     const isCodexProvider = (provider: string): boolean => (provider || '').toLowerCase() === 'codex';
 
-    const addOrUpdateCodexQuotaResume = (name: string, quota: CodexQuotaInfo | null | undefined) => {
-        const resetAt = typeof quota?.resetAt === 'number' && Number.isFinite(quota.resetAt) ? quota.resetAt : null;
-        const usedPercent = typeof quota?.usedPercent === 'number' && Number.isFinite(quota.usedPercent) ? quota.usedPercent : null;
-        const source = quota?.source ? String(quota.source) : null;
-        const nowMs = Date.now();
-        setCodexQuotaResumeMap((prev) => ({
-            ...prev,
-            [name]: {
-                resetAt,
-                usedPercent,
-                source,
-                nextProbeAtMs: Math.max(nowMs + 30_000, resetAt ? resetAt * 1000 : nowMs + 30_000),
-            },
-        }));
-    };
+    const applyProbeAutomation = async (
+        cred: Credential,
+        status: ProbeUiStatus,
+        quota: CodexQuotaInfo | null | undefined,
+        probeAtMs: number,
+        runtimeEntry: RuntimeCredentialState,
+    ) => {
+        const codexProvider = isCodexProvider(String(cred.provider || ''));
+        const expectedAuthIndex = String(cred.auth_index || '');
+        const hasRuntimeOwnership = Boolean(runtimeEntry?.disabled_by_runtime);
+        const normalNextProbeAtMs = probeAtMs + Math.max(1, autoProbeIntervalMinutes) * 60 * 1000;
 
-    const removeCodexQuotaResume = (name: string) => {
-        setCodexQuotaResumeMap((prev) => {
-            if (!prev[name]) return prev;
-            const next = { ...prev };
-            delete next[name];
-            return next;
-        });
+        if (status === 'active') {
+            if (hasRuntimeOwnership) {
+                await runStatusUpdate(cred.name, false, {
+                    cpaUrl,
+                    requireRuntimeOwnership: true,
+                    expectedProbeAtMs: probeAtMs,
+                    expectedAuthIndex,
+                    runtimeState: {
+                        disabled_by_runtime: false,
+                        archived_by_runtime: false,
+                        next_probe_at_ms: normalNextProbeAtMs,
+                    },
+                });
+            }
+            return;
+        }
+
+        if (codexProvider && isQuotaRecoveryStatus(status)) {
+            if (!hasRuntimeOwnership && (!isAutoDisableRef.current || cred.disabled)) {
+                return;
+            }
+            await runStatusUpdate(cred.name, true, {
+                cpaUrl,
+                requireRuntimeOwnership: hasRuntimeOwnership,
+                expectedProbeAtMs: probeAtMs,
+                expectedAuthIndex,
+                runtimeState: {
+                    disabled_by_runtime: true,
+                    archived_by_runtime: false,
+                    next_probe_at_ms: resolveRuntimeNextProbeAtMs(
+                        status,
+                        quota,
+                        Math.max(1, autoProbeIntervalMinutes) * 60 * 1000,
+                        probeAtMs,
+                    ),
+                },
+            });
+            return;
+        }
+
+        if (hasRuntimeOwnership && runtimeEntry.archived_by_runtime && !shouldAutoArchive(status)) {
+            await runStatusUpdate(cred.name, true, {
+                cpaUrl,
+                requireRuntimeOwnership: true,
+                expectedProbeAtMs: probeAtMs,
+                expectedAuthIndex,
+                runtimeState: {
+                    disabled_by_runtime: true,
+                    archived_by_runtime: false,
+                    next_probe_at_ms: normalNextProbeAtMs,
+                },
+            });
+            return;
+        }
+
+        if (isAutoDisableRef.current && shouldAutoArchive(status) && !archivedNames.includes(cred.name)) {
+            await archiveCredentialNames([cred.name], true, probeAtMs, expectedAuthIndex, hasRuntimeOwnership);
+        } else if (isAutoDisableRef.current && shouldAutoDisable(status) && !cred.disabled) {
+            await runStatusUpdate(cred.name, true, {
+                cpaUrl,
+                requireRuntimeOwnership: hasRuntimeOwnership,
+                expectedProbeAtMs: probeAtMs,
+                expectedAuthIndex,
+                runtimeState: {
+                    disabled_by_runtime: true,
+                    archived_by_runtime: false,
+                    next_probe_at_ms: resolveRuntimeNextProbeAtMs(
+                        status,
+                        quota,
+                        Math.max(1, autoProbeIntervalMinutes) * 60 * 1000,
+                        probeAtMs,
+                    ),
+                },
+            });
+        }
     };
 
     const handleProbeSingle = async (cred: Credential, options?: { signal?: AbortSignal; fromBatch?: boolean }) => {
         const lockKey = `probe-single:${cred.name}`;
         await runWithLock(lockKey, async () => {
+            const startedAtMs = Date.now();
             setProbeStatuses(prev => ({
                 ...prev,
                 [cred.name]: {
                     status: 'running',
                     time: new Date().toLocaleTimeString(),
+                    updatedAtMs: startedAtMs,
+                    authIndex: String(cred.auth_index || ''),
                     reason: '',
                     tier: resolveTierFromCredential(cred),
                     detail: '',
                 },
             }));
 
+            let response: ProbeResponse;
+            let finalStatus: ProbeUiStatus;
+            let finalReason = '';
+            let tier: ProbeTier = resolveTierFromCredential(cred);
+            let quota: CodexQuotaInfo | null | undefined;
+            let detail = '';
+
             try {
-                const response = await probeCredential(cred.auth_index, cred.provider as string, options?.signal);
+                response = await probeCredential(cred.auth_index, cred.provider as string, options?.signal);
                 const result = classifyProviderProbe(cred.provider, response, {
                     codexQuotaDisableRemainingPercent,
                 });
-                const tier = resolveTierAfterProbe(cred, response);
-                const detail = formatProbeDetail(response);
-
-                setProbeStatuses(prev => ({
-                    ...prev,
-                    [cred.name]: {
-                        status: result.status,
-                        time: new Date().toLocaleTimeString(),
-                        reason: truncateText(result.reason),
-                        tier,
-                        detail,
-                        quotaResetAt: result.quota?.resetAt ?? null,
-                        quotaSource: result.quota?.source ?? null,
-                        quotaUsedPercent: result.quota?.usedPercent ?? null,
-                        quotaCards: result.quota?.cards ?? [],
-                    },
-                }));
-
-                await persistRuntimeProbeSnapshot(cred, {
-                    provider: String(cred.provider || ''),
-                    last_status: result.status,
-                    last_reason: result.reason || '',
-                    last_probe_at: Date.now(),
-                    last_probe_detail: detail,
-                    last_reset_at: result.quota?.resetAt ?? null,
-                    last_quota_source: result.quota?.source ?? '',
-                    last_quota_used_percent: result.quota?.usedPercent ?? null,
-                    last_quota_cards: result.quota?.cards ?? [],
-                });
-
-                if (isCodexProvider(String(cred.provider || ''))) {
-                    if (result.status === 'quota_exhausted' || result.status === 'quota_low_remaining' || result.status === 'rate_limited') {
-                        addOrUpdateCodexQuotaResume(cred.name, result.quota);
-                    } else {
-                        removeCodexQuotaResume(cred.name);
-                    }
-                }
-
-                if (result.status === 'active' && cred.disabled) {
-                    await runStatusUpdate(cred.name, false);
-                } else if (isAutoDisable && shouldAutoArchive(result.status) && !archivedNames.includes(cred.name)) {
-                    await archiveCredentialNames([cred.name]);
-                } else if (isAutoDisable && shouldAutoDisable(result.status) && !cred.disabled) {
-                    await runStatusUpdate(cred.name, true);
-                }
+                finalStatus = result.status;
+                finalReason = result.reason || '';
+                quota = result.quota;
+                tier = resolveTierAfterProbe(cred, response);
+                const rawDetail = formatProbeDetail(response);
+                detail = finalStatus === 'active' ? stripProbeErrorDetail(rawDetail) : rawDetail;
             } catch (error: unknown) {
                 if (isAbortError(error)) {
                     if (options?.fromBatch) {
+                        const cancelledAtMs = Date.now();
                         setProbeStatuses(prev => ({
                             ...prev,
                             [cred.name]: {
                                 status: 'unknown',
                                 time: new Date().toLocaleTimeString(),
+                                updatedAtMs: cancelledAtMs,
+                                authIndex: String(cred.auth_index || ''),
                                 reason: t('Probe cancelled'),
                                 tier: resolveTierFromCredential(cred),
                                 detail: t('Probe cancelled'),
@@ -349,84 +485,116 @@ export default function CredentialManager({
                     return;
                 }
 
-                const fallbackResponse = toProbeErrorResponse(error);
-                const result = classifyProviderProbe(cred.provider, fallbackResponse, {
+                response = toProbeErrorResponse(error);
+                const result = classifyProviderProbe(cred.provider, response, {
                     codexQuotaDisableRemainingPercent,
                 });
-                const finalStatus: ProbeUiStatus = result.status === 'unknown' ? 'error' : result.status;
-                const detail = formatProbeDetail(fallbackResponse);
+                finalStatus = result.status === 'unknown' ? 'error' : result.status;
+                finalReason = finalStatus === 'active'
+                    ? ''
+                    : (result.reason || 'Network error during probing');
+                quota = result.quota;
+                const rawDetail = formatProbeDetail(response);
+                detail = finalStatus === 'active' ? stripProbeErrorDetail(rawDetail) : rawDetail;
+            }
 
-                setProbeStatuses(prev => ({
-                    ...prev,
-                    [cred.name]: {
-                        status: finalStatus,
-                        time: new Date().toLocaleTimeString(),
-                        reason: truncateText(result.reason || 'Network error during probing'),
-                        tier: resolveTierFromCredential(cred),
-                        detail,
-                    },
-                }));
+            const completedAtMs = Date.now();
+            setProbeStatuses(prev => ({
+                ...prev,
+                [cred.name]: {
+                    status: finalStatus,
+                    time: new Date(completedAtMs).toLocaleTimeString(),
+                    updatedAtMs: completedAtMs,
+                    authIndex: String(cred.auth_index || ''),
+                    reason: truncateText(finalReason),
+                    tier,
+                    detail,
+                    quotaResetAt: quota?.resetAt ?? null,
+                    quotaSource: quota?.source ?? null,
+                    quotaUsedPercent: quota?.usedPercent ?? null,
+                    quotaCards: quota?.cards ?? [],
+                },
+            }));
 
-                await persistRuntimeProbeSnapshot(cred, {
+            let persistedState: RuntimeCredentialState | null = null;
+            try {
+                persistedState = await persistRuntimeProbeSnapshot(cred, {
                     provider: String(cred.provider || ''),
                     last_status: finalStatus,
-                    last_reason: result.reason || 'Network error during probing',
-                    last_probe_at: Date.now(),
+                    last_reason: finalReason,
+                    last_probe_at: completedAtMs,
                     last_probe_detail: detail,
-                    last_reset_at: result.quota?.resetAt ?? null,
-                    last_quota_source: result.quota?.source ?? '',
-                    last_quota_used_percent: result.quota?.usedPercent ?? null,
-                    last_quota_cards: result.quota?.cards ?? [],
+                    last_reset_at: quota?.resetAt ?? null,
+                    last_quota_source: quota?.source ?? '',
+                    last_quota_used_percent: quota?.usedPercent ?? null,
+                    last_quota_cards: quota?.cards ?? [],
+                    next_probe_at_ms: resolveRuntimeNextProbeAtMs(
+                        finalStatus,
+                        quota,
+                        Math.max(1, autoProbeIntervalMinutes) * 60 * 1000,
+                        completedAtMs,
+                    ),
                 });
-
-                if (isCodexProvider(String(cred.provider || ''))) {
-                    if (finalStatus === 'quota_exhausted' || finalStatus === 'quota_low_remaining' || finalStatus === 'rate_limited') {
-                        addOrUpdateCodexQuotaResume(cred.name, result.quota);
-                    } else {
-                        removeCodexQuotaResume(cred.name);
+                if (persistedState.last_probe_at === completedAtMs) {
+                    await applyProbeAutomation(cred, finalStatus, quota, completedAtMs, persistedState);
+                }
+                setOperationErrors((prev) => {
+                    if (!prev[cred.name]) return prev;
+                    const next = { ...prev };
+                    delete next[cred.name];
+                    return next;
+                });
+            } catch (error: unknown) {
+                let message = String((error as { message?: string })?.message || error || 'Credential automation failed');
+                if (persistedState?.last_probe_at === completedAtMs) {
+                    try {
+                        await persistRuntimeProbeSnapshot(cred, {
+                            last_probe_at: completedAtMs,
+                            next_probe_at_ms: Date.now() + AUTOMATION_RETRY_DELAY_MS,
+                        });
+                    } catch (retryError) {
+                        message = `${message}; retry scheduling failed: ${String((retryError as { message?: string })?.message || retryError)}`;
                     }
                 }
-
-                if (isAutoDisable && shouldAutoArchive(finalStatus) && !archivedNames.includes(cred.name)) {
-                    await archiveCredentialNames([cred.name]);
-                } else if (isAutoDisable && shouldAutoDisable(finalStatus) && !cred.disabled) {
-                    await runStatusUpdate(cred.name, true);
-                }
+                setOperationErrors((prev) => ({
+                    ...prev,
+                    [cred.name]: { message, authIndex: String(cred.auth_index || '') },
+                }));
+                queryClient.invalidateQueries({ queryKey: ['credentials'] });
+                queryClient.invalidateQueries({ queryKey: ['runtime-status', cpaUrl] });
             }
         });
     };
-
-    useEffect(() => {
-        if (!credentials.length) return;
-        const byName = new Map(credentials.map((item) => [item.name, item]));
-        setCodexQuotaResumeMap((prev) => {
-            let changed = false;
-            const next: Record<string, CodexQuotaResumeEntry> = {};
-            Object.entries(prev).forEach(([name, entry]) => {
-                const cred = byName.get(name);
-                if (!cred || !isCodexProvider(String(cred.provider || ''))) {
-                    changed = true;
-                    return;
-                }
-                next[name] = entry;
-            });
-            return changed ? next : prev;
-        });
-    }, [credentials]);
 
     const runtimeCredentialStates = useMemo<Record<string, RuntimeCredentialState>>(() => {
         return runtimeStatusPayload?.credentials || {};
     }, [runtimeStatusPayload]);
 
+    const credentialAuthIndexByName = useMemo(
+        () => new Map(credentials.map((cred) => [cred.name, String(cred.auth_index || '')])),
+        [credentials],
+    );
+
+    const runtimeStateMatchesCredential = useCallback((name: string, state: RuntimeCredentialState): boolean => {
+        const currentAuthIndex = credentialAuthIndexByName.get(name);
+        const storedAuthIndex = String(state.auth_index || '');
+        return Boolean(currentAuthIndex && storedAuthIndex && currentAuthIndex === storedAuthIndex);
+    }, [credentialAuthIndexByName]);
+
     const runtimeProbeStatuses = useMemo<Record<string, ProbeUiState>>(() => {
         const next: Record<string, ProbeUiState> = {};
         Object.entries(runtimeCredentialStates).forEach(([name, state]) => {
-            if (!state?.last_status) return;
+            if (!state?.last_status || !runtimeStateMatchesCredential(name, state)) return;
+            const detail = state.last_status === 'active'
+                ? stripProbeErrorDetail(state.last_probe_detail || '')
+                : (state.last_probe_detail || state.last_reason || '');
             next[name] = {
                 status: state.last_status,
                 time: formatRuntimeProbeTime(state.last_probe_at),
-                reason: truncateText(state.last_reason || ''),
-                detail: state.last_probe_detail || state.last_reason || '',
+                updatedAtMs: state.last_probe_at || 0,
+                authIndex: String(state.auth_index || ''),
+                reason: state.last_status === 'active' ? '' : truncateText(state.last_reason || ''),
+                detail,
                 quotaResetAt: state.last_reset_at,
                 quotaSource: state.last_quota_source || null,
                 quotaUsedPercent: state.last_quota_used_percent,
@@ -434,7 +602,16 @@ export default function CredentialManager({
             };
         });
         return next;
-    }, [runtimeCredentialStates]);
+    }, [runtimeCredentialStates, runtimeStateMatchesCredential]);
+
+    const runtimeOwnedNames = useMemo(
+        () => new Set(
+            Object.entries(runtimeCredentialStates)
+                .filter(([name, state]) => Boolean(state?.disabled_by_runtime) && runtimeStateMatchesCredential(name, state))
+                .map(([name]) => name),
+        ),
+        [runtimeCredentialStates, runtimeStateMatchesCredential],
+    );
 
     const runtimeCodexQuotaResumeMap = useMemo<Record<string, CodexQuotaResumeEntry>>(() => {
         const next: Record<string, CodexQuotaResumeEntry> = {};
@@ -442,7 +619,7 @@ export default function CredentialManager({
             const isQuotaRecoveryState = state?.last_status === 'quota_exhausted'
                 || state?.last_status === 'quota_low_remaining'
                 || state?.last_status === 'rate_limited';
-            if (!state?.disabled_by_runtime || state.next_probe_at_ms === null || !isQuotaRecoveryState) return;
+            if (!runtimeStateMatchesCredential(name, state) || !state?.disabled_by_runtime || state.next_probe_at_ms === null || !isQuotaRecoveryState) return;
             next[name] = {
                 resetAt: state.last_reset_at,
                 usedPercent: state.last_quota_used_percent,
@@ -451,23 +628,33 @@ export default function CredentialManager({
             };
         });
         return next;
-    }, [runtimeCredentialStates]);
+    }, [runtimeCredentialStates, runtimeStateMatchesCredential]);
 
-    const mergedProbeStatuses = useMemo<Record<string, ProbeUiState>>(
-        () => ({
-            ...runtimeProbeStatuses,
-            ...probeStatuses,
-        }),
-        [runtimeProbeStatuses, probeStatuses],
-    );
-
-    const mergedCodexQuotaResumeMap = useMemo<Record<string, CodexQuotaResumeEntry>>(
-        () => ({
-            ...runtimeCodexQuotaResumeMap,
-            ...codexQuotaResumeMap,
-        }),
-        [runtimeCodexQuotaResumeMap, codexQuotaResumeMap],
-    );
+    const mergedProbeStatuses = useMemo<Record<string, ProbeUiState>>(() => {
+        const next: Record<string, ProbeUiState> = {};
+        const names = new Set([...Object.keys(runtimeProbeStatuses), ...Object.keys(probeStatuses)]);
+        names.forEach((name) => {
+            const currentAuthIndex = credentialAuthIndexByName.get(name);
+            const runtimeCandidate = runtimeProbeStatuses[name];
+            const localCandidate = probeStatuses[name];
+            const runtimeState = runtimeCandidate && currentAuthIndex && runtimeCandidate.authIndex === currentAuthIndex
+                ? runtimeCandidate
+                : undefined;
+            const localState = localCandidate && currentAuthIndex && localCandidate.authIndex === currentAuthIndex
+                ? localCandidate
+                : undefined;
+            if (!runtimeState) {
+                if (localState) next[name] = localState;
+                return;
+            }
+            if (!localState) {
+                next[name] = runtimeState;
+                return;
+            }
+            next[name] = localState.updatedAtMs > runtimeState.updatedAtMs ? localState : runtimeState;
+        });
+        return next;
+    }, [credentialAuthIndexByName, runtimeProbeStatuses, probeStatuses]);
 
     const runProbeForTargets = async (targets: Credential[]) => {
         if (!targets.length || isProbingAll) return;
@@ -483,7 +670,8 @@ export default function CredentialManager({
                         break;
                     }
                     const chunk = probeTargets.slice(i, i + probeBatchSize);
-                    const tasks = chunk.map(async (cred) => {
+                    await batchWithLimit(chunk, async (cred) => {
+                        if (probeCancelRequestedRef.current) return;
                         const controller = new AbortController();
                         probeAbortControllersRef.current.set(cred.name, controller);
                         try {
@@ -491,8 +679,7 @@ export default function CredentialManager({
                         } finally {
                             probeAbortControllersRef.current.delete(cred.name);
                         }
-                    });
-                    await Promise.allSettled(tasks);
+                    }, PROBE_MAX_CONCURRENCY);
                     if (probeCancelRequestedRef.current) {
                         break;
                     }
@@ -539,8 +726,11 @@ export default function CredentialManager({
     const loadCredentialArchive = useCallback(async () => {
         if (!cpaReady || !cpaUrl) {
             setArchivedNames([]);
+            setArchiveLoadStatus('idle');
             return;
         }
+        setArchivedNames([]);
+        setArchiveLoadStatus('loading');
         try {
             const result = await runCredentialArchiveList({ cpa_url: cpaUrl });
             const payload = result.payload as { names?: unknown } | undefined;
@@ -548,8 +738,9 @@ export default function CredentialManager({
                 ? payload.names.map((item) => String(item || '').trim()).filter(Boolean)
                 : [];
             setArchivedNames(Array.from(new Set(names)));
+            setArchiveLoadStatus('loaded');
         } catch {
-            setArchivedNames([]);
+            setArchiveLoadStatus('error');
         }
     }, [cpaReady, cpaUrl]);
 
@@ -591,6 +782,19 @@ export default function CredentialManager({
         [activeCredentials],
     );
     const archivedCredentialCount = archivedNames.length;
+    const currentOperationErrors = useMemo<Record<string, string>>(() => {
+        const next: Record<string, string> = {};
+        for (const cred of activeCredentials) {
+            const entry = operationErrors[cred.name];
+            if (!entry || entry.authIndex !== String(cred.auth_index || '')) continue;
+            next[cred.name] = entry.message;
+        }
+        return next;
+    }, [activeCredentials, operationErrors]);
+    const credentialOverview = useMemo(
+        () => summarizeCredentialOverview(activeCredentials, mergedProbeStatuses, currentOperationErrors),
+        [activeCredentials, currentOperationErrors, mergedProbeStatuses],
+    );
     const providerStats = useMemo(() => {
         const stats: Record<string, { total: number; disabled: number }> = {};
         for (const cred of activeCredentials) {
@@ -636,9 +840,19 @@ export default function CredentialManager({
     }, [probeBatchIntervalMs]);
 
     useEffect(() => {
+        isAutoDisableRef.current = isAutoDisable;
+        localStorage.setItem(AUTO_DISABLE_STORAGE_KEY, isAutoDisable ? '1' : '0');
+    }, [isAutoDisable]);
+
+    useEffect(() => {
         setPage(1);
         setSelectedItems(new Set());
     }, [filterProvider, statusFilter, searchKeyword, pageSize, cpaUrl]);
+
+    useEffect(() => {
+        setProbeStatuses({});
+        setOperationErrors({});
+    }, [cpaUrl]);
 
     useEffect(() => {
         if (page > totalPages) {
@@ -717,13 +931,13 @@ export default function CredentialManager({
 
     const refreshListWithLock = useCallback(async (force: boolean = false) => {
         await runWithLock('refresh-list', async () => {
-            if (force) {
-                await forceRefreshCredentials();
-            } else {
-                await refetch();
-            }
+            const credentialRefresh = force ? forceRefreshCredentials() : refetch();
+            const archiveRefresh = force || archiveLoadStatus === 'error'
+                ? loadCredentialArchive()
+                : Promise.resolve();
+            await Promise.all([credentialRefresh, archiveRefresh]);
         });
-    }, [runWithLock, forceRefreshCredentials, refetch]);
+    }, [archiveLoadStatus, forceRefreshCredentials, loadCredentialArchive, refetch, runWithLock]);
 
     useLockedInterval(
         async () => {
@@ -762,8 +976,7 @@ export default function CredentialManager({
 
         setIsDeletingSelection(true);
         try {
-            const promises = Array.from(selectedItems).map(name => deleteMutation.mutateAsync(name));
-            await Promise.all(promises);
+            await batchWithLimit(Array.from(selectedItems), (name) => runCredentialDelete(name), 5);
             setSelectedItems(new Set());
             await forceRefreshCredentials();
         } finally {
@@ -777,28 +990,98 @@ export default function CredentialManager({
             ? record.names.map((item) => String(item || '').trim()).filter(Boolean)
             : [];
         setArchivedNames(Array.from(new Set(names)));
+        setArchiveLoadStatus('loaded');
     };
 
-    const archiveCredentialNames = async (names: string[]) => {
+    const archiveCredentialNames = async (
+        names: string[],
+        runtimeOwned: boolean = false,
+        expectedProbeAtMs?: number,
+        expectedAuthIndex?: string,
+        requireExistingRuntimeOwnership: boolean = false,
+    ) => {
         const targets = Array.from(new Set(names.map((item) => String(item || '').trim()).filter(Boolean)));
+        const automaticAuthIndex = String(expectedAuthIndex || '');
         if (!targets.length) return;
+        if (runtimeOwned && (typeof expectedProbeAtMs !== 'number' || !Number.isFinite(expectedProbeAtMs) || expectedProbeAtMs <= 0)) {
+            throw new Error('Automatic archive requires a persisted probe version');
+        }
+        if (runtimeOwned && !automaticAuthIndex) {
+            throw new Error('Automatic archive requires a credential identity');
+        }
         setIsArchiveBusy(true);
         try {
+            const archiveTargets: string[] = [];
+            const archiveAuthIndices: Record<string, string> = {};
             for (const name of targets) {
                 const cred = activeCredentials.find((item) => item.name === name);
                 if (!cred) continue;
-                if (!cred.disabled) {
-                    await runStatusUpdate(name, true);
+                const transition = await runStatusUpdate(name, true, runtimeOwned
+                    ? {
+                        cpaUrl,
+                        requireRuntimeOwnership: requireExistingRuntimeOwnership,
+                        expectedProbeAtMs,
+                        expectedAuthIndex: automaticAuthIndex,
+                        runtimeState: {
+                            disabled_by_runtime: true,
+                            archived_by_runtime: true,
+                            next_probe_at_ms: null,
+                        },
+                    }
+                    : {
+                        cpaUrl,
+                        expectedAuthIndex: String(cred.auth_index || ''),
+                    });
+                if (!transition.skipped) {
+                    archiveTargets.push(name);
+                    archiveAuthIndices[name] = String(cred.auth_index || '');
                 }
             }
-            const result = await runCredentialArchiveAdd({ cpa_url: cpaUrl, names: targets });
+            if (!archiveTargets.length) return;
+            let result: LocalCliResult<CredentialArchivePayload>;
+            try {
+                result = await runCredentialArchiveAdd({
+                    cpa_url: cpaUrl,
+                    names: archiveTargets,
+                    require_runtime_ownership: runtimeOwned,
+                    expected_probe_at_ms: runtimeOwned ? expectedProbeAtMs : undefined,
+                    expected_auth_index: runtimeOwned ? automaticAuthIndex : undefined,
+                    auth_indices: archiveAuthIndices,
+                });
+            } catch (error) {
+                if (runtimeOwned) {
+                    const compensationResults = await Promise.allSettled(archiveTargets.map((name) => runStatusUpdate(name, true, {
+                        cpaUrl,
+                        requireRuntimeOwnership: true,
+                        expectedProbeAtMs,
+                        expectedAuthIndex: automaticAuthIndex,
+                        runtimeState: {
+                            disabled_by_runtime: true,
+                            archived_by_runtime: false,
+                            next_probe_at_ms: Date.now() + AUTOMATION_RETRY_DELAY_MS,
+                        },
+                    })));
+                    const compensationErrors = compensationResults
+                        .filter((item): item is PromiseRejectedResult => item.status === 'rejected')
+                        .map((item) => String((item.reason as { message?: string })?.message || item.reason));
+                    if (compensationErrors.length) {
+                        throw new Error(`${String((error as { message?: string })?.message || error)}; archive compensation failed: ${compensationErrors.join('; ')}`);
+                    }
+                }
+                throw error;
+            }
+            const skippedNames = new Set(result.payload?.skipped || []);
+            const committedTargets = archiveTargets.filter((name) => !skippedNames.has(name));
             setArchivedNamesFromPayload(result.payload || null);
             setSelectedItems((prev) => {
                 const next = new Set(prev);
-                targets.forEach((name) => next.delete(name));
+                committedTargets.forEach((name) => next.delete(name));
                 return next;
             });
             await forceRefreshCredentials();
+            if (!runtimeOwned && skippedNames.size > 0) {
+                throw new Error(`Archive skipped because credential state changed: ${Array.from(skippedNames).join(', ')}`);
+            }
         } finally {
             setIsArchiveBusy(false);
         }
@@ -817,7 +1100,15 @@ export default function CredentialManager({
             cancelText: t('Cancel', 'Cancel'),
         });
         if (!confirmed) return;
-        await archiveCredentialNames(disabledTargets);
+        try {
+            await archiveCredentialNames(disabledTargets);
+        } catch (error: unknown) {
+            showAlert({
+                title: t('Error'),
+                message: String((error as { message?: string })?.message || error || t('Archive failed')),
+                confirmText: t('Confirm', 'Confirm'),
+            });
+        }
     };
 
     const handleDeleteDisabled = async () => {
@@ -836,7 +1127,7 @@ export default function CredentialManager({
 
         setIsArchiveBusy(true);
         try {
-            const settled = await Promise.allSettled(targets.map((name) => deleteMutation.mutateAsync(name).then(() => name)));
+            const settled = await Promise.allSettled(targets.map((name) => runCredentialDelete(name).then(() => name)));
             const deleted: string[] = [];
             const failed: string[] = [];
             settled.forEach((item, idx) => {
@@ -876,11 +1167,25 @@ export default function CredentialManager({
             cancelText: t('Cancel', 'Cancel'),
         });
         if (!confirmed) return;
-        await archiveCredentialNames(targets);
+        try {
+            await archiveCredentialNames(targets);
+        } catch (error: unknown) {
+            showAlert({
+                title: t('Error'),
+                message: String((error as { message?: string })?.message || error || t('Archive failed')),
+                confirmText: t('Confirm', 'Confirm'),
+            });
+        }
     };
 
     return (
         <div className="space-y-6">
+            <CredentialOverview
+                t={t}
+                {...credentialOverview}
+                unavailable={isLoading || isError || archiveLoadStatus !== 'loaded'}
+            />
+
             <CredentialManagerToolbar
                 t={t}
                 totalCredentialCount={totalCredentialCount}
@@ -895,7 +1200,7 @@ export default function CredentialManager({
                 searchKeyword={searchKeyword}
                 setSearchKeyword={setSearchKeyword}
                 isAutoDisable={isAutoDisable}
-                setIsAutoDisable={setIsAutoDisable}
+                setIsAutoDisable={handleAutoDisableChange}
                 cpaReady={cpaReady}
                 isFetching={isFetching}
                 onRefreshList={() => { void refreshListWithLock(true); }}
@@ -946,7 +1251,9 @@ export default function CredentialManager({
                 onToggleSelectAll={handleSelectAll}
                 onToggleItem={handleToggleItem}
                 probeStatuses={mergedProbeStatuses}
-                codexQuotaResumeMap={mergedCodexQuotaResumeMap}
+                codexQuotaResumeMap={runtimeCodexQuotaResumeMap}
+                runtimeOwnedNames={runtimeOwnedNames}
+                operationErrors={currentOperationErrors}
                 isLocked={isLocked}
                 deletingNames={deletingNames}
                 togglingNames={togglingNames}

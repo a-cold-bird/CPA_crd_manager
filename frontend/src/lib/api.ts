@@ -1,8 +1,12 @@
 ﻿import axios from 'axios';
 
+const STATUS_TRANSITION_TIMEOUT_MS = 100_000;
+const REMOTE_PUSH_TEST_TIMEOUT_MS = 80_000;
+
 // 1. Create independent backend configuration API
 export const configApi = axios.create({
-  baseURL: '/api', // this goes to our local node server
+  baseURL: '/api',
+  timeout: 50_000,
 });
 
 configApi.interceptors.request.use((config) => {
@@ -16,6 +20,7 @@ configApi.interceptors.request.use((config) => {
 // 2. Create the main CPA API client
 export const cpaApi = axios.create({
   baseURL: '/api/cpa',
+  timeout: 50_000,
 });
 
 cpaApi.interceptors.request.use((config) => {
@@ -25,6 +30,22 @@ cpaApi.interceptors.request.use((config) => {
   }
   return config;
 });
+
+function normalizeApiError(error: unknown, fallback: string): Error {
+  if (axios.isAxiosError(error)) {
+    const data = error.response?.data as {
+      error?: unknown;
+      transition?: { inconsistent?: unknown; rollback_error?: unknown } | null;
+    } | undefined;
+    const message = String(data?.error || error.message || fallback);
+    if (data?.transition?.inconsistent) {
+      const rollbackError = String(data.transition.rollback_error || '').trim();
+      return new Error(rollbackError ? `${message} (state may be inconsistent: ${rollbackError})` : `${message} (state may be inconsistent)`);
+    }
+    return new Error(message);
+  }
+  return error instanceof Error ? error : new Error(String(error || fallback));
+}
 
 // Types based on phase 1 API doc
 export type Provider = 'codex';
@@ -44,7 +65,7 @@ export interface Credential {
   [key: string]: unknown;
 }
 
-export type CheckStatus = 'active' | 'invalidated' | 'deactivated' | 'unauthorized' | 'expired_by_time' | 'quota_exhausted' | 'quota_low_remaining' | 'rate_limited' | 'unknown' | 'error';
+export type CheckStatus = 'active' | 'invalidated' | 'deactivated' | 'workspace_deactivated' | 'unauthorized' | 'expired_by_time' | 'quota_exhausted' | 'quota_low_remaining' | 'rate_limited' | 'unknown' | 'error';
 
 export interface OperationLog {
   at: string;
@@ -83,16 +104,22 @@ export interface CredentialArchivePayload {
   total: number;
   added?: number;
   removed?: number;
+  skipped?: string[];
 }
 
 export interface CredentialArchiveRequest {
   cpa_url?: string;
   names?: string[];
+  require_runtime_ownership?: boolean;
+  expected_probe_at_ms?: number;
+  expected_auth_index?: string;
+  auth_indices?: Record<string, string>;
 }
 
 export interface RuntimeCredentialState {
   provider?: string;
-  last_status: CheckStatus;
+  auth_index?: string;
+  last_status: CheckStatus | '';
   last_reason: string;
   last_probe_at: number | null;
   last_probe_at_iso: string;
@@ -113,37 +140,21 @@ export interface RuntimeCredentialState {
   disabled_by_runtime: boolean;
 }
 
-export interface ReplenishmentBatchStatus {
-  accounts: Array<{
-    idx: number | null;
-    total: number | null;
-    email: string;
-    proxy: string;
-    status: string;
-    register_ok: boolean;
-    codex_ok: boolean;
-    upload_ok: boolean;
-    error: string;
-    updated_at: number | null;
-  }>;
-  attempt: number | null;
-  requested: number | null;
-  workers: number | null;
-  selected_domain: string;
-  email_selection_mode: string;
-  status: string;
-  register_succeeded: number;
-  register_failed: number;
-  codex_succeeded: number;
-  codex_failed: number;
-  upload_succeeded: number;
-  upload_failed: number;
-  current_proxy: string;
-  current_email: string;
-  last_error: string;
-  started_at: number | null;
-  finished_at: number | null;
-  events: string[];
+export interface CredentialStatusTransitionPayload {
+  cpa_url: string;
+  name: string;
+  disabled: boolean;
+  state: RuntimeCredentialState;
+  skipped?: boolean;
+  skip_reason?: string;
+}
+
+export interface CredentialStatusTransitionOptions {
+  cpaUrl?: string;
+  runtimeState?: Partial<RuntimeCredentialState>;
+  requireRuntimeOwnership?: boolean;
+  expectedProbeAtMs?: number;
+  expectedAuthIndex: string;
 }
 
 export interface RuntimeStatusPayload {
@@ -159,43 +170,6 @@ export interface RuntimeStatusPayload {
     last_cycle_finished_at: number | null;
     last_cycle_finished_at_iso: string;
     last_error: string;
-  };
-  replenishment: {
-    domain_stats: Record<string, { total: number; success: number; fail: number }>;
-    enabled: boolean;
-    in_progress: boolean;
-    stop_requested: boolean;
-    process_pid: number | null;
-    mode: string;
-    healthy_count: number | null;
-    proxy_pool_size: number | null;
-    target_count: number | null;
-    threshold: number | null;
-    batch_size: number | null;
-    worker_count: number | null;
-    use_proxy: boolean;
-    needed: number | null;
-    new_token_files: number | null;
-    last_limit: number | null;
-    last_scan_register_total: number | null;
-    last_scan_cpa_total: number | null;
-    last_scan_missing_count: number | null;
-    last_uploaded: number | null;
-    last_failed: number | null;
-    failed_names: string[];
-    log_file: string;
-    recent_events: string[];
-    log_tail: string[];
-    last_started_at: number | null;
-    last_started_at_iso: string;
-    last_finished_at: number | null;
-    last_finished_at_iso: string;
-    last_error: string;
-    last_summary: string;
-    email_selection_mode: string;
-    last_selected_domain: string;
-    current_batch: ReplenishmentBatchStatus | null;
-    batch_history: ReplenishmentBatchStatus[];
   };
   credentials: Record<string, RuntimeCredentialState>;
 }
@@ -215,35 +189,6 @@ export interface RemotePushTestPayload {
   };
 }
 
-export interface MailDomainTestPayload {
-  provider?: string;
-  domain: string;
-  mailbox: string;
-  ok: boolean;
-  login_status: number | null;
-  list_status: number | null;
-  message: string;
-  error: string;
-}
-
-export interface StartReplenishmentPayload {
-  started: boolean;
-  already_running: boolean;
-  pid: number | null;
-  needed: number | null;
-  healthy_count: number | null;
-  target_count: number | null;
-  threshold: number | null;
-  message: string;
-}
-
-export interface StopReplenishmentPayload {
-  requested: boolean;
-  stopped: boolean;
-  pid: number | null;
-  message: string;
-}
-
 const AUTH_FILES_CACHE_TTL_MS = 3000;
 const AUTH_FILES_MIN_GAP_MS = 250;
 
@@ -252,6 +197,7 @@ type AuthFilesCacheEntry = { data: Credential[]; at: number };
 const authFilesCacheByBaseUrl = new Map<string, AuthFilesCacheEntry>();
 const authFilesInFlightByBaseUrl = new Map<string, Promise<Credential[]>>();
 const authFilesLastRequestAtByBaseUrl = new Map<string, number>();
+let authFilesCacheGeneration = 0;
 
 const cloneCredentials = (files: Credential[]): Credential[] => files.map((item) => ({ ...item }));
 
@@ -261,6 +207,7 @@ const sleep = async (ms: number) => {
 };
 
 export const clearAuthFilesCache = () => {
+  authFilesCacheGeneration += 1;
   authFilesCacheByBaseUrl.clear();
   authFilesInFlightByBaseUrl.clear();
   authFilesLastRequestAtByBaseUrl.clear();
@@ -279,6 +226,7 @@ function getAuthFilesCacheKey(): string {
 export const fetchAuthFiles = async (options?: { force?: boolean }): Promise<Credential[]> => {
   const force = options?.force ?? false;
   const cacheKey = getAuthFilesCacheKey();
+  const generation = authFilesCacheGeneration;
   const now = Date.now();
   const cacheEntry = authFilesCacheByBaseUrl.get(cacheKey) || null;
   const inFlight = authFilesInFlightByBaseUrl.get(cacheKey) || null;
@@ -298,15 +246,19 @@ export const fetchAuthFiles = async (options?: { force?: boolean }): Promise<Cre
   const nextInFlight = (async () => {
     await sleep(waitMs);
     const data = await requestAuthFilesFromServer();
-    const fetchedAt = Date.now();
-    authFilesLastRequestAtByBaseUrl.set(cacheKey, fetchedAt);
-    authFilesCacheByBaseUrl.set(cacheKey, {
-      data: cloneCredentials(data),
-      at: fetchedAt,
-    });
+    if (generation === authFilesCacheGeneration) {
+      const fetchedAt = Date.now();
+      authFilesLastRequestAtByBaseUrl.set(cacheKey, fetchedAt);
+      authFilesCacheByBaseUrl.set(cacheKey, {
+        data: cloneCredentials(data),
+        at: fetchedAt,
+      });
+    }
     return cloneCredentials(data);
   })().finally(() => {
-    authFilesInFlightByBaseUrl.delete(cacheKey);
+    if (authFilesInFlightByBaseUrl.get(cacheKey) === nextInFlight) {
+      authFilesInFlightByBaseUrl.delete(cacheKey);
+    }
   });
 
   authFilesInFlightByBaseUrl.set(cacheKey, nextInFlight);
@@ -355,19 +307,50 @@ export const probeCredential = async (auth_index: string, provider: string, sign
   return res.data as ProbeResponse;
 };
 
-export const updateCredentialStatus = async (name: string, disabled: boolean) => {
-  const res = await cpaApi.patch('/auth-files/status', {
-    name,
-    disabled,
-  });
-  clearAuthFilesCache();
-  return res.data;
+export const updateCredentialStatus = async (
+  name: string,
+  disabled: boolean,
+  options: CredentialStatusTransitionOptions,
+): Promise<CredentialStatusTransitionPayload> => {
+  const runtimeState = options?.runtimeState ?? {
+    disabled_by_runtime: false,
+    archived_by_runtime: false,
+    next_probe_at_ms: null,
+  };
+  try {
+    const res = await cpaApi.patch('/auth-files/status', {
+      name,
+      disabled,
+      cpa_url: options?.cpaUrl,
+      runtime_state: runtimeState,
+      require_runtime_ownership: Boolean(options?.requireRuntimeOwnership),
+      expected_probe_at_ms: options?.expectedProbeAtMs,
+      expected_auth_index: options?.expectedAuthIndex,
+    }, { timeout: STATUS_TRANSITION_TIMEOUT_MS });
+    const payload = res.data?.payload as CredentialStatusTransitionPayload | undefined;
+    if (!res.data?.ok || !payload?.name || !payload.state) {
+      throw new Error(String(res.data?.error || 'Credential status transition returned an invalid response'));
+    }
+    clearAuthFilesCache();
+    return payload;
+  } catch (error) {
+    throw normalizeApiError(error, 'Credential status transition failed');
+  }
 };
 
-export const deleteCredential = async (name: string) => {
-  const res = await cpaApi.delete('/auth-files', { params: { name } });
-  clearAuthFilesCache();
-  return res.data;
+export const deleteCredential = async (name: string, expectedAuthIndex: string) => {
+  try {
+    const res = await cpaApi.delete('/auth-files', {
+      params: {
+        name,
+        expected_auth_index: expectedAuthIndex,
+      },
+    });
+    clearAuthFilesCache();
+    return res.data;
+  } catch (error) {
+    throw normalizeApiError(error, 'Credential deletion failed');
+  }
 };
 
 function getManagementKeyOrThrow(): string {
@@ -389,20 +372,28 @@ export const runCredentialArchiveList = async (payload?: CredentialArchiveReques
 
 export const runCredentialArchiveAdd = async (payload: CredentialArchiveRequest): Promise<LocalCliResult<CredentialArchivePayload>> => {
   const password = getManagementKeyOrThrow();
-  const res = await configApi.post('/archive/add', {
-    password,
-    ...payload,
-  });
-  return res.data as LocalCliResult<CredentialArchivePayload>;
+  try {
+    const res = await configApi.post('/archive/add', {
+      password,
+      ...payload,
+    });
+    return res.data as LocalCliResult<CredentialArchivePayload>;
+  } catch (error) {
+    throw normalizeApiError(error, 'Credential archive update failed');
+  }
 };
 
 export const runCredentialArchiveRemove = async (payload: CredentialArchiveRequest): Promise<LocalCliResult<CredentialArchivePayload>> => {
   const password = getManagementKeyOrThrow();
-  const res = await configApi.post('/archive/remove', {
-    password,
-    ...payload,
-  });
-  return res.data as LocalCliResult<CredentialArchivePayload>;
+  try {
+    const res = await configApi.post('/archive/remove', {
+      password,
+      ...payload,
+    });
+    return res.data as LocalCliResult<CredentialArchivePayload>;
+  } catch (error) {
+    throw normalizeApiError(error, 'Credential archive removal failed');
+  }
 };
 
 export const fetchRuntimeStatus = async (): Promise<LocalCliResult<RuntimeStatusPayload>> => {
@@ -413,10 +404,15 @@ export const fetchRuntimeStatus = async (): Promise<LocalCliResult<RuntimeStatus
 export const upsertRuntimeCredentialState = async (payload: {
   cpa_url?: string;
   name: string;
+  auth_index: string;
   state: Partial<RuntimeCredentialState>;
 }): Promise<LocalCliResult<{ cpa_url: string; name: string; state: RuntimeCredentialState }>> => {
-  const res = await configApi.post('/runtime/credential-state/upsert', payload);
-  return res.data as LocalCliResult<{ cpa_url: string; name: string; state: RuntimeCredentialState }>;
+  try {
+    const res = await configApi.post('/runtime/credential-state/upsert', payload);
+    return res.data as LocalCliResult<{ cpa_url: string; name: string; state: RuntimeCredentialState }>;
+  } catch (error) {
+    throw normalizeApiError(error, 'Runtime state persistence failed');
+  }
 };
 
 export const runRemotePushTest = async (payload?: {
@@ -427,38 +423,6 @@ export const runRemotePushTest = async (payload?: {
   const res = await configApi.post('/remote/push-test', {
     password,
     ...payload,
-  });
+  }, { timeout: REMOTE_PUSH_TEST_TIMEOUT_MS });
   return res.data as LocalCliResult<RemotePushTestPayload>;
-};
-
-export const runMailDomainTest = async (payload: {
-  mail_email_provider?: 'mailfree' | 'inbucket' | 'inbucket_ice' | 'duckmail';
-  domain: string;
-  mail_api_base?: string;
-  mail_username?: string;
-  mail_password?: string;
-  duckmail_api_key?: string;
-}): Promise<LocalCliResult<MailDomainTestPayload>> => {
-  const password = getManagementKeyOrThrow();
-  const res = await configApi.post('/mail/domain-test', {
-    password,
-    ...payload,
-  });
-  return res.data as LocalCliResult<MailDomainTestPayload>;
-};
-
-export const stopReplenishment = async (): Promise<LocalCliResult<StopReplenishmentPayload>> => {
-  const password = getManagementKeyOrThrow();
-  const res = await configApi.post('/runtime/replenishment/stop', {
-    password,
-  });
-  return res.data as LocalCliResult<StopReplenishmentPayload>;
-};
-
-export const startReplenishment = async (): Promise<LocalCliResult<StartReplenishmentPayload>> => {
-  const password = getManagementKeyOrThrow();
-  const res = await configApi.post('/runtime/replenishment/start', {
-    password,
-  });
-  return res.data as LocalCliResult<StartReplenishmentPayload>;
 };

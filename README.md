@@ -1,48 +1,73 @@
-﻿# CPA Credential Manager
+﻿# CPA Remote Account Manager
 
-## 安装
+用于管理远程 CPA 服务中的凭证：查看和探测账号状态、按配额自动禁用或恢复、手动禁用、删除、归档及恢复。项目不包含账号注册、邮箱接入、自动补号、Python 或浏览器自动化。
 
-### 1) 克隆并进入项目目录
+## Configuration
 
-```powershell
-git clone <your-repo-url>
-cd CPA_crd_manager
-```
-
-### 2) 配置前端本地连接参数
-
-编辑 `frontend/config.yaml`：
+配置只支持以下字段：
 
 ```yaml
-cpa_url: http://127.0.0.1:8317
-management_key: sk-39c5bb
+cpa_url: http://host.docker.internal:8317
+management_key: CHANGE_ME_TO_A_STRONG_SECRET
+auto_probe_enabled: false
+auto_probe_interval_minutes: 60
+auto_probe_batch_size: 5
+codex_quota_disable_remaining_percent: 10
 ```
 
-注意：`management_key` 需要替换成你自己的管理密码，并且必须与远程 CPA 服务端配置保持一致，否则 WebUI 登录会失败。
+`management_key` 必须替换为 CPA 服务使用的强管理密钥。空值及 `CHANGE_ME` 类占位符会 fail closed（拒绝登录和管理请求）。本机直接运行时，通常将 `cpa_url` 改为 `http://127.0.0.1:8317`。
 
-### 3) 本地启动（Windows 推荐）
+## Docker
+
+镜像使用 pinned Node.js 24 multi-stage build，只包含生产 Node dependencies、构建后的前端和远程管理服务，不安装 Python、Playwright 或浏览器。
+
+PowerShell：
 
 ```powershell
-.\start.bat
-```
-
-默认访问：`http://localhost:8333`
-
-Linux 本机启动：
-
-```bash
-./start.sh
-```
-
-### 4) Docker 启动（Linux / Windows 都支持）
-
-```powershell
+Copy-Item .env.example .env
+New-Item -ItemType Directory -Force docker-data/config, runtime
+Copy-Item frontend/config.example.yaml docker-data/config/config.yaml
 docker compose up -d --build
 ```
 
-默认访问：`http://localhost:8333`
+Linux/macOS：
 
-说明：
-- Docker 镜像现在会自带 `python3` 和项目的 Python dependencies，所以 `replenish_codex.py` 在 Linux 容器里也能直接运行。
-- 如果你不是用 Docker，而是在 Linux 主机本机启动，请确保系统里有 `python3`、`pip`、`node`、`npm`，并且 Python 依赖已安装。
-- Linux 热更新开发可使用 `./start_dev.sh`。
+```bash
+cp .env.example .env
+mkdir -p docker-data/config runtime
+cp frontend/config.example.yaml docker-data/config/config.yaml
+chmod 700 docker-data/config runtime
+chmod 600 .env docker-data/config/config.yaml
+docker compose up -d --build
+```
+
+启动前编辑 `docker-data/config/config.yaml`。Compose 保留 `host.docker.internal` 到宿主机的映射，因此 CPA 运行在宿主机时可直接使用示例 URL。
+
+容器以非 root UID/GID 运行。Linux 主机不是 `1000:1000` 时，将 `.env` 中的 `CPA_MANAGER_UID` 和 `CPA_MANAGER_GID` 设置为 `id -u` 和 `id -g` 的输出，并确保挂载目录可由该用户写入。
+
+服务默认仅绑定 `127.0.0.1:8333`。需要远程访问时才将 `CPA_MANAGER_BIND_ADDRESS` 改为 `0.0.0.0`，并通过启用 TLS 和访问控制的反向代理暴露服务。
+
+健康检查：`http://127.0.0.1:8333/api/health`
+
+## Local Node
+
+需要 Node.js 24 和 npm：
+
+```powershell
+Copy-Item frontend/config.example.yaml frontend/config.yaml
+Push-Location frontend
+npm ci
+npm run build
+node server.js
+```
+
+Linux/macOS 使用对应的 `cp` 和 `cd frontend` 命令。默认访问 `http://127.0.0.1:8333`。
+
+## Runtime State And Security
+
+- Docker 配置挂载在 `/app/config`，持久状态挂载在 `/app/runtime`；重建容器不会删除宿主机数据。
+- `runtime/credential_runtime_state.json` 保存探针和 runtime-owned disable 状态。手动禁用的凭证不会被自动恢复。
+- `runtime/credential_archive.json` 保存归档状态。升级、迁移或手工清理前应备份这两个文件。
+- 不要在服务运行时手工修改 runtime JSON；状态写入使用序列化和原子替换。
+- 不要提交 `.env`、本地 `config.yaml`、runtime 状态、账号/token 数据、日志、压缩包或 session transcript。`.dockerignore` 同样排除这些 secret/runtime artifacts。
+- 如果凭证曾进入 Git 历史，应先轮换凭证；只从当前版本删除不能撤销泄露。

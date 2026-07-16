@@ -18,6 +18,8 @@ interface CredentialTableProps {
   onToggleItem: (name: string) => void;
   probeStatuses: Record<string, ProbeUiState>;
   codexQuotaResumeMap: Record<string, CodexQuotaResumeEntry>;
+  runtimeOwnedNames: Set<string>;
+  operationErrors: Record<string, string>;
   isLocked: (key: string) => boolean;
   deletingNames: Set<string>;
   togglingNames: Set<string>;
@@ -43,6 +45,12 @@ function formatResetAtText(resetAt: number | null | undefined, t: TFunction): st
   return date.toLocaleString();
 }
 
+function formatTimestampMs(value: number | null | undefined, t: TFunction): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return t('Unknown');
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toLocaleString() : t('Unknown');
+}
+
 function normalizePercent(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
   return Math.max(0, Math.min(100, value));
@@ -63,7 +71,13 @@ function isQuotaRecoveryStatus(status: ProbeUiStatus | undefined): boolean {
   return status === 'quota_exhausted' || status === 'quota_low_remaining' || status === 'rate_limited';
 }
 
-function getDisabledBadgeMeta(status: ProbeUiStatus | undefined, hasQuotaResume: boolean, t: TFunction) {
+function getDisabledBadgeMeta(status: ProbeUiStatus | undefined, hasQuotaResume: boolean, runtimeOwned: boolean, t: TFunction) {
+  if (!runtimeOwned) {
+    return {
+      label: t('Disabled'),
+      detail: t('Manual Disabled'),
+    };
+  }
   if (status === 'rate_limited') {
     return {
       label: t('Temp Disabled (429)'),
@@ -76,7 +90,7 @@ function getDisabledBadgeMeta(status: ProbeUiStatus | undefined, hasQuotaResume:
       detail: t('Auto Enable Scheduled'),
     };
   }
-  if (status === 'invalidated' || status === 'unauthorized' || status === 'deactivated' || status === 'expired_by_time' || status === 'error') {
+  if (status === 'invalidated' || status === 'unauthorized' || status === 'deactivated' || status === 'workspace_deactivated' || status === 'expired_by_time' || status === 'error') {
     return {
       label: t('Auto Disabled (Status)'),
       detail: t('Auto Disabled (Status)'),
@@ -101,6 +115,8 @@ export default function CredentialTableV2({
   onToggleItem,
   probeStatuses,
   codexQuotaResumeMap,
+  runtimeOwnedNames,
+  operationErrors,
   isLocked,
   deletingNames,
   togglingNames,
@@ -166,6 +182,8 @@ export default function CredentialTableV2({
               pagedCredentials.map((cred) => {
                 const st = probeStatuses[cred.name];
                 const quotaResume = codexQuotaResumeMap[cred.name];
+                const runtimeOwned = runtimeOwnedNames.has(cred.name);
+                const operationError = operationErrors[cred.name] || '';
                 const probeLockKey = `probe-single:${cred.name}`;
                 const isProbeRunning = st?.status === 'running' || isLocked(probeLockKey);
                 const canProbe = canProbeCredential(cred);
@@ -255,8 +273,8 @@ export default function CredentialTableV2({
                       {cred.disabled ? (
                         <div className="flex flex-col items-start gap-1">
                           {(() => {
-                            const showQuotaResume = Boolean(quotaResume && isQuotaRecoveryStatus(st?.status));
-                            const disabledBadge = getDisabledBadgeMeta(st?.status, showQuotaResume, t);
+                            const showQuotaResume = Boolean(runtimeOwned && quotaResume && isQuotaRecoveryStatus(st?.status));
+                            const disabledBadge = getDisabledBadgeMeta(st?.status, showQuotaResume, runtimeOwned, t);
                             const quotaRemainingPercent = toRemainingPercent(normalizePercent(quotaResume?.usedPercent));
                             return (
                               <>
@@ -269,7 +287,7 @@ export default function CredentialTableV2({
                                 </div>
                                 {showQuotaResume && (
                                   <div className="max-w-[280px] break-words whitespace-normal text-[11px] font-medium leading-tight text-destructive/90">
-                                    {t('Auto Enable At')}: {formatResetAtText(quotaResume.resetAt, t)}
+                                    {t('Auto Enable At')}: {formatTimestampMs(quotaResume.nextProbeAtMs, t)}
                                     {quotaRemainingPercent !== null ? ` | ${t('Remaining')}: ${quotaRemainingPercent}%` : ''}
                                   </div>
                                 )}
@@ -286,13 +304,18 @@ export default function CredentialTableV2({
                               {t('View Body')}
                             </button>
                           )}
+                          {operationError && (
+                            <div className="max-w-[280px] whitespace-normal break-words text-[11px] font-medium leading-tight text-destructive" title={operationError}>
+                              {operationError}
+                            </div>
+                          )}
                         </div>
                       ) : (
                         <div className="flex flex-col items-start gap-1">
                           <div className="flex items-center gap-2">
                             {st?.status === 'active' ? (
                               <span className="flex items-center text-emerald-500"><CheckCircle2 className="mr-1.5 h-4 w-4" /> {t('Active')}</span>
-                            ) : st?.status === 'invalidated' || st?.status === 'unauthorized' || st?.status === 'deactivated' || st?.status === 'expired_by_time' || st?.status === 'quota_exhausted' || st?.status === 'quota_low_remaining' || st?.status === 'rate_limited' || st?.status === 'error' ? (
+                            ) : st?.status === 'invalidated' || st?.status === 'unauthorized' || st?.status === 'deactivated' || st?.status === 'workspace_deactivated' || st?.status === 'expired_by_time' || st?.status === 'quota_exhausted' || st?.status === 'quota_low_remaining' || st?.status === 'rate_limited' || st?.status === 'error' ? (
                               <span className="flex items-center text-destructive" title={st.reason}>
                                 <AlertTriangle className="mr-1.5 h-4 w-4" />
                                 {st.status === 'quota_low_remaining'
@@ -316,6 +339,11 @@ export default function CredentialTableV2({
                             <button onClick={() => onShowProbeDetail(st.detail || t('No detail'))} className="text-[11px] text-primary hover:underline">
                               {t('View Body')}
                             </button>
+                          )}
+                          {operationError && (
+                            <div className="max-w-[280px] whitespace-normal break-words text-[11px] font-medium leading-tight text-destructive" title={operationError}>
+                              {operationError}
+                            </div>
                           )}
                         </div>
                       )}

@@ -1,15 +1,21 @@
 services:
   cpa-manager:
-    container_name: cpa-manager
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8333:8333"
+      - "${CPA_MANAGER_BIND_ADDRESS:-127.0.0.1}:${CPA_MANAGER_PORT:-8333}:8333"
+    user: "${CPA_MANAGER_UID:-1000}:${CPA_MANAGER_GID:-1000}"
     environment:
       PORT: "8333"
-      CPA_CONFIG_FILE: /app/persist/frontend/config.yaml
+      CPA_CONFIG_FILE: /app/config/config.yaml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      - ./frontend:/app/persist/frontend
+      - ./docker-data/config:/app/config
       - ./runtime:/app/runtime
+    init: true
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
+    stop_grace_period: 30s

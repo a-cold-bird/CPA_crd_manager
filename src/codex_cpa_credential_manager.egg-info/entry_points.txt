@@ -1,2 +1,0 @@
-[console_scripts]
-codex-cpa-manager = codex_cpa_credential_manager.cli:main

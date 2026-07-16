@@ -1,6 +1,8 @@
 const CODEX_ACTIVE_CODES = new Set([200, 201, 400, 402, 403, 404, 409, 422]);
 const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
-const QUOTA_LIMIT_KEYWORDS = ['usage_limit_reached', 'insufficient_quota', 'quota_exceeded', 'limit_reached', 'rate limit'];
+const QUOTA_LIMIT_KEYWORDS = ['usage_limit_reached', 'insufficient_quota', 'quota_exceeded', 'rate_limit_exceeded', 'rate limit exceeded'];
+const RATE_LIMIT_RETRY_MS = 30 * 60_000;
+const RUNTIME_RECHECK_FLOOR_MS = 30_000;
 
 function toText(value) {
   if (typeof value === 'string') return value;
@@ -45,6 +47,12 @@ function pickFirstVal(record, ...keys) {
     }
   }
   return undefined;
+}
+
+function getProbeDetailCode(response) {
+  const body = parseJsonRecord(response?.body);
+  const detail = parseJsonRecord(body?.detail);
+  return String(pickFirstVal(detail, 'code') ?? pickFirstVal(body, 'code') ?? '').trim().toLowerCase();
 }
 
 function toNumber(value) {
@@ -94,6 +102,19 @@ function hasLimitKeyword(text) {
   return QUOTA_LIMIT_KEYWORDS.some((keyword) => lower.includes(keyword));
 }
 
+function toQuotaHintText(value) {
+  if (typeof value === 'string') return value;
+  const record = asRecord(value);
+  if (!record) return '';
+  return [
+    toText(record.code),
+    toText(record.message),
+    toText(record.type),
+    toText(record.detail),
+    toQuotaHintText(record.error),
+  ].join(' ');
+}
+
 function parseQuotaWindow(name, value) {
   const record = asRecord(value);
   if (!record) return null;
@@ -113,28 +134,50 @@ function chooseCodexQuotaWindows(rateLimit) {
     .map((key) => parseQuotaWindow(key, rateLimit[key]))
     .filter(Boolean);
 
-  let weekly = windows.find((window) => window.name.toLowerCase().includes('individual')) || null;
-  let short = windows.find((window) => window.name.toLowerCase().includes('secondary')) || null;
+  const withSeconds = windows
+    .filter((window) => typeof window.limitWindowSeconds === 'number' && window.limitWindowSeconds > 0)
+    .sort((a, b) => a.limitWindowSeconds - b.limitWindowSeconds);
+  let weekly = null;
+  let short = null;
 
-  const withSeconds = windows.filter((window) => typeof window.limitWindowSeconds === 'number');
-  if (!weekly && withSeconds.length) {
-    weekly = [...withSeconds].sort((a, b) => (b.limitWindowSeconds || 0) - (a.limitWindowSeconds || 0))[0] || null;
-  }
-  if (!short && withSeconds.length) {
-    const sorted = [...withSeconds].sort((a, b) => (a.limitWindowSeconds || 0) - (b.limitWindowSeconds || 0));
-    short = sorted.find((window) => !weekly || window.name !== weekly.name) || sorted[0] || null;
-  }
-  if (!weekly && windows.length) weekly = windows[0];
-  if (!short && windows.length > 1) {
-    short = windows.find((window) => !weekly || window.name !== weekly.name) || null;
+  if (withSeconds.length === 1) {
+    if (withSeconds[0].limitWindowSeconds <= 6 * 3600) {
+      short = withSeconds[0];
+    } else {
+      weekly = withSeconds[0];
+    }
+  } else if (withSeconds.length > 1) {
+    short = withSeconds[0];
+    weekly = withSeconds[withSeconds.length - 1];
   }
 
-  if (!short && weekly && typeof weekly.limitWindowSeconds === 'number' && weekly.limitWindowSeconds <= 6 * 3600) {
-    short = weekly;
-    weekly = null;
+  const unassigned = windows.filter((window) => window !== weekly && window !== short);
+  if (!weekly) {
+    weekly = unassigned.find((window) => window.name.toLowerCase().includes('individual')) || null;
+  }
+  if (!short) {
+    short = unassigned.find((window) => window.name.toLowerCase().includes('secondary'))
+      || unassigned.find((window) => window.name.toLowerCase().includes('primary'))
+      || null;
+  }
+  if (!weekly) {
+    weekly = windows.find((window) => window !== short) || null;
+  }
+  if (!short) {
+    short = windows.find((window) => window !== weekly) || null;
   }
 
   return { weekly, short, windows };
+}
+
+function getQuotaSourceForWindow(window, weekly, short) {
+  if (!window) return null;
+  if (window === short) return '5hour';
+  if (window === weekly) return 'weekly';
+  const seconds = window.limitWindowSeconds || 0;
+  if (seconds > 0 && seconds <= 6 * 3600) return '5hour';
+  if (seconds >= 6 * 24 * 3600) return 'weekly';
+  return null;
 }
 
 function getQuotaWindowDisplayLabel(window, fallbackIndex) {
@@ -176,7 +219,15 @@ function extractCodexQuotaInfo(response) {
   const body = parseJsonRecord(response?.body);
   const statusMessage = parseJsonRecord(body?.status_message ?? body?.statusMessage);
   const statusError = asRecord(statusMessage?.error);
-  const limitHintText = [toText(response?.body), toText(response?.error), toText(body?.status_message), toText(body?.statusMessage)].join(' ');
+  const limitHintText = [
+    toText(response?.error),
+    body ? '' : toText(response?.body),
+    toQuotaHintText(body?.error),
+    toQuotaHintText(body?.message),
+    toQuotaHintText(body?.detail),
+    toQuotaHintText(body?.status_message),
+    toQuotaHintText(body?.statusMessage),
+  ].join(' ');
   const quotaMarkedByText = hasLimitKeyword(limitHintText);
 
   const rateLimit = asRecord(body?.rate_limit ?? body?.rateLimit);
@@ -213,54 +264,47 @@ function extractCodexQuotaInfo(response) {
   ];
   const weeklyUsed = weekly?.usedPercent ?? null;
   const shortUsed = short?.usedPercent ?? null;
+  const usageWindows = windows
+    .filter((window) => typeof window.usedPercent === 'number')
+    .sort((a, b) => (b.usedPercent || 0) - (a.usedPercent || 0));
 
   let source = null;
   let usedPercent = null;
   let exhausted = false;
   let selectedResetAt = null;
 
-  if (weeklyUsed !== null || shortUsed !== null) {
-    const preferShort = shortUsed !== null && (weeklyUsed === null || shortUsed >= weeklyUsed);
-    if (preferShort) {
-      source = '5hour';
-      usedPercent = shortUsed;
-      selectedResetAt = short?.resetAt ?? null;
-    } else {
-      source = 'weekly';
-      usedPercent = weeklyUsed;
-      selectedResetAt = weekly?.resetAt ?? null;
-    }
-    exhausted = (weeklyUsed !== null && weeklyUsed >= 100) || (shortUsed !== null && shortUsed >= 100);
+  if (usageWindows.length > 0) {
+    const selectedWindow = usageWindows[0];
+    source = getQuotaSourceForWindow(selectedWindow, weekly, short);
+    usedPercent = selectedWindow.usedPercent;
+    selectedResetAt = selectedWindow.resetAt;
+    exhausted = usageWindows.some((window) => window.usedPercent >= 100);
   }
 
-  if (usedPercent === null) {
-    const weeklyLimitReached = weekly?.limitReached === true;
-    const shortLimitReached = short?.limitReached === true;
-    const remainingZero = windows.some((window) => window.remaining === 0);
-    const rateLimitReached = toBoolean(pickFirstVal(rateLimit, 'limit_reached', 'limitReached')) === true;
-    const rateAllowed = toBoolean(rateLimit.allowed);
+  const limitReachedWindow = windows.find((window) => window.limitReached === true) || null;
+  const remainingZeroWindow = windows.find((window) => window.remaining === 0) || null;
+  const rateLimitReached = toBoolean(pickFirstVal(rateLimit, 'limit_reached', 'limitReached')) === true;
+  const rateAllowed = toBoolean(rateLimit.allowed);
 
-    if (weeklyLimitReached) {
-      source = 'weekly_limit';
-      usedPercent = 100;
-      exhausted = true;
-    } else if (shortLimitReached) {
-      source = '5hour_limit';
-      usedPercent = 100;
-      exhausted = true;
-    } else if (remainingZero) {
-      source = 'remaining';
-      usedPercent = 100;
-      exhausted = true;
-    } else if (rateLimitReached || rateAllowed === false) {
-      source = 'rate_limit_flag';
-      usedPercent = 100;
-      exhausted = true;
-    } else if (quotaMarkedByText) {
-      source = 'status_message';
-      usedPercent = 100;
-      exhausted = true;
-    }
+  if (!exhausted && limitReachedWindow) {
+    const limitSource = getQuotaSourceForWindow(limitReachedWindow, weekly, short);
+    source = limitSource === 'weekly' ? 'weekly_limit' : limitSource === '5hour' ? '5hour_limit' : 'rate_limit_flag';
+    usedPercent = 100;
+    selectedResetAt = limitReachedWindow.resetAt ?? selectedResetAt;
+    exhausted = true;
+  } else if (!exhausted && remainingZeroWindow) {
+    source = 'remaining';
+    usedPercent = 100;
+    selectedResetAt = remainingZeroWindow.resetAt ?? selectedResetAt;
+    exhausted = true;
+  } else if (!exhausted && (rateLimitReached || rateAllowed === false)) {
+    source = 'rate_limit_flag';
+    usedPercent = 100;
+    exhausted = true;
+  } else if (!exhausted && quotaMarkedByText) {
+    source = 'status_message';
+    usedPercent = 100;
+    exhausted = true;
   }
 
   const resetAt = selectedResetAt ?? weekly?.resetAt ?? short?.resetAt ?? statusResetAt;
@@ -298,8 +342,12 @@ function classifyCodexProbe(response, options) {
   const text = normalizeProbeText(response);
   const lower = text.toLowerCase();
   const quota = extractCodexQuotaInfo(response);
+  const detailCode = getProbeDetailCode(response);
   const remainingThreshold = Math.max(0, Math.min(100, Math.floor(Number(options?.codexQuotaDisableRemainingPercent ?? 0) || 0)));
 
+  if (detailCode === 'deactivated_workspace') {
+    return { status: 'workspace_deactivated', reason: text || 'codex workspace deactivated', quota };
+  }
   if (statusCode === 401 && isCodexInvalidated401(lower)) {
     return { status: 'invalidated', reason: text || 'codex token invalidated', quota };
   }
@@ -396,6 +444,7 @@ export function canProbeCredential(cred) {
 export function shouldAutoDisable(status) {
   return status === 'invalidated'
     || status === 'deactivated'
+    || status === 'workspace_deactivated'
     || status === 'unauthorized'
     || status === 'expired_by_time'
     || status === 'quota_exhausted'
@@ -404,7 +453,22 @@ export function shouldAutoDisable(status) {
 }
 
 export function shouldAutoArchive(status) {
-  return status === 'deactivated' || status === 'invalidated';
+  return status === 'deactivated' || status === 'workspace_deactivated' || status === 'invalidated';
+}
+
+export function resolveRuntimeNextProbeAtMs(status, quota, normalIntervalMs, nowMs = Date.now()) {
+  const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+  const normalInterval = Math.max(RUNTIME_RECHECK_FLOOR_MS, Number(normalIntervalMs) || RUNTIME_RECHECK_FLOOR_MS);
+  const resetAt = toUnixSeconds(quota?.resetAt ?? null);
+  const resetAtMs = resetAt ? resetAt * 1000 : null;
+
+  if (status === 'rate_limited') {
+    return Math.max(now + RATE_LIMIT_RETRY_MS, resetAtMs || 0);
+  }
+  if (status === 'quota_exhausted' || status === 'quota_low_remaining') {
+    return resetAtMs ? Math.max(now + RUNTIME_RECHECK_FLOOR_MS, resetAtMs) : now + normalInterval;
+  }
+  return now + normalInterval;
 }
 
 export function toProbeErrorResponse(error) {
