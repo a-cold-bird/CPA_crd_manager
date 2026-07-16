@@ -63,7 +63,10 @@ frontend/runtime/*
 !.env.example
 .secrets/
 account-pools/
-docker-data/
+docker-data/*
+!docker-data/config/
+docker-data/config/*
+!docker-data/config/.gitkeep
 frontend/config.local.yaml
 frontend/config.local.yml
 frontend/config.yaml

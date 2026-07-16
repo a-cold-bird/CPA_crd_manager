@@ -7,9 +7,11 @@ export default defineConfig({
     react()
   ],
   server: {
+    port: 8333,
+    strictPort: true,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8333',
+        target: 'http://127.0.0.1:8334',
         changeOrigin: true
       }
     }

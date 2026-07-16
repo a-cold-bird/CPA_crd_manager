@@ -17,11 +17,11 @@ if errorlevel 1 (
 )
 
 call :kill_port 8333
-call :kill_port 5173
+call :kill_port 8334
 
 echo [INFO] Starting CPA dev servers with hot reload...
-echo [INFO] API  : http://127.0.0.1:8333
-echo [INFO] Web  : http://127.0.0.1:5173
+echo [INFO] API  : http://127.0.0.1:8334
+echo [INFO] Web  : http://127.0.0.1:8333
 
 start "CPA Dev API" cmd /k "cd /d ""%FRONTEND_DIR%"" && npm run dev:api"
 start "CPA Dev Web" cmd /k "cd /d ""%FRONTEND_DIR%"" && npm run dev:web"

@@ -4,12 +4,12 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "dev:web": "vite --host 0.0.0.0 --port 5173",
-    "dev:api": "node --watch server.js",
+    "dev": "vite --host 0.0.0.0 --port 8333",
+    "dev:web": "vite --host 0.0.0.0 --port 8333",
+    "dev:api": "node --watch dev-api.js",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview --host 0.0.0.0 --port 8333"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.21",

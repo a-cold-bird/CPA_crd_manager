@@ -176,6 +176,18 @@ function writeConfig(data) {
   }
 }
 
+function initializeConfigFile() {
+  if (fs.existsSync(CONFIG_PATH)) {
+    return;
+  }
+  const configPathToRead = resolveReadableConfigPath();
+  if (!configPathToRead || path.resolve(configPathToRead) !== path.resolve(CONFIG_FALLBACK_PATH)) {
+    return;
+  }
+  writeConfig(readConfig());
+  console.log(`Initialized default config at ${CONFIG_PATH}`);
+}
+
 function isAuthorized(password, config) {
   return isAuthorizedManagementKey(password, config?.management_key);
 }
@@ -2180,6 +2192,7 @@ if (!backendLock.ok) {
 
 backendServerLockHeld = true;
 installBackendServerExitHandlers();
+initializeConfigFile();
 
 app.listen(PORT, () => {
   startBackendAutomationScheduler();

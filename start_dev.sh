@@ -64,12 +64,12 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 kill_port 8333
-kill_port 5173
+kill_port 8334
 ensure_npm_dependencies
 
 echo "[INFO] Starting CPA dev servers with hot reload..."
-echo "[INFO] API  : http://127.0.0.1:8333"
-echo "[INFO] Web  : http://127.0.0.1:5173"
+echo "[INFO] API  : http://127.0.0.1:8334"
+echo "[INFO] Web  : http://127.0.0.1:8333"
 
 cd "$FRONTEND_DIR"
 npm run dev:api &

@@ -1,5 +1,5 @@
 ﻿cpa_url: http://host.docker.internal:8317
-management_key: CHANGE_ME_TO_A_STRONG_SECRET
+management_key: sk-39c5bb
 auto_probe_enabled: false
 auto_probe_interval_minutes: 60
 auto_probe_batch_size: 5

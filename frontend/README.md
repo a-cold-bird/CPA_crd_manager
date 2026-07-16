@@ -2,12 +2,14 @@
 
 ## Local Dev (Hot Reload)
 
-- API auto-restart (`node --watch`): `npm run dev:api` (port `8333`)
-- Web HMR (`vite`): `npm run dev:web` (port `5173`)
+- API auto-restart (`node --watch`): `npm run dev:api` (internal port `8334`)
+- Web HMR (`vite`): `npm run dev:web` (user-facing port `8333`)
 - One-click Windows start (run from project root): `..\\start-hot.bat`
 - One-click Linux start (run from project root): `../start_dev.sh`
 
 ## Production Start
+
+The built frontend and API are served by the same Node process on port `8333`.
 
 - Normal: `start.bat` (build + run)
 - Fallback mode: `start.bat --no-build` (skip build, use existing `dist`)
