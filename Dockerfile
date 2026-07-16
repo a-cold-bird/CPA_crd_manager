@@ -26,17 +26,15 @@ RUN --mount=type=cache,target=/root/.npm \
     cd /app/frontend \
     && npm ci --omit=dev
 
-COPY --from=frontend-build --chown=node:node /app/frontend/dist /app/frontend/dist
-COPY --chown=node:node frontend/server.js frontend/runtimeProbePlanner.js /app/frontend/
-COPY --chown=node:node frontend/serializedJsonStore.js frontend/keyedOperationQueue.js /app/frontend/
-COPY --chown=node:node frontend/asyncRequestCache.js frontend/asyncConcurrency.js /app/frontend/
-COPY --chown=node:node frontend/credentialStatusTransaction.js frontend/managementAuth.js frontend/config.example.yaml /app/frontend/
-COPY --chown=node:node frontend/src/shared/providerRuntimeStrategies.js /app/frontend/src/shared/
+COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
+COPY frontend/server.js frontend/runtimeProbePlanner.js /app/frontend/
+COPY frontend/serializedJsonStore.js frontend/keyedOperationQueue.js /app/frontend/
+COPY frontend/asyncRequestCache.js frontend/asyncConcurrency.js /app/frontend/
+COPY frontend/credentialStatusTransaction.js frontend/managementAuth.js frontend/config.example.yaml /app/frontend/
+COPY frontend/src/shared/providerRuntimeStrategies.js /app/frontend/src/shared/
 
-RUN mkdir -p /app/config /app/runtime \
-    && chown -R node:node /app/config /app/runtime /app/frontend
+RUN mkdir -p /app/config /app/runtime
 
-USER node
 WORKDIR /app/frontend
 
 EXPOSE 8333

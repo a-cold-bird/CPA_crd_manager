@@ -27,9 +27,7 @@ docker compose up -d --build
 
 首次启动会自动将默认配置写入 `docker-data/config/config.yaml`。Compose 保留 `host.docker.internal` 到宿主机的映射，因此 CPA 运行在宿主机时可直接使用默认 URL。
 
-容器以非 root UID/GID 运行。Linux 主机不是 `1000:1000` 时，将 `.env` 中的 `CPA_MANAGER_UID` 和 `CPA_MANAGER_GID` 设置为 `id -u` 和 `id -g` 的输出，并确保挂载目录可由该用户写入。
-
-容器端口和 built frontend 均固定为 `8333`，默认仅绑定 `127.0.0.1:8333`。
+容器端口和 built frontend 均固定为 `8333`。
 
 健康检查：`http://127.0.0.1:8333/api/health`
 

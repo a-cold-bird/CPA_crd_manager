@@ -4,8 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "127.0.0.1:8333:8333"
-    user: "${CPA_MANAGER_UID:-1000}:${CPA_MANAGER_GID:-1000}"
+      - "8333:8333"
     environment:
       PORT: "8333"
       CPA_CONFIG_FILE: /app/config/config.yaml
